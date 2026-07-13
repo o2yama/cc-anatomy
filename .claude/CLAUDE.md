@@ -34,6 +34,16 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 - `npm run tauri dev` — 開発起動
 - `npm run tauri build` — 配布ビルド
+- `scripts/release.sh <version> ["ノート"]` — リリース一式（バージョン反映→署名ビルド→latest.json→commit/tag/push→GitHub Release）
+
+## 自動アップデート（2026-07-13 実装・実機検証済み）
+
+- リポジトリ: https://github.com/o2yama/cc-anatomy （public、o2yama アカウント）
+- 仕組み: tauri-plugin-updater が GitHub Releases の `latest.json` を起動15秒後+12時間ごとに確認 → 確認ダイアログ → `.app.tar.gz` をダウンロード・差し替え → 再起動。トレイに「アップデートを確認」（手動）
+- **署名鍵: `~/.tauri/cc-anatomy.key`（パスワードなし）。紛失すると以後の更新配信が不能になる。要バックアップ**。公開鍵は tauri.conf.json の `plugins.updater.pubkey`
+- リリースは必ず `scripts/release.sh` で行う（latest.json の signature/url 生成を手作業にしない）
+- 無署名（Apple Developer 署名なし）でも updater 経由の更新は quarantine が付かず Gatekeeper に阻まれないことを実機確認済み（v0.1.1→v0.1.2）
+- v0.1.0（updater なし）を配布済みの相手には v0.1.1 以降の dmg での手動再インストールを一度だけ依頼する必要がある
 
 ## 追加の設計決定（2026-07-12〜13）
 

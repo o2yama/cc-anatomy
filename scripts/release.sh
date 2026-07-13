@@ -36,7 +36,11 @@ for (const f of ['package.json', 'src-tauri/tauri.conf.json']) {
 sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" src-tauri/Cargo.toml
 
 echo "==> 署名付きビルド"
-export TAURI_SIGNING_PRIVATE_KEY_PATH="$KEY_PATH"
+# CLI が TAURI_SIGNING_PRIVATE_KEY_PATH を解釈しないため鍵の中身を直接渡す。
+# 鍵はパスワードなし生成（--ci）だが、PASSWORD 未設定だと TTY プロンプトを試みて
+# 非対話環境で落ちるため空文字を明示する
+TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")" \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
 npm run tauri build
 
 BUNDLE="src-tauri/target/release/bundle"
