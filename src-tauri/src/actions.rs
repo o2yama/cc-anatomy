@@ -52,7 +52,12 @@ pub fn open_in_terminal(path: &str) -> Result<(), String> {
 /// トークンは呼び出し元の関数内で完結させ、戻り値・ログに含めない
 fn oauth_token() -> Result<String, String> {
     let keychain = Command::new("security")
-        .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
         .output()
         .map_err(|e| e.to_string())?;
     if !keychain.status.success() {

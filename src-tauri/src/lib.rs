@@ -4,6 +4,7 @@ mod env;
 mod inventory;
 mod transcript;
 mod tray;
+mod updater;
 
 #[tauri::command]
 fn list_projects() -> Result<Vec<db::ProjectInfo>, String> {
@@ -85,9 +86,12 @@ fn get_account_profile() -> Result<String, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             tray::setup(app.handle())?;
+            updater::setup_periodic_check(app.handle());
             Ok(())
         })
         // ウィンドウを閉じてもメニューバー常駐を続ける（終了はトレイの「終了」から）

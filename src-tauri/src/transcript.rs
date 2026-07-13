@@ -194,7 +194,9 @@ pub fn get_transcript(session_id: &str) -> Result<Transcript, String> {
 
     for line in reader.lines() {
         let Ok(line) = line else { continue };
-        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
 
         if cwd.is_none() {
             if let Some(c) = v.get("cwd").and_then(Value::as_str) {
@@ -212,7 +214,9 @@ pub fn get_transcript(session_id: &str) -> Result<Transcript, String> {
         {
             continue;
         }
-        let Some(content) = v.pointer("/message/content") else { continue };
+        let Some(content) = v.pointer("/message/content") else {
+            continue;
+        };
         let text = extract_text(content);
         if text.trim().is_empty() {
             continue;

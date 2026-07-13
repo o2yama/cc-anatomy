@@ -30,7 +30,7 @@ pub struct ScopedItem {
 #[derive(Serialize)]
 pub struct McpServer {
     pub name: String,
-    pub scope: String, // "project" | "global"
+    pub scope: String,  // "project" | "global"
     pub source: String, // 設定ファイルの場所
     pub config: String, // 整形済みJSON（秘匿値はマスク）
 }
@@ -104,9 +104,7 @@ pub fn read_doc_checked(path: &str) -> Result<FileDoc, String> {
     let canon = PathBuf::from(path)
         .canonicalize()
         .map_err(|e| format!("{path}: {e}"))?;
-    let home = home_dir()
-        .canonicalize()
-        .map_err(|e| e.to_string())?;
+    let home = home_dir().canonicalize().map_err(|e| e.to_string())?;
     if !canon.starts_with(&home) {
         return Err("ホームディレクトリ外のファイルは表示できません".into());
     }

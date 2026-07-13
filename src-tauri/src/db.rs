@@ -64,9 +64,9 @@ fn resolve_project_paths(conn: &Connection) -> std::collections::HashMap<String,
          JOIN pending_messages p ON p.content_session_id = s.content_session_id
          WHERE p.cwd IS NOT NULL AND s.project != 'unknown-project'",
     ) {
-        if let Ok(rows) = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) {
+        if let Ok(rows) =
+            stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        {
             for (project, cwd) in rows.flatten() {
                 let cwd = normalize_cwd(&cwd);
                 // サブディレクトリ起動の cwd より短い（=浅い）パスを採用する
@@ -447,5 +447,6 @@ pub fn search_summaries(query: &str, project: Option<&str>) -> Result<Vec<Search
             })
         })
         .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())
 }

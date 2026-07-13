@@ -184,6 +184,13 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
         true,
         None::<&str>,
     )?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "check-update",
+        "アップデートを確認",
+        true,
+        None::<&str>,
+    )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?)?;
     Ok(menu)
@@ -224,6 +231,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "refresh" => refresh(app.clone()),
+            "check-update" => crate::updater::check(app.clone(), true),
             "open" => {
                 if let Some(win) = app.get_webview_window("main") {
                     let _ = win.show();
