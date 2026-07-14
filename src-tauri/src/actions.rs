@@ -300,16 +300,24 @@ fn rate_limits_from_headers(token: &str) -> Result<String, String> {
     .to_string())
 }
 
+/// メニューバー向けの使用量サマリー。使用率は 0〜100、リセットは epoch 秒
+pub struct UsageSummary {
+    pub five_pct: f64,
+    pub seven_pct: f64,
+    pub five_reset: Option<i64>,
+    pub seven_reset: Option<i64>,
+}
+
 /// 現在ログイン中（ライブ）アカウントの使用率。登録されていないアカウントで
 /// ログインしている場合でも、ライブ Keychain のトークンから直接取れる
-pub fn live_usage_summary() -> Result<(f64, f64), String> {
+pub fn live_usage_summary() -> Result<UsageSummary, String> {
     let token = live_keychain_token()?;
     usage_summary(&token)
 }
 
-/// メニューバーのアカウント一覧向けに、5時間枠・7日枠の使用率（0〜100）だけを返す。
+/// メニューバーのアカウント一覧向けに、5時間枠・7日枠の使用率とリセット時刻を返す。
 /// 枠を使い切ったアカウント（429）でもヘッダは返るので値は取れる
-pub fn usage_summary(token: &str) -> Result<(f64, f64), String> {
+pub fn usage_summary(token: &str) -> Result<UsageSummary, String> {
     let (_, headers, _) = probe_headers(token)?;
     let pct = |prefix: &str| -> Option<f64> {
         header_value(
@@ -319,8 +327,20 @@ pub fn usage_summary(token: &str) -> Result<(f64, f64), String> {
         .and_then(|v| v.parse::<f64>().ok())
         .map(|v| v * 100.0)
     };
-    let five = pct("5h").ok_or("使用量を取得できませんでした")?;
-    Ok((five, pct("7d").unwrap_or(0.0)))
+    let reset = |prefix: &str| -> Option<i64> {
+        header_value(
+            &headers,
+            &format!("anthropic-ratelimit-unified-{prefix}-reset"),
+        )
+        .and_then(|v| v.parse::<i64>().ok())
+    };
+    let five_pct = pct("5h").ok_or("使用量を取得できませんでした")?;
+    Ok(UsageSummary {
+        five_pct,
+        seven_pct: pct("7d").unwrap_or(0.0),
+        five_reset: reset("5h"),
+        seven_reset: reset("7d"),
+    })
 }
 
 fn epoch_to_iso(secs: i64) -> Option<String> {

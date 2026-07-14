@@ -209,8 +209,8 @@ pub fn active_token() -> Option<String> {
 pub struct TrayAccount {
     pub name: String,
     pub is_live: bool,
-    /// 5時間枠・7日枠の使用率（0〜100）。取得できなければ None
-    pub usage: Option<(f64, f64)>,
+    /// 使用率とリセット時刻。取得できなければ None
+    pub usage: Option<crate::actions::UsageSummary>,
 }
 
 pub fn accounts_with_usage() -> Vec<TrayAccount> {

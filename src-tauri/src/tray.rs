@@ -28,6 +28,33 @@ fn gauge(pct: i64) -> String {
     format!("{}{}", "▓".repeat(filled), "░".repeat(10 - filled))
 }
 
+/// epoch 秒をローカル時刻の表示に変換する。今日中なら時刻だけ、それ以外は日付つき。
+/// 依存クレートを増やさないため date コマンドで変換する
+fn reset_local(secs: i64) -> Option<String> {
+    let day_of = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("date").args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let today = day_of(&["+%-m/%-d"])?;
+    let s = secs.to_string();
+    let target_day = day_of(&["-r", &s, "+%-m/%-d"])?;
+    let fmt = if target_day == today {
+        "+%H:%M"
+    } else {
+        "+%-m/%-d %H:%M"
+    };
+    day_of(&["-r", &s, fmt])
+}
+
+fn reset_suffix(epoch: Option<i64>) -> String {
+    epoch
+        .and_then(reset_local)
+        .map(|t| format!("（{t} 復活）"))
+        .unwrap_or_default()
+}
+
 fn fetch_status() -> StatusData {
     // 登録済みアカウントの使用状況を並べる（アプリを開かず見比べられるように）。
     // 切り替えはアプリ内のアカウント画面で行うため、ここは閲覧のみ
@@ -50,16 +77,16 @@ fn fetch_status() -> StatusData {
         // 実際の消費先）だけを印として付ける。アプリ内の選択状態(active)はここには出さない
         let live = if a.is_live { "　⦿ ログイン中" } else { "" };
         lines.push(format!("{}{live}", a.name));
-        match a.usage {
-            Some((five, seven)) => {
+        match &a.usage {
+            Some(u) => {
                 // バッジはログイン中アカウントの使用率にする（起動中セッションの実際の消費先）
                 if a.is_live {
-                    title = format!("{}%", five.max(seven).round() as i64);
+                    title = format!("{}%", u.five_pct.max(u.seven_pct).round() as i64);
                 }
-                let f = five.round() as i64;
-                let s = seven.round() as i64;
-                lines.push(format!("5h   {} {f}%", gauge(f)));
-                lines.push(format!("週次 {} {s}%", gauge(s)));
+                let f = u.five_pct.round() as i64;
+                let s = u.seven_pct.round() as i64;
+                lines.push(format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)));
+                lines.push(format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)));
             }
             None => lines.push("使用量取得不可".into()),
         }
@@ -67,8 +94,8 @@ fn fetch_status() -> StatusData {
 
     // ログイン中アカウントが未登録なら、ライブ Keychain から直接バッジ用の使用率を取る
     if title == "-" {
-        if let Ok((five, seven)) = crate::actions::live_usage_summary() {
-            title = format!("{}%", five.max(seven).round() as i64);
+        if let Ok(u) = crate::actions::live_usage_summary() {
+            title = format!("{}%", u.five_pct.max(u.seven_pct).round() as i64);
         }
     }
 
