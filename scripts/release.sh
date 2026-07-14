@@ -16,9 +16,13 @@ VERSION="${1:?使い方: scripts/release.sh <version> [notes]}"
 NOTES="${2:-CC Anatomy v$VERSION}"
 KEY_PATH="$HOME/.tauri/cc-anatomy.key"
 REPO="o2yama/cc-anatomy"
-ASSET="cc-anatomy_${VERSION}_aarch64.app.tar.gz"
+ASSET="cc-anatomy_${VERSION}_universal.app.tar.gz"
 
 [[ -f "$KEY_PATH" ]] || { echo "エラー: 署名鍵 $KEY_PATH がありません" >&2; exit 1; }
+# universal ビルドには両アーキテクチャの Rust ターゲットが必要
+for t in aarch64-apple-darwin x86_64-apple-darwin; do
+  rustup target list --installed | grep -qx "$t" || rustup target add "$t"
+done
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "エラー: バージョンは x.y.z 形式で指定してください" >&2; exit 1; }
 if gh release view "v$VERSION" --repo "$REPO" >/dev/null 2>&1; then
   echo "エラー: v$VERSION は既にリリース済みです" >&2; exit 1
@@ -41,12 +45,12 @@ echo "==> 署名付きビルド"
 # 非対話環境で落ちるため空文字を明示する
 TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")" \
 TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
-npm run tauri build
+npm run tauri build -- --target universal-apple-darwin
 
-BUNDLE="src-tauri/target/release/bundle"
+BUNDLE="src-tauri/target/universal-apple-darwin/release/bundle"
 TARBALL="$BUNDLE/macos/CC Anatomy.app.tar.gz"
 SIG_FILE="$TARBALL.sig"
-DMG="$BUNDLE/dmg/CC Anatomy_${VERSION}_aarch64.dmg"
+DMG="$BUNDLE/dmg/CC Anatomy_${VERSION}_universal.dmg"
 for f in "$TARBALL" "$SIG_FILE" "$DMG"; do
   [[ -f "$f" ]] || { echo "エラー: ビルド成果物がありません: $f" >&2; exit 1; }
 done
@@ -60,12 +64,11 @@ const manifest = {
   version: '$VERSION',
   notes: process.argv[1],
   pub_date: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
-  platforms: {
-    'darwin-aarch64': {
-      signature: fs.readFileSync('$SIG_FILE', 'utf8').trim(),
-      url: 'https://github.com/$REPO/releases/download/v$VERSION/$ASSET'
-    }
-  }
+  // universal binary のため両アーキテクチャに同一アセットを配信する
+  platforms: Object.fromEntries(['darwin-aarch64', 'darwin-x86_64'].map(k => [k, {
+    signature: fs.readFileSync('$SIG_FILE', 'utf8').trim(),
+    url: 'https://github.com/$REPO/releases/download/v$VERSION/$ASSET'
+  }]))
 };
 fs.writeFileSync('tmp/release/latest.json', JSON.stringify(manifest, null, 2) + '\n');
 " "$NOTES"
