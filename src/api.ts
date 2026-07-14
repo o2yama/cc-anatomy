@@ -115,6 +115,56 @@ export interface ProjectEnv {
   rules: RuleFile[];
 }
 
+export interface DiagnosisFinding {
+  id: string;
+  severity: "high" | "medium" | "low";
+  category: string;
+  title: string;
+  detail: string;
+  fix_prompt: string;
+  target_paths: string[];
+}
+
+export interface DiagnosisReport {
+  summary: string;
+  findings: DiagnosisFinding[];
+}
+
+/** 実行中は "diagnosis-progress" イベント（{kind, label}）が随時 emit される */
+export interface DiagnosisProgress {
+  kind: "tool" | "text" | "info";
+  label: string;
+}
+
+export interface Account {
+  name: string;
+  email: string;
+  plan: string;
+  active: boolean;
+  /** Claude Code が現在 /login しているアカウント（起動中セッションが消費する先） */
+  is_live: boolean;
+  /** Keychain 側のトークンが失われている（手動削除・1年の期限切れ等）。切り替えできない */
+  missing_token: boolean;
+}
+
+export interface AccountsState {
+  accounts: Account[];
+  /** .zshrc に読み込み行が入っているか。無いと切り替えても新しいシェルに効かない */
+  shell_integration: boolean;
+  /** 起動中の claude CLI セッション数。切り替えの反映には再起動が要る */
+  running_sessions: number;
+}
+
+export interface AccountUsageDetail {
+  name: string;
+  email: string;
+  plan: string;
+  active: boolean;
+  is_live: boolean;
+  usage: RateLimits | null;
+  error: string | null;
+}
+
 export const api = {
   listProjects: () => invoke<ProjectInfo[]>("list_projects"),
   getHomeDir: () => invoke<string>("get_home_dir"),
@@ -134,6 +184,19 @@ export const api = {
   openInTerminal: (path: string) => invoke<void>("open_in_terminal", { path }),
   extractTasks: (project: string) =>
     invoke<string>("extract_tasks", { project }),
+  runDiagnosis: () => invoke<DiagnosisReport>("run_diagnosis"),
+  cancelDiagnosis: () => invoke<void>("cancel_diagnosis"),
+  runFixesInTerminal: (prompts: string[]) =>
+    invoke<void>("run_fixes_in_terminal", { prompts }),
+  getAccounts: () => invoke<AccountsState>("get_accounts"),
+  getAccountsUsage: () => invoke<AccountUsageDetail[]>("get_accounts_usage"),
+  addAccountInTerminal: (name: string) =>
+    invoke<void>("add_account_in_terminal", { name }),
+  claimPendingAccount: (name: string) =>
+    invoke<Account | null>("claim_pending_account", { name }),
+  switchAccount: (name: string) => invoke<void>("switch_account", { name }),
+  removeAccount: (name: string) => invoke<void>("remove_account", { name }),
+  installShellIntegration: () => invoke<void>("install_shell_integration"),
   getRateLimits: async (): Promise<RateLimits> => {
     const raw = await invoke<string>("get_rate_limits");
     return JSON.parse(raw) as RateLimits;

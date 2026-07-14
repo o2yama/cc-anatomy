@@ -1,5 +1,7 @@
+mod accounts;
 mod actions;
 mod db;
+mod diagnostics;
 mod env;
 mod inventory;
 mod transcript;
@@ -83,6 +85,61 @@ fn get_account_profile() -> Result<String, String> {
     actions::get_account_profile()
 }
 
+/// 環境スキャンは数分かかるので async で UI スレッドを塞がない
+#[tauri::command(async)]
+fn run_diagnosis(app: tauri::AppHandle) -> Result<diagnostics::DiagnosisReport, String> {
+    diagnostics::run_diagnosis(&app)
+}
+
+#[tauri::command]
+fn cancel_diagnosis() -> Result<(), String> {
+    diagnostics::cancel_diagnosis()
+}
+
+#[tauri::command(async)]
+fn run_fixes_in_terminal(app: tauri::AppHandle, prompts: Vec<String>) -> Result<(), String> {
+    diagnostics::run_fixes_in_terminal(&app, prompts)
+}
+
+/// ps とファイル読みを伴うので async
+#[tauri::command(async)]
+fn get_accounts() -> Result<accounts::AccountsState, String> {
+    accounts::get_accounts()
+}
+
+/// カルーセル表示用に、全アカウントの使用量をまとめて取得する。
+/// アカウント数だけ推論 API を叩くので async
+#[tauri::command(async)]
+fn get_accounts_usage() -> Result<Vec<accounts::AccountUsageDetail>, String> {
+    Ok(accounts::accounts_usage_detail())
+}
+
+#[tauri::command(async)]
+fn add_account_in_terminal(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    accounts::add_account_in_terminal(&app, &name)
+}
+
+/// Terminal でのログイン完了をフロントがポーリングする。API 呼び出しを伴うので async
+#[tauri::command(async)]
+fn claim_pending_account(name: String) -> Result<Option<accounts::Account>, String> {
+    accounts::claim_pending_account(&name)
+}
+
+#[tauri::command(async)]
+fn switch_account(name: String) -> Result<(), String> {
+    accounts::switch_account(&name)
+}
+
+#[tauri::command(async)]
+fn remove_account(name: String) -> Result<(), String> {
+    accounts::remove_account(&name)
+}
+
+#[tauri::command(async)]
+fn install_shell_integration() -> Result<(), String> {
+    accounts::install_shell_integration()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -116,7 +173,17 @@ pub fn run() {
             open_in_terminal,
             extract_tasks,
             get_rate_limits,
-            get_account_profile
+            get_account_profile,
+            run_diagnosis,
+            cancel_diagnosis,
+            run_fixes_in_terminal,
+            get_accounts,
+            get_accounts_usage,
+            add_account_in_terminal,
+            claim_pending_account,
+            switch_account,
+            remove_account,
+            install_shell_integration
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -278,36 +278,6 @@ pub fn list_sessions(project: &str) -> Result<Vec<SessionInfo>, String> {
     Ok(result)
 }
 
-/// 今日（ローカル時刻）開始したセッション数と、直近に触ったプロジェクト名
-pub fn today_activity() -> Result<(i64, Option<String>), String> {
-    let conn = open_db()?;
-    let count: i64 = conn
-        .query_row(
-            &format!(
-                "SELECT COUNT(*) FROM sdk_sessions
-                 WHERE date(started_at_epoch / 1000, 'unixepoch', 'localtime') = date('now', 'localtime')
-                   AND {}",
-                project_filter("project")
-            ),
-            [],
-            |r| r.get(0),
-        )
-        .map_err(|e| e.to_string())?;
-    use rusqlite::OptionalExtension;
-    let last_project: Option<String> = conn
-        .query_row(
-            &format!(
-                "SELECT project FROM sdk_sessions WHERE {} ORDER BY started_at_epoch DESC LIMIT 1",
-                project_filter("project")
-            ),
-            [],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?;
-    Ok((count, last_project))
-}
-
 /// タスク抽出（claude CLI）に渡すサマリー履歴のダイジェストを組み立てる。
 /// 「何を頼まれ・何を終え・何が残っているか」だけに絞り、直近50件・新しい順。
 pub fn task_digest(project: &str) -> Result<String, String> {

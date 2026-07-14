@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   api,
   formatEpoch,
@@ -18,10 +18,14 @@ import {
   collapsiblePaths,
 } from "./ProjectTree";
 import { ProjectOverview } from "./ProjectOverview";
+import { DiagnosisOverlay } from "./Diagnosis";
+import { AccountsOverlay } from "./Accounts";
 import "./App.css";
 
 export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [acctOpen, setAcctOpen] = useState(false);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -39,6 +43,45 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <h1>CC Anatomy</h1>
+        <button
+          className="icon-btn"
+          title="環境診断"
+          onClick={() => setDiagOpen(true)}
+        >
+          <svg
+            width="15"
+            height="15"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            {/* 心拍波形アイコン（診断のメタファー） */}
+            <polyline points="2 12 6 12 9 5 14 19 17 12 22 12" />
+          </svg>
+        </button>
+        <button
+          className="icon-btn"
+          title="アカウント切り替え"
+          onClick={() => setAcctOpen(true)}
+        >
+          <svg
+            width="15"
+            height="15"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            {/* 人物アイコン（アカウントのメタファー） */}
+            <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+            <circle cx="12" cy="7" r="4" />
+          </svg>
+        </button>
         <UsagePopover />
         <button
           className="icon-btn"
@@ -63,6 +106,9 @@ export default function App() {
         <SessionsView />
       </main>
       {searchOpen && <GlobalSearchOverlay onClose={() => setSearchOpen(false)} />}
+      {/* 実行中に閉じても診断を継続できるよう、常にマウントして open で表示を切り替える */}
+      <DiagnosisOverlay open={diagOpen} onClose={() => setDiagOpen(false)} />
+      <AccountsOverlay open={acctOpen} onClose={() => setAcctOpen(false)} />
     </div>
   );
 }
@@ -96,28 +142,151 @@ function formatReset(iso: string | null): string {
   });
 }
 
-/** 検索アイコン横のリソース確認ポップオーバー。開くたびに最新を取得する */
+/** カルーセルの1枚に渡す統一形（登録アカウント / ライブログインの両方をこの形に寄せる） */
+interface UsageCard {
+  name: string;
+  email: string;
+  planLabel: string;
+  isLive: boolean;
+  usage: RateLimits | null;
+  error: string | null;
+}
+
+function planLabelRaw(plan: string): string {
+  if (plan === "claude_max") return "Max";
+  if (plan === "claude_pro") return "Pro";
+  return plan || "不明";
+}
+
+/** 1アカウント分の使用量（枠ごとのゲージ）を描画する */
+function UsageCardView({ card }: { card: UsageCard }) {
+  if (card.error) return <p className="error-box">{card.error}</p>;
+  if (!card.usage) return <p className="muted">取得中…</p>;
+  const limits = card.usage.limits ?? [];
+  return (
+    <>
+      <div className="usage-account">
+        <p className="usage-name">
+          {card.name}
+          {card.isLive && <span className="acct-live">ログイン中</span>}
+        </p>
+        <p className="muted">{card.email}</p>
+        <p className="usage-plan">
+          <span className="count-badge">{card.planLabel}</span>
+        </p>
+      </div>
+      <hr />
+      <div className="usage-limits">
+        {limits.map((l, i) => {
+          const pct = Math.min(100, Math.round(l.percent ?? 0));
+          const level = pct >= 85 ? "high" : pct >= 60 ? "mid" : "low";
+          return (
+            <div key={i} className={`usage-limit level-${level}`}>
+              <div className="usage-limit-head">
+                <span>{limitLabel(l)}</span>
+                <span className="gauge-pct">{pct}%</span>
+              </div>
+              <span className="gauge-bar wide">
+                <span className="gauge-fill" style={{ width: `${pct}%` }} />
+              </span>
+              <p className="muted usage-reset">
+                {formatReset(l.resets_at)} にリセット
+                {l.severity && l.severity !== "normal"
+                  ? ` · ${l.severity}`
+                  : ""}
+              </p>
+            </div>
+          );
+        })}
+      </div>
+      {limits.length > 0 &&
+        !limits.some((l) => l.kind === "weekly_scoped") && (
+          <p className="muted usage-note">
+            モデル別（Fable
+            等）の内訳は、アカウント切り替え中は取得できません（長期トークンの権限制限）。
+          </p>
+        )}
+    </>
+  );
+}
+
+/** 各アカウントの使用状況を左右の矢印で見比べられるポップオーバー */
 function UsagePopover() {
   const [open, setOpen] = useState(false);
-  const [usage, setUsage] = useState<RateLimits | null>(null);
-  const [profile, setProfile] = useState<AccountProfile | null>(null);
+  const [cards, setCards] = useState<UsageCard[] | null>(null);
+  const [idx, setIdx] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!open) return;
+  const load = useCallback(() => {
     setError(null);
-    Promise.all([api.getRateLimits(), api.getAccountProfile()])
-      .then(([u, p]) => {
-        setUsage(u);
-        setProfile(p);
+    setCards(null);
+    api
+      .getAccountsUsage()
+      .then((accts) => {
+        if (accts.length > 0) {
+          setCards(
+            accts.map((a) => ({
+              name: a.name,
+              email: a.email,
+              planLabel: planLabelRaw(a.plan),
+              isLive: a.is_live,
+              usage: a.usage,
+              error: a.error,
+            }))
+          );
+          // 選択中アカウントを最初に表示する
+          const activeIdx = accts.findIndex((a) => a.active);
+          setIdx(activeIdx >= 0 ? activeIdx : 0);
+          return;
+        }
+        // アカウント未登録時はライブログインを1枚だけ表示する
+        return Promise.all([
+          api.getRateLimits(),
+          api.getAccountProfile(),
+        ]).then(([u, p]) => {
+          setCards([
+            {
+              name:
+                p.account?.display_name ?? p.account?.full_name ?? "(名前不明)",
+              email: p.account?.email ?? "",
+              planLabel: planLabel(p),
+              // アカウント未登録時はライブログインそのものを表示している
+              isLive: true,
+              usage: u,
+              error: null,
+            },
+          ]);
+          setIdx(0);
+        });
       })
       .catch((e) => setError(String(e)));
-    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+  }, []);
+
+  // 取得は open の立ち上がりだけで走らせる。cards を依存に入れると、load が cards を
+  // 更新→再取得…の無限ループになりポップオーバーがちらつくため分離する
+  useEffect(() => {
+    if (open) load();
+  }, [open, load]);
+
+  // キー操作は最新の cards を参照する必要があるので別 effect にする（再取得は起こさない）
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+      if (cards && cards.length > 1) {
+        if (e.key === "ArrowLeft")
+          setIdx((i) => (i - 1 + cards.length) % cards.length);
+        if (e.key === "ArrowRight") setIdx((i) => (i + 1) % cards.length);
+      }
+    };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
+  }, [open, cards]);
 
-  const spendUsed = usage?.spend?.used;
+  const count = cards?.length ?? 0;
+  const prev = () => setIdx((i) => (i - 1 + count) % count);
+  const next = () => setIdx((i) => (i + 1) % count);
+  const card = cards?.[idx];
 
   return (
     <div className="usage-anchor">
@@ -148,66 +317,43 @@ function UsagePopover() {
           <div className="usage-popover">
             {error ? (
               <p className="error-box">{error}</p>
-            ) : !usage || !profile ? (
+            ) : !cards || !card ? (
               <p className="muted">取得中…</p>
             ) : (
               <>
-                <div className="usage-account">
-                  <p className="usage-name">
-                    {profile.account?.display_name ??
-                      profile.account?.full_name ??
-                      "(名前不明)"}
-                  </p>
-                  <p className="muted">{profile.account?.email}</p>
-                  <p className="usage-plan">
-                    <span className="count-badge">{planLabel(profile)}</span>
-                    <span className="muted">
-                      {profile.organization?.subscription_status === "active"
-                        ? " サブスクリプション有効"
-                        : ` ${profile.organization?.subscription_status ?? ""}`}
+                {count > 1 && (
+                  <div className="usage-carousel-nav">
+                    <button
+                      className="icon-btn"
+                      title="前のアカウント（←）"
+                      onClick={prev}
+                    >
+                      ‹
+                    </button>
+                    <span className="usage-carousel-dots">
+                      {cards.map((_, i) => (
+                        <span
+                          key={i}
+                          className={i === idx ? "dot on" : "dot"}
+                        />
+                      ))}
                     </span>
-                  </p>
-                </div>
-                <hr />
-                <div className="usage-limits">
-                  {(usage.limits ?? []).map((l, i) => {
-                    const pct = Math.min(100, Math.round(l.percent ?? 0));
-                    const level =
-                      pct >= 85 ? "high" : pct >= 60 ? "mid" : "low";
-                    return (
-                      <div key={i} className={`usage-limit level-${level}`}>
-                        <div className="usage-limit-head">
-                          <span>{limitLabel(l)}</span>
-                          <span className="gauge-pct">{pct}%</span>
-                        </div>
-                        <span className="gauge-bar wide">
-                          <span
-                            className="gauge-fill"
-                            style={{ width: `${pct}%` }}
-                          />
-                        </span>
-                        <p className="muted usage-reset">
-                          {formatReset(l.resets_at)} にリセット
-                          {l.severity && l.severity !== "normal"
-                            ? ` · ${l.severity}`
-                            : ""}
-                        </p>
-                      </div>
-                    );
-                  })}
-                </div>
+                    <button
+                      className="icon-btn"
+                      title="次のアカウント（→）"
+                      onClick={next}
+                    >
+                      ›
+                    </button>
+                  </div>
+                )}
+                <UsageCardView card={card} />
                 <hr />
                 <p className="usage-extra muted">
                   追加クレジット:{" "}
-                  {usage.extra_usage?.is_enabled
-                    ? `有効（使用 ${usage.extra_usage.used_credits ?? 0}）`
+                  {card.usage?.extra_usage?.is_enabled
+                    ? `有効（使用 ${card.usage.extra_usage.used_credits ?? 0}）`
                     : "無効"}
-                  {spendUsed &&
-                    spendUsed.amount_minor > 0 &&
-                    ` · 使用額 ${(
-                      spendUsed.amount_minor /
-                      10 ** spendUsed.exponent
-                    ).toFixed(2)} ${spendUsed.currency}`}
                 </p>
               </>
             )}

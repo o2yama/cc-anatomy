@@ -1,7 +1,6 @@
-//! メニューバー常駐アイコン。クリックで /status 相当の情報（アカウント・プラン・
-//! レートリミット各枠・今日の活動）をメニュー表示する。5分ごと自動更新。
+//! メニューバー常駐アイコン。登録済みアカウントの使用状況を並列表示する（閲覧のみ）。
+//! 切り替えはアプリ内のアカウント画面で行う。5分ごと自動更新。
 
-use serde_json::Value;
 use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem},
@@ -12,149 +11,68 @@ use tauri::{
 const TRAY_ID: &str = "status-tray";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// メニューに流し込む表示専用データ。ネットワーク・DB 取得はワーカースレッドで行い、
+/// メニューに流し込む表示専用データ。ネットワーク取得はワーカースレッドで行い、
 /// メニュー操作（NSMenu）はメインスレッド限定なので文字列だけを渡す
 struct StatusData {
-    /// メニューバーに常時出す短い文字列（セッション枠の使用率）
+    /// メニューバーに常時出す短い文字列（選択中アカウントの使用率）
     title: String,
-    /// 情報行（クリック不可の行として並べる）
+    /// 登録アカウントの使用状況を並べた行（閲覧のみ・クリック不可）
     lines: Vec<String>,
 }
 
+/// テキストのステータスバー（NSMenu は実バーを描けないので block 文字で表現する）
 fn gauge(pct: i64) -> String {
-    let filled = (pct.clamp(0, 100) / 10) as usize;
-    format!("{}{} {pct}%", "▓".repeat(filled), "░".repeat(10 - filled))
-}
-
-/// UTC ISO8601 をローカル "M/D H:MM" に変換。
-/// 依存クレートを増やさないため date コマンドで epoch を経由する
-fn reset_local(iso: &str) -> String {
-    let base = iso.split('.').next().unwrap_or(iso);
-    let utc = format!("{}+0000", base.trim_end_matches('Z'));
-    let epoch = std::process::Command::new("date")
-        .args(["-j", "-f", "%Y-%m-%dT%H:%M:%S%z", &utc, "+%s"])
-        .output();
-    if let Ok(o) = epoch {
-        if o.status.success() {
-            let secs = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if let Ok(o2) = std::process::Command::new("date")
-                .args(["-r", &secs, "+%-m/%-d %H:%M"])
-                .output()
-            {
-                if o2.status.success() {
-                    return String::from_utf8_lossy(&o2.stdout).trim().to_string();
-                }
-            }
-        }
-    }
-    // 変換失敗時は日付部分だけそのまま出す
-    iso.split('T').next().unwrap_or(iso).to_string()
-}
-
-fn limit_line(l: &Value) -> Option<String> {
-    let kind = l.get("kind")?.as_str()?;
-    let pct = l.get("percent")?.as_i64()?;
-    let label = match kind {
-        "session" => "5時間枠".to_string(),
-        "weekly_all" => "週間・全体".to_string(),
-        "weekly_scoped" => {
-            let model = l
-                .pointer("/scope/model/display_name")
-                .and_then(Value::as_str)
-                .unwrap_or("モデル別");
-            format!("週間・{model}")
-        }
-        other => other.to_string(),
-    };
-    let reset = l
-        .get("resets_at")
-        .and_then(Value::as_str)
-        .map(reset_local)
-        .unwrap_or_default();
-    Some(format!("{label}: {}（{reset} 復活）", gauge(pct)))
+    let p = pct.clamp(0, 100);
+    // 10 分割で四捨五入（75% → ▓8つ）
+    let filled = ((p + 5) / 10) as usize;
+    format!("{}{}", "▓".repeat(filled), "░".repeat(10 - filled))
 }
 
 fn fetch_status() -> StatusData {
+    // 登録済みアカウントの使用状況を並べる（アプリを開かず見比べられるように）。
+    // 切り替えはアプリ内のアカウント画面で行うため、ここは閲覧のみ
+    let accounts = crate::accounts::accounts_with_usage();
+    if accounts.is_empty() {
+        return StatusData {
+            title: "-".into(),
+            lines: vec!["アカウント未登録".into(), "CC Anatomy で追加してください".into()],
+        };
+    }
+
     let mut lines = Vec::new();
     let mut title = "-".to_string();
-
-    match crate::actions::get_account_profile()
-        .and_then(|p| serde_json::from_str::<Value>(&p).map_err(|e| e.to_string()))
-    {
-        Ok(p) => {
-            let name = p
-                .pointer("/account/display_name")
-                .and_then(Value::as_str)
-                .unwrap_or("(不明)");
-            let email = p
-                .pointer("/account/email")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let tier = p
-                .pointer("/organization/rate_limit_tier")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            lines.push(format!("{name} · {email}"));
-            lines.push(format!("プラン: {}", plan_label(tier)));
-        }
-        Err(e) => lines.push(format!("アカウント取得失敗: {e}")),
-    }
-
-    match crate::actions::get_rate_limits()
-        .and_then(|u| serde_json::from_str::<Value>(&u).map_err(|e| e.to_string()))
-    {
-        Ok(u) => {
+    for (i, a) in accounts.iter().enumerate() {
+        // アカウントごとにセクションを区切る（先頭以外の前に区切り線）
+        if i > 0 {
             lines.push("---".into());
-            if let Some(limits) = u.get("limits").and_then(Value::as_array) {
-                for l in limits {
-                    if let Some(line) = limit_line(l) {
-                        lines.push(line);
-                    }
-                }
-            }
-            if let Some(pct) = u.pointer("/five_hour/utilization").and_then(Value::as_f64) {
-                title = format!("{}%", pct.round() as i64);
-            }
-            let extra = u
-                .pointer("/extra_usage/is_enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            lines.push(format!(
-                "追加クレジット: {}",
-                if extra { "有効" } else { "無効" }
-            ));
         }
-        Err(e) => lines.push(format!("使用状況取得失敗: {e}")),
+        // メニューバーは閲覧専用なので、意味のある「ログイン中」（起動中セッションの
+        // 実際の消費先）だけを印として付ける。アプリ内の選択状態(active)はここには出さない
+        let live = if a.is_live { "　⦿ ログイン中" } else { "" };
+        lines.push(format!("{}{live}", a.name));
+        match a.usage {
+            Some((five, seven)) => {
+                // バッジはログイン中アカウントの使用率にする（起動中セッションの実際の消費先）
+                if a.is_live {
+                    title = format!("{}%", five.max(seven).round() as i64);
+                }
+                let f = five.round() as i64;
+                let s = seven.round() as i64;
+                lines.push(format!("5h   {} {f}%", gauge(f)));
+                lines.push(format!("週次 {} {s}%", gauge(s)));
+            }
+            None => lines.push("使用量取得不可".into()),
+        }
     }
 
-    if let Ok((count, last)) = crate::db::today_activity() {
-        lines.push("---".into());
-        lines.push(format!("今日のセッション: {count}件"));
-        if let Some(p) = last {
-            lines.push(format!("直近プロジェクト: {p}"));
+    // ログイン中アカウントが未登録なら、ライブ Keychain から直接バッジ用の使用率を取る
+    if title == "-" {
+        if let Ok((five, seven)) = crate::actions::live_usage_summary() {
+            title = format!("{}%", five.max(seven).round() as i64);
         }
     }
 
     StatusData { title, lines }
-}
-
-fn plan_label(tier: &str) -> String {
-    // "default_claude_max_20x" → "Max 20x"
-    if let Some(rest) = tier.strip_prefix("default_claude_") {
-        let mut parts = rest.splitn(2, '_');
-        let plan = parts.next().unwrap_or(rest);
-        let mult = parts.next().unwrap_or("");
-        if plan.is_empty() {
-            return tier.to_string();
-        }
-        let mut label = format!("{}{}", plan[..1].to_uppercase(), &plan[1..]);
-        if !mult.is_empty() {
-            label.push(' ');
-            label.push_str(mult);
-        }
-        return label;
-    }
-    tier.to_string()
 }
 
 /// StatusData からメニューを組み立てる（メインスレッドで呼ぶこと）
@@ -173,26 +91,32 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
     menu.append(&MenuItem::with_id(
         app,
         "refresh",
-        "今すぐ更新",
+        "ステータス更新 ♻️",
         true,
         None::<&str>,
     )?)?;
     menu.append(&MenuItem::with_id(
         app,
         "open",
-        "CC Anatomy を開く",
+        "アプリを開く",
         true,
         None::<&str>,
     )?)?;
     menu.append(&MenuItem::with_id(
         app,
         "check-update",
-        "アップデートを確認",
+        "バージョン確認",
         true,
         None::<&str>,
     )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(app, "quit", "終了", true, None::<&str>)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "quit",
+        "アプリを終了",
+        true,
+        None::<&str>,
+    )?)?;
     Ok(menu)
 }
 
@@ -229,17 +153,19 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .title("…")
         .menu(&menu)
         .show_menu_on_left_click(true)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-            "refresh" => refresh(app.clone()),
-            "check-update" => crate::updater::check(app.clone(), true),
-            "open" => {
-                if let Some(win) = app.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
+        .on_menu_event(|app, event| {
+            match event.id.as_ref() {
+                "refresh" => refresh(app.clone()),
+                "check-update" => crate::updater::check(app.clone(), true),
+                "open" => {
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
                 }
+                "quit" => app.exit(0),
+                _ => {}
             }
-            "quit" => app.exit(0),
-            _ => {}
         })
         .build(app)?;
 

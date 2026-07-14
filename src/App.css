@@ -1013,3 +1013,407 @@ main {
   font-size: 13px;
   margin: 12px 0;
 }
+
+/* ---- 環境診断 ---- */
+.diagnosis-panel {
+  position: absolute;
+  top: 40px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(760px, 92vw);
+  max-height: calc(100vh - 80px);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.diag-intro {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 8px 0;
+}
+
+.diag-points {
+  padding-left: 20px;
+  font-size: 13px;
+}
+
+.diag-note {
+  font-size: 12px;
+}
+
+.diag-primary {
+  align-self: flex-start;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 8px 18px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.diag-primary:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.diag-running {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.diag-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+}
+
+.diag-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: diag-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+@keyframes diag-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.diag-log {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  max-height: 45vh;
+  overflow-y: auto;
+  font-size: 12px;
+}
+
+.diag-log-line {
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.diag-log-line.diag-log-text {
+  color: var(--text);
+  white-space: normal;
+  margin: 4px 0;
+}
+
+.diag-report {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.diag-summary {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+}
+
+.diag-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.diag-sev {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.diag-sev-high {
+  color: #f0a0a0;
+}
+
+.diag-sev-medium {
+  color: #e8c07a;
+}
+
+.diag-sev-low {
+  color: var(--text-dim);
+}
+
+.diag-finding {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.diag-finding:hover {
+  background: var(--bg-hover);
+}
+
+.diag-finding input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.diag-finding-title {
+  font-weight: 600;
+}
+
+.diag-finding-title .count-badge {
+  margin-left: 0;
+  margin-right: 8px;
+}
+
+.diag-paths {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: ui-monospace, monospace;
+  word-break: break-all;
+}
+
+.diag-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding-top: 4px;
+  border-top: 1px solid var(--border);
+}
+
+/* ---- アカウント切り替え ---- */
+
+.acct-error {
+  color: var(--danger, #d2544b);
+  font-size: 13px;
+  margin: 0;
+}
+
+.acct-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-alt, rgba(127, 127, 127, 0.06));
+}
+
+.acct-banner p {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.acct-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.acct-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 4px 10px 4px 4px;
+}
+
+.acct-item.active {
+  border-color: var(--accent);
+}
+
+.acct-radio {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: none;
+  border: none;
+  padding: 8px 10px;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  border-radius: 8px;
+}
+
+.acct-radio:disabled {
+  cursor: default;
+}
+
+.acct-radio .dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  flex-shrink: 0;
+}
+
+.acct-radio .dot.on {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--panel, #fff);
+}
+
+.acct-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.acct-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.acct-email {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.acct-remove {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: inherit;
+  opacity: 0.7;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.acct-remove:hover {
+  opacity: 1;
+}
+
+.acct-pending {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+}
+
+.acct-pending > div {
+  flex: 1;
+}
+
+.acct-pending p {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.acct-add {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.acct-add input {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel, transparent);
+  color: inherit;
+  font-size: 13px;
+}
+
+.acct-note {
+  font-size: 12px;
+  margin: 0;
+}
+
+.acct-warn {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--danger, #d2544b);
+  border: 1px solid currentColor;
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+.acct-confirm {
+  font-size: 11px;
+  text-align: right;
+}
+
+.acct-remove.danger {
+  color: var(--danger, #d2544b);
+  border-color: currentColor;
+  opacity: 1;
+}
+
+
+.usage-note {
+  font-size: 11px;
+  line-height: 1.5;
+  margin: 4px 0 0;
+}
+
+/* ---- 使用状況ポップオーバーのカルーセル ---- */
+.usage-carousel-nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.usage-carousel-nav .icon-btn {
+  font-size: 20px;
+  line-height: 1;
+  padding: 0 8px;
+}
+
+.usage-carousel-dots {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+}
+
+.usage-carousel-dots .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--border);
+}
+
+.usage-carousel-dots .dot.on {
+  background: var(--accent);
+}
+
+.acct-live {
+  margin-left: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+  border: 1px solid currentColor;
+  border-radius: 5px;
+  padding: 1px 5px;
+}
