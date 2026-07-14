@@ -1,0 +1,69 @@
+# タグ push で全プラットフォームのビルド→updater署名→latest.json統合→GitHub Release を行う。
+# バージョン反映とタグ作成はローカルの scripts/release.sh が担当する。
+#
+# 前提 Secrets:
+#   TAURI_SIGNING_PRIVATE_KEY          … ~/.tauri/cc-anatomy.key の中身（紛失すると更新配信不能）
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD … 空文字列（鍵はパスワードなし生成）
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    strategy:
+      fail-fast: false
+      # tauri-action の latest.json 統合は「既存をダウンロード→platforms をマージ→再アップロード」の
+      # read-modify-write のため、並列実行するとプラットフォームのエントリが消える。直列で回す
+      max-parallel: 1
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target universal-apple-darwin --bundles app,dmg'
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # universal ビルドは両アーキテクチャの標準ライブラリが必要
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      # release.sh が注釈付きタグにリリースノートを入れて push してくる
+      - name: タグ注釈をリリースノートとして取り出す
+        id: notes
+        shell: bash
+        run: |
+          git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          NOTES="$(git tag -l --format='%(contents)' "${GITHUB_REF_NAME}")"
+          [ -z "$NOTES" ] && NOTES="CC Anatomy ${GITHUB_REF_NAME}"
+          { echo 'body<<NOTES_EOF'; echo "$NOTES"; echo 'NOTES_EOF'; } >> "$GITHUB_OUTPUT"
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'CC Anatomy ${{ github.ref_name }}'
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
