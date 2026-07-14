@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 pub fn home_dir() -> PathBuf {
-    // Windows に HOME 環境変数は無いため std に任せる（Rust 1.87 で非推奨解除・挙動修正済み）
+    // Windows に HOME 環境変数は無いため std に任せる（近年の Rust で挙動修正・非推奨解除済み）
     std::env::home_dir().expect("home directory not found")
 }
 

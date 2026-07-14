@@ -45,7 +45,8 @@ echo "==> git commit / tag / push"
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
 git commit -m "リリース v$VERSION" || echo "（バージョン変更なし・コミットスキップ）"
 git tag -a "v$VERSION" -m "$NOTES"
-git push origin main --tags
+# --tags は無関係なローカルタグまで push するため、コミットに紐づく注釈付きタグだけを送る
+git push origin main --follow-tags
 
 echo ""
 echo "✅ v$VERSION のタグを push しました。ビルドと配信は GitHub Actions が行います:"

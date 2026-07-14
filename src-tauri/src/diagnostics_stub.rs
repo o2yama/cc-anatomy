@@ -4,13 +4,20 @@
 
 #![allow(dead_code)]
 
-#[derive(serde::Serialize)]
+// ⚠ diagnostics.rs の定義と常に同期させること。乖離するとフロントとの契約が黙って壊れる
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct Finding {
+    pub id: String,
+    pub severity: String, // "high" | "medium" | "low"
+    pub category: String,
     pub title: String,
     pub detail: String,
+    pub fix_prompt: String,
+    #[serde(default)]
+    pub target_paths: Vec<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub struct DiagnosisReport {
     pub summary: String,
     pub findings: Vec<Finding>,
