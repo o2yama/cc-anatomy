@@ -179,6 +179,8 @@ export const api = {
     invoke<Transcript>("get_transcript", { sessionId }),
   listSkills: () => invoke<InventoryItem[]>("list_skills"),
   listAgents: () => invoke<InventoryItem[]>("list_agents"),
+  /** "macos" | "windows" | "linux"（Rust の std::env::consts::OS） */
+  getPlatform: () => invoke<string>("get_platform"),
   openInFinder: (path: string) => invoke<void>("open_in_finder", { path }),
   openInCmux: (path: string) => invoke<void>("open_in_cmux", { path }),
   openInTerminal: (path: string) => invoke<void>("open_in_terminal", { path }),

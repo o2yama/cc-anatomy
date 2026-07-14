@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, ProjectInfo, relativeTime } from "./api";
+import { useIsMac } from "./platform";
 
 /**
  * ツリーで選択された「階層」。ディレクトリはセッション実績の有無にかかわらず選択でき、
@@ -226,6 +227,7 @@ function ContextMenu({
 }) {
   const { sel } = menu;
   const hasPath = !!sel.path;
+  const isMac = useIsMac();
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
@@ -237,6 +239,10 @@ function ContextMenu({
     onClose();
     fn().catch((e) => window.alert(String(e)));
   };
+
+  // メニュー項目は全部 macOS 限定機能（Finder/cmux/Ghostty 起動・claude CLI 実行）のため、
+  // 非 macOS では右クリックメニュー自体を出さない
+  if (!isMac) return null;
 
   return (
     <>

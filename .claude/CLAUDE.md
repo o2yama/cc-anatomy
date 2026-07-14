@@ -33,8 +33,30 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 ## 開発コマンド
 
 - `npm run tauri dev` — 開発起動
-- `npm run tauri build` — 配布ビルド
-- `scripts/release.sh <version> ["ノート"]` — リリース一式（バージョン反映→署名ビルド→latest.json→commit/tag/push→GitHub Release）
+- `npm run tauri build` — 配布ビルド（macOS 配布物は `-- --target universal-apple-darwin`）
+- `scripts/release.sh <version> ["ノート"]` — リリース開始（バージョン反映→注釈付きタグ push。ビルドと配信は GitHub Actions）
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --ignored` — 実資格情報を使う使用量取得の e2e 検証
+
+## クロスプラットフォーム対応（2026-07-14 実装）
+
+macOS universal（Apple Silicon + Intel）と Windows（監視機能のみ）に対応。
+
+| 決定 | 理由 |
+|---|---|
+| macOS は universal binary 1本で配布。latest.json は darwin-aarch64 / darwin-x86_64 の両キーに同一アセット | 配布物・cask・latest.json の管理を1系統に保つ。既存 aarch64 ユーザーは darwin-aarch64 キー経由でシームレスに universal へ更新される |
+| リリースビルドは GitHub Actions（release.yml、tauri-action）。`max-parallel: 1` 必須 | Windows は Mac からクロスコンパイル不可のため CI 化が必須。tauri-action の latest.json 統合は read-modify-write で、並列実行するとプラットフォームエントリが消える |
+| Windows 第1弾は監視のみ（使用量・トレイ・自動更新）。アカウント切替・環境診断・右クリックメニューは macOS 限定 | それらは Keychain・`.zshrc` 注入・Terminal.app・claude CLI パス解決に依存し、Windows では根本的に再設計が要る |
+| 非 macOS は accounts / diagnostics を**同一シグネチャのスタブに `#[path]` 差し替え**。コマンド登録もフロント API 契約も変えない | 呼び出し側（lib.rs / tray.rs / actions.rs）を無修正に保つ。コンパイル時にコマンドを消すとフロントの invoke 漏れが即クラッシュになるため、スタブがエラー文字列を返す安全網にする |
+| ライブ資格情報は `credentials.rs` に抽象化。macOS = Keychain、Windows/Linux = `~/.claude/.credentials.json`（`CLAUDE_CONFIG_DIR` 対応） | Claude Code の公式仕様。JSON 構造（`claudeAiOauth.accessToken`）は全 OS 共通 |
+| API 呼び出しは curl CLI → **reqwest**（blocking + rustls-no-provider + rustls/ring） | Windows では GUI からのサブプロセス起動がコンソール窓を出す。TLS 構成は tauri-plugin-updater と同一にして依存を共有。**`rustls::crypto::ring::default_provider().install_default()` を呼ばないと実行時 panic**（actions.rs の HTTP クライアント初期化に組み込み済み） |
+| `date` コマンド → chrono | Windows に互換 `date` が無い |
+| トレイの使用率バッジ（`set_title`）は macOS のみ。他 OS はツールチップ + メニュー内ゲージ | tray-icon の title 描画は macOS 限定機能 |
+| フロントの OS 出し分けは `get_platform` コマンド + `src/platform.ts` の `useIsMac()` | プラグイン（@tauri-apps/plugin-os）追加より軽い。取得完了までは macOS 挙動に倒す |
+| Windows 版の検証は windows-build.yml（手動実行）で NSIS を作り、Windows 11 ARM VM の Prism x64 エミュレーションで行う | 手元に Windows 実機が無い。検証が取れるまで release.yml の matrix に windows-latest を**入れない**（未検証バイナリを配布しないため） |
+
+- Windows 配布を開始するとき: release.yml の matrix に `- platform: windows-latest` / `args: '--bundles nsis'` を追加するだけ（tauri-action が windows-x86_64 キーを latest.json にマージする）
+- 無署名 .exe は SmartScreen 警告が出る（「詳細情報」→「実行」で回避可能）。README に手順を書くこと
+- CI Secrets: `TAURI_SIGNING_PRIVATE_KEY`（= ~/.tauri/cc-anatomy.key の中身）/ `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`（空文字列）
 
 ## 自動アップデート（2026-07-13 実装・実機検証済み）
 

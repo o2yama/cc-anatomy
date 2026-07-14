@@ -1,10 +1,19 @@
-//! フォルダ右クリックメニューのアクション群。
-//! 外部アプリ起動（Finder / cmux / Ghostty）と、claude CLI ヘッドレス実行によるタスク抽出。
+//! フォルダ右クリックメニューのアクション群と Anthropic API 呼び出し。
+//! 外部アプリ起動（Finder / cmux / Ghostty）とタスク抽出は macOS 限定機能。
+//! 使用量取得（レート制限ヘッダ経由）は全プラットフォーム共通。
 
+#[cfg(target_os = "macos")]
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 
+/// macOS 限定コマンドを非対応 OS で呼ばれたときの応答。
+/// フロントの UI 出し分けが第一防衛で、これは取りこぼし時の安全網
+#[cfg(not(target_os = "macos"))]
+pub const MAC_ONLY: &str = "この機能は macOS 版でのみ利用できます";
+
 /// 存在するディレクトリだけを外部アプリに渡す（消えたパスで空ウィンドウを開かない）
+#[cfg(target_os = "macos")]
 fn ensure_dir(path: &str) -> Result<(), String> {
     if Path::new(path).is_dir() {
         Ok(())
@@ -13,6 +22,27 @@ fn ensure_dir(path: &str) -> Result<(), String> {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_finder(_path: &str) -> Result<(), String> {
+    Err(MAC_ONLY.into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_cmux(_path: &str) -> Result<(), String> {
+    Err(MAC_ONLY.into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn open_in_terminal(_path: &str) -> Result<(), String> {
+    Err(MAC_ONLY.into())
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn extract_tasks(_project: &str) -> Result<String, String> {
+    Err(MAC_ONLY.into())
+}
+
+#[cfg(target_os = "macos")]
 pub fn open_in_finder(path: &str) -> Result<(), String> {
     ensure_dir(path)?;
     Command::new("open")
@@ -22,6 +52,7 @@ pub fn open_in_finder(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub fn open_in_cmux(path: &str) -> Result<(), String> {
     ensure_dir(path)?;
     // GUI アプリは zsh の PATH を継承しないため、cmux CLI は app bundle 内の実体を直接叩く
@@ -41,6 +72,7 @@ pub fn open_in_cmux(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub fn open_in_terminal(path: &str) -> Result<(), String> {
     ensure_dir(path)?;
     Command::new("open")
@@ -51,29 +83,22 @@ pub fn open_in_terminal(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Claude Code がログインに使っている Keychain 資格情報のアクセストークン。
-/// トークンは呼び出し元の関数内で完結させ、戻り値・ログに含めない
+/// Claude Code がログインに使っているライブ資格情報のアクセストークン（保存場所は OS 別）
 fn live_keychain_token() -> Result<String, String> {
-    let keychain = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            "Claude Code-credentials",
-            "-w",
-        ])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !keychain.status.success() {
-        return Err("Keychain から Claude Code の資格情報を取得できません".into());
-    }
-    let creds: serde_json::Value =
-        serde_json::from_slice(&keychain.stdout).map_err(|e| e.to_string())?;
-    creds
-        .pointer("/claudeAiOauth/accessToken")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .ok_or("資格情報に accessToken がありません".into())
+    crate::credentials::live_token()
 }
+
+/// 使用量ポーリングで繰り返し呼ぶため、接続を使い回す共有クライアント。
+/// トークンは Authorization ヘッダで送る（argv に載らないので `ps` から見えない）
+static HTTP: std::sync::LazyLock<reqwest::blocking::Client> = std::sync::LazyLock::new(|| {
+    // rustls-no-provider 構成ではプロセスに crypto provider を明示登録する必要がある。
+    // updater 等が先に登録済みならエラーになるだけなので無視してよい
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .expect("HTTP クライアントの初期化に失敗")
+});
 
 /// 選択中アカウントのトークンで叩き、失敗したらライブ資格情報で再試行する。
 ///
@@ -96,34 +121,15 @@ fn oauth_get(url: &str) -> Result<String, String> {
     }
 }
 
-/// トークンは -H で渡すと argv に載り、同一ユーザーの `ps` から見えてしまう。
-/// 使用量ポーリングのたびに晒すことになるので、設定ファイル形式で stdin から渡す
 pub fn oauth_get_with_token(token: &str, url: &str) -> Result<String, String> {
-    let config = format!(
-        "silent\nmax-time = 10\nurl = \"{url}\"\n\
-         header = \"Authorization: Bearer {token}\"\n\
-         header = \"anthropic-beta: oauth-2025-04-20\"\n"
-    );
-    let mut child = Command::new("curl")
-        .arg("-K")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    {
-        use std::io::Write;
-        let stdin = child.stdin.as_mut().ok_or("stdin の取得に失敗")?;
-        stdin
-            .write_all(config.as_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err("API への接続に失敗しました".into());
-    }
-    let body = String::from_utf8_lossy(&out.stdout).to_string();
+    let resp = HTTP
+        .get(url)
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .map_err(|_| "API への接続に失敗しました".to_string())?;
+    let body = resp.text().map_err(|e| e.to_string())?;
     // トークン失効時などは {"error": ...} が返る。JSONでなければそのままエラー扱い
     let parsed: serde_json::Value =
         serde_json::from_str(&body).map_err(|_| "API の応答が不正です".to_string())?;
@@ -142,56 +148,34 @@ pub fn oauth_get_with_token(token: &str, url: &str) -> Result<String, String> {
 ///
 /// ヘッダには `anthropic-organization-id`（どのアカウントに課金されたか）と
 /// `anthropic-ratelimit-unified-*`（そのアカウントの使用率）が入っている
-fn probe_headers(token: &str) -> Result<(u16, String, Option<String>), String> {
+fn probe_headers(
+    token: &str,
+) -> Result<(u16, reqwest::header::HeaderMap, Option<String>), String> {
     let body = r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
-    let config = format!(
-        "silent\nmax-time = 20\ninclude\n\
-         url = \"https://api.anthropic.com/v1/messages\"\nrequest = \"POST\"\n\
-         header = \"Authorization: Bearer {token}\"\n\
-         header = \"anthropic-beta: oauth-2025-04-20\"\n\
-         header = \"anthropic-version: 2023-06-01\"\n\
-         header = \"content-type: application/json\"\n\
-         data = \"{}\"\n",
-        body.replace('\\', "\\\\").replace('"', "\\\"")
-    );
-    let mut child = Command::new("curl")
-        .arg("-K")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| e.to_string())?;
-    {
-        use std::io::Write;
-        let stdin = child.stdin.as_mut().ok_or("stdin の取得に失敗")?;
-        stdin
-            .write_all(config.as_bytes())
-            .map_err(|e| e.to_string())?;
-    }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
-    let (headers, body) = text
-        .split_once("\n\n")
-        .ok_or("API に接続できませんでした".to_string())?;
+    let resp = HTTP
+        .post("https://api.anthropic.com/v1/messages")
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .map_err(|_| "API に接続できませんでした".to_string())?;
 
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .ok_or("API の応答が不正です".to_string())?;
-    let error_type = serde_json::from_str::<serde_json::Value>(body)
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    let body = resp.text().unwrap_or_default();
+    let error_type = serde_json::from_str::<serde_json::Value>(&body)
         .ok()
         .and_then(|v| v.pointer("/error/type").and_then(|t| t.as_str()).map(String::from));
-    Ok((status, headers.to_string(), error_type))
+    Ok((status, headers, error_type))
 }
 
-fn header_value(headers: &str, key: &str) -> Option<String> {
-    headers.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        (name.trim().eq_ignore_ascii_case(key)).then(|| value.trim().to_string())
-    })
+fn header_value(headers: &reqwest::header::HeaderMap, key: &str) -> Option<String> {
+    headers
+        .get(key)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
 }
 
 pub enum TokenCheck {
@@ -344,17 +328,8 @@ pub fn usage_summary(token: &str) -> Result<UsageSummary, String> {
 }
 
 fn epoch_to_iso(secs: i64) -> Option<String> {
-    let out = Command::new("date")
-        .args([
-            "-u",
-            "-r",
-            &secs.to_string(),
-            "+%Y-%m-%dT%H:%M:%SZ",
-        ])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// 指定トークンのレートリミットを UI 用の JSON 値で返す（カルーセル表示の1アカウント分）
@@ -405,8 +380,24 @@ pub fn get_account_profile() -> Result<String, String> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    /// 実環境の資格情報とネットワークを使う e2e 検証。
+    /// curl → reqwest 置き換え後も、ライブ資格情報 → /v1/messages のレート制限ヘッダ →
+    /// 使用率組み立ての経路が実際に通ることを確かめる。
+    /// CI では資格情報が無いため ignore とし、手元で `cargo test -- --ignored` で実行する
+    #[test]
+    #[ignore]
+    fn live_usage_e2e() {
+        let u = super::live_usage_summary().expect("ライブ使用量の取得に失敗");
+        assert!((0.0..=100.0).contains(&u.five_pct), "5h 使用率が範囲外: {}", u.five_pct);
+        assert!(u.five_reset.is_some(), "5h リセット時刻が取れていない");
+    }
+}
+
 /// GUI アプリは zsh の PATH（.zshrc）を継承しないため、claude CLI は既知の
 /// インストール先から実体を探す
+#[cfg(target_os = "macos")]
 pub fn resolve_claude_bin() -> Result<std::path::PathBuf, String> {
     let home = crate::db::home_dir();
     let candidates = [
@@ -423,6 +414,7 @@ pub fn resolve_claude_bin() -> Result<std::path::PathBuf, String> {
 
 /// claude-mem のサマリー履歴を claude CLI（ヘッドレス）に渡して未完了タスクを抽出する。
 /// 抽出は要約作業なので軽量モデル（haiku）で十分。
+#[cfg(target_os = "macos")]
 pub fn extract_tasks(project: &str) -> Result<String, String> {
     let digest = crate::db::task_digest(project)?;
     if digest.trim().is_empty() {

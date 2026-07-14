@@ -24,6 +24,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tauri-plugin-dialog = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# TLS 構成は tauri-plugin-updater と同一（rustls + ring）にして依存ツリーを共有する。
+# aws-lc-rs を混ぜると Windows CI にビルドツール要求が増えるため避ける
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
 tauri-plugin-updater = "2"

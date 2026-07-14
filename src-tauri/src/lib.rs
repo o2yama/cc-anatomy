@@ -1,7 +1,19 @@
+// アカウント切り替えと環境診断は Keychain・.zshrc・Terminal.app に依存する macOS 限定機能。
+// 非 macOS では同一シグネチャのスタブに差し替え、コマンド登録とフロント API 契約は維持する
+#[cfg(target_os = "macos")]
 mod accounts;
-mod actions;
-mod db;
+#[cfg(not(target_os = "macos"))]
+#[path = "accounts_stub.rs"]
+mod accounts;
+#[cfg(target_os = "macos")]
 mod diagnostics;
+#[cfg(not(target_os = "macos"))]
+#[path = "diagnostics_stub.rs"]
+mod diagnostics;
+
+mod actions;
+mod credentials;
+mod db;
 mod env;
 mod inventory;
 mod transcript;
@@ -16,6 +28,12 @@ fn list_projects() -> Result<Vec<db::ProjectInfo>, String> {
 #[tauri::command]
 fn get_home_dir() -> String {
     db::home_dir().display().to_string()
+}
+
+/// フロントが macOS 限定 UI（アカウント切替・環境診断・Finder 等）を出し分けるための OS 名
+#[tauri::command]
+fn get_platform() -> String {
+    std::env::consts::OS.to_string()
 }
 
 #[tauri::command]
@@ -161,6 +179,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_projects,
             get_home_dir,
+            get_platform,
             get_project_env,
             read_doc,
             list_sessions,

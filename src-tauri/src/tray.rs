@@ -28,24 +28,16 @@ fn gauge(pct: i64) -> String {
     format!("{}{}", "▓".repeat(filled), "░".repeat(10 - filled))
 }
 
-/// epoch 秒をローカル時刻の表示に変換する。今日中なら時刻だけ、それ以外は日付つき。
-/// 依存クレートを増やさないため date コマンドで変換する
+/// epoch 秒をローカル時刻の表示に変換する。今日中なら時刻だけ、それ以外は日付つき
 fn reset_local(secs: i64) -> Option<String> {
-    let day_of = |args: &[&str]| -> Option<String> {
-        let out = std::process::Command::new("date").args(args).output().ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    let today = day_of(&["+%-m/%-d"])?;
-    let s = secs.to_string();
-    let target_day = day_of(&["-r", &s, "+%-m/%-d"])?;
-    let fmt = if target_day == today {
-        "+%H:%M"
+    use chrono::{Datelike, Local, TimeZone};
+    let dt = Local.timestamp_opt(secs, 0).single()?;
+    let time = dt.format("%H:%M");
+    if dt.date_naive() == Local::now().date_naive() {
+        Some(time.to_string())
     } else {
-        "+%-m/%-d %H:%M"
-    };
-    day_of(&["-r", &s, fmt])
+        Some(format!("{}/{} {time}", dt.month(), dt.day()))
+    }
 }
 
 fn reset_suffix(epoch: Option<i64>) -> String {
@@ -105,13 +97,20 @@ fn fetch_status() -> StatusData {
 /// StatusData からメニューを組み立てる（メインスレッドで呼ぶこと）
 fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
-    for line in &data.lines {
+    for (i, line) in data.lines.iter().enumerate() {
         if line == "---" {
             menu.append(&PredefinedMenuItem::separator(app)?)?;
         } else {
             // 情報行。enabled=false だと macOS がグレー表示して読みづらいため、
-            // 有効のままにして通常の文字色で出す（クリックしても何も起きない）
-            menu.append(&MenuItem::with_id(app, "", line, true, None::<&str>)?)?;
+            // 有効のままにして通常の文字色で出す（クリックしても何も起きない）。
+            // id は連番で一意にする（重複 id は Windows の muda でイベント誤配の恐れ）
+            menu.append(&MenuItem::with_id(
+                app,
+                format!("info-{i}"),
+                line,
+                true,
+                None::<&str>,
+            )?)?;
         }
     }
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -157,7 +156,12 @@ fn refresh<R: Runtime>(app: AppHandle<R>) {
                 if let Ok(menu) = build_menu(&handle, &data) {
                     let _ = tray.set_menu(Some(menu));
                 }
+                // トレイ横の文字列表示（タイトル）は macOS のみ対応。
+                // 他 OS はアイコンだけになるため、ホバーのツールチップで使用率を出す
+                #[cfg(target_os = "macos")]
                 let _ = tray.set_title(Some(&data.title));
+                #[cfg(not(target_os = "macos"))]
+                let _ = tray.set_tooltip(Some(&format!("CC Anatomy 使用率 {}", data.title)));
             }
         });
     });
@@ -174,10 +178,9 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // （ウィンドウ用の大きな透過アイコンを渡すと不可視になることがある）。
     // タイトルも最初から設定し、アイコン描画に失敗しても文字は必ず見えるようにする
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?;
-    TrayIconBuilder::with_id(TRAY_ID)
+    let builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .icon_as_template(false)
-        .title("…")
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
@@ -193,8 +196,11 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 "quit" => app.exit(0),
                 _ => {}
             }
-        })
-        .build(app)?;
+        });
+    // メニューバー横の文字列（使用率バッジ）は macOS のみ描画できる
+    #[cfg(target_os = "macos")]
+    let builder = builder.title("…");
+    builder.build(app)?;
 
     // 初回取得 + 5分ごとの自動更新
     let handle = app.clone();

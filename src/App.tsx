@@ -20,12 +20,15 @@ import {
 import { ProjectOverview } from "./ProjectOverview";
 import { DiagnosisOverlay } from "./Diagnosis";
 import { AccountsOverlay } from "./Accounts";
+import { useIsMac } from "./platform";
 import "./App.css";
 
 export default function App() {
   const [searchOpen, setSearchOpen] = useState(false);
   const [diagOpen, setDiagOpen] = useState(false);
   const [acctOpen, setAcctOpen] = useState(false);
+  // 環境診断・アカウント切り替えは macOS 限定機能（Keychain / Terminal.app 依存）
+  const isMac = useIsMac();
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -43,6 +46,8 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <h1>CC Anatomy</h1>
+        {isMac && (
+        <>
         <button
           className="icon-btn"
           title="環境診断"
@@ -82,6 +87,8 @@ export default function App() {
             <circle cx="12" cy="7" r="4" />
           </svg>
         </button>
+        </>
+        )}
         <UsagePopover />
         <button
           className="icon-btn"
@@ -106,9 +113,10 @@ export default function App() {
         <SessionsView />
       </main>
       {searchOpen && <GlobalSearchOverlay onClose={() => setSearchOpen(false)} />}
-      {/* 実行中に閉じても診断を継続できるよう、常にマウントして open で表示を切り替える */}
-      <DiagnosisOverlay open={diagOpen} onClose={() => setDiagOpen(false)} />
-      <AccountsOverlay open={acctOpen} onClose={() => setAcctOpen(false)} />
+      {/* 実行中に閉じても診断を継続できるよう、常にマウントして open で表示を切り替える
+          （macOS 限定機能のため非 macOS ではマウント自体を省く） */}
+      {isMac && <DiagnosisOverlay open={diagOpen} onClose={() => setDiagOpen(false)} />}
+      {isMac && <AccountsOverlay open={acctOpen} onClose={() => setAcctOpen(false)} />}
     </div>
   );
 }

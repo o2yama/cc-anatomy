@@ -6,7 +6,8 @@ use serde::Serialize;
 use std::path::PathBuf;
 
 pub fn home_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").expect("HOME not set"))
+    // Windows に HOME 環境変数は無いため std に任せる（Rust 1.87 で非推奨解除・挙動修正済み）
+    std::env::home_dir().expect("home directory not found")
 }
 
 /// claude-mem プラグインが導入されているか（DB ファイルの有無で判定）。
