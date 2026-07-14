@@ -37,10 +37,15 @@ export interface Tree {
  * （ツリー上の位置が決められず、偽のパスを作ると設定の読み先を誤るため）。
  */
 export function buildTree(projects: ProjectInfo[], home: string): Tree {
+  // Windows のパスは `C:\Users\...` 形式で来るため、区切りを `/` に正規化してから
+  // 階層分割する（Windows のファイル API は `/` 区切りをそのまま受け付ける）
+  const norm = (p: string) => p.split("\\").join("/");
+  home = norm(home);
   const root: DirNode = { name: "~", fullPath: home, children: [], lastActivity: 0 };
   const others: ProjectInfo[] = [];
 
-  for (const p of projects) {
+  for (const raw of projects) {
+    const p = raw.path ? { ...raw, path: norm(raw.path) } : raw;
     if (!p.path) {
       others.push(p);
       continue;

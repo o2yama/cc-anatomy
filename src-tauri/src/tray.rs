@@ -47,15 +47,42 @@ fn reset_suffix(epoch: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
+/// 登録アカウントが無いときの表示。ライブ（ログイン中）資格情報の使用量が取れるなら
+/// それを出す。アカウント登録機能の無い Windows/Linux ではこれが唯一の経路で、
+/// ここでライブを引かないとトレイ監視自体が成立しない
+fn live_only_status() -> StatusData {
+    match crate::actions::live_usage_summary() {
+        Ok(u) => {
+            let f = u.five_pct.round() as i64;
+            let s = u.seven_pct.round() as i64;
+            StatusData {
+                title: format!("{}%", u.five_pct.max(u.seven_pct).round() as i64),
+                lines: vec![
+                    "ログイン中アカウント".into(),
+                    format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)),
+                    format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)),
+                ],
+            }
+        }
+        Err(_) => StatusData {
+            title: "-".into(),
+            #[cfg(target_os = "macos")]
+            lines: vec!["アカウント未登録".into(), "CC Anatomy で追加してください".into()],
+            #[cfg(not(target_os = "macos"))]
+            lines: vec![
+                "使用量を取得できません".into(),
+                "Claude Code でログインしてください".into(),
+            ],
+        },
+    }
+}
+
 fn fetch_status() -> StatusData {
     // 登録済みアカウントの使用状況を並べる（アプリを開かず見比べられるように）。
     // 切り替えはアプリ内のアカウント画面で行うため、ここは閲覧のみ
     let accounts = crate::accounts::accounts_with_usage();
     if accounts.is_empty() {
-        return StatusData {
-            title: "-".into(),
-            lines: vec!["アカウント未登録".into(), "CC Anatomy で追加してください".into()],
-        };
+        return live_only_status();
     }
 
     let mut lines = Vec::new();

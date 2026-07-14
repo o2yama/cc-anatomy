@@ -14,7 +14,9 @@ URL="https://github.com/o2yama/cc-anatomy/releases/download/v${VERSION}/CC.Anato
 [[ -f "$CASK" ]] || { echo "エラー: cask がありません: $CASK" >&2; exit 1; }
 
 echo "==> dmg を取得して sha256 を計算: $URL"
-TMP="$(mktemp -d)"
+# 一時ファイルは案件内 tmp/（gitignore 対象）に置く運用ルールに合わせる
+TMP="$(cd "$(dirname "$0")/.." && pwd)/tmp/cask-update"
+mkdir -p "$TMP"
 trap 'rm -rf "$TMP"' EXIT
 curl -fsSL -o "$TMP/app.dmg" "$URL"
 SHA="$(shasum -a 256 "$TMP/app.dmg" | awk '{print $1}')"

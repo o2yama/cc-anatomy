@@ -27,6 +27,8 @@ if [[ -n "$(git status --porcelain)" ]]; then
   git status --short >&2
   exit 1
 fi
+# main 以外でタグを作ると push 対象から外れ、「配信開始」と表示だけされる事故になる
+[[ "$(git branch --show-current)" == "main" ]] || { echo "エラー: main ブランチで実行してください" >&2; exit 1; }
 
 echo "==> バージョンを $VERSION に更新"
 node -e "
@@ -43,7 +45,13 @@ cargo metadata --manifest-path src-tauri/Cargo.toml --format-version 1 >/dev/nul
 
 echo "==> git commit / tag / push"
 git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
-git commit -m "リリース v$VERSION" || echo "（バージョン変更なし・コミットスキップ）"
+# 「変更なし」だけをスキップし、hook 等による commit 失敗は握り潰さず止める
+# （旧 HEAD にタグを付けて古いコードを新バージョンとして配信する事故の防止）
+if git diff --cached --quiet; then
+  echo "（バージョン変更なし・コミットスキップ）"
+else
+  git commit -m "リリース v$VERSION"
+fi
 git tag -a "v$VERSION" -m "$NOTES"
 # --tags は無関係なローカルタグまで push するため、コミットに紐づく注釈付きタグだけを送る
 git push origin main --follow-tags
