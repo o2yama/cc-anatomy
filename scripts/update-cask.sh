@@ -28,5 +28,6 @@ sed -i '' \
   -e "/depends_on arch: :arm64/d" \
   "$CASK"
 
-echo "✅ cask を v$VERSION（universal, sha256=$SHA）に更新しました"
+# $VERSION 直後に全角括弧を続けると bash が変数名に巻き込むため ${} で区切る
+echo "✅ cask を v${VERSION}（universal, sha256=${SHA}）に更新しました"
 echo "   cd ~/MyProjects/homebrew-tap && git diff で確認して commit & push してください"
