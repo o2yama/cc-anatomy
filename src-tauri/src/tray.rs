@@ -1,8 +1,9 @@
-//! メニューバー常駐アイコン。ライブ（現在ログイン中）アカウントの使用状況のみ表示する（閲覧のみ）。
-//! 切り替えはアプリ内のアカウント画面で行う。5分ごと自動更新。
+//! メニューバー常駐アイコン。ライブ（現在ログイン中）アカウントの使用状況を表示し、
+//! 他の登録アカウントはクリックで Keychain スワップ切り替えができる。5分ごと自動更新。
 //!
 //! 2026-07-25 ユーザー決定で、監視用長期トークンによる複数アカウント使用率の並列表示は
 //! 全廃した。他の登録アカウントは名前だけを列挙し、使用率・リセット時刻は出さない。
+//! 2026-07-26 トレイからのワンクリック切り替えに対応（確認ダイアログを出せないため常に force）。
 
 use std::time::Duration;
 use tauri::{
@@ -10,17 +11,26 @@ use tauri::{
     tray::TrayIconBuilder,
     AppHandle, Manager, Runtime,
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const TRAY_ID: &str = "status-tray";
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// クリックで切り替えるメニュー項目 id のプレフィックス（id は "switch-<name>"）。
+/// name は validate_name により英数字・ハイフン・アンダースコアのみと保証されるため、
+/// このプレフィックスを剥がすだけで元の name を復元できる
+const SWITCH_ID_PREFIX: &str = "switch-";
 
 /// メニューに流し込む表示専用データ。ネットワーク取得はワーカースレッドで行い、
 /// メニュー操作（NSMenu）はメインスレッド限定なので文字列だけを渡す
 struct StatusData {
     /// メニューバーに常時出す短い文字列（選択中アカウントの使用率）
     title: String,
-    /// 登録アカウントの使用状況を並べた行（閲覧のみ・クリック不可）
-    lines: Vec<String>,
+    /// 「ログイン中: <名前>」の見出し行（取得できない時は代替文言）
+    live_header: String,
+    /// 使用率ゲージ行（5h/週次）。ログイン中アカウントが分かる時だけ入る
+    usage_lines: Vec<String>,
+    /// ライブ以外の登録アカウント。クリックでそのアカウントへ切り替える
+    other_accounts: Vec<crate::accounts::TrayAccount>,
 }
 
 /// テキストのステータスバー（NSMenu は実バーを描けないので block 文字で表現する）
@@ -51,64 +61,94 @@ fn reset_suffix(epoch: Option<i64>) -> String {
 }
 
 fn fetch_status() -> StatusData {
-    // ライブ（現在ログイン中）アカウントの使用率だけを表示する。切り替えはアプリ内の
-    // アカウント画面で行うため、ここは閲覧のみ
-    let mut lines = Vec::new();
-    let title = match crate::actions::live_usage_summary() {
+    // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す。
+    // 監視用長期トークンは全廃済みなので、使用率はライブアカウントのみ別途取得する
+    let registered = crate::accounts::registered_accounts();
+    let live_name = registered.iter().find(|a| a.is_live).map(|a| a.display_name.clone());
+    let other_accounts: Vec<_> = registered.into_iter().filter(|a| !a.is_live).collect();
+
+    let mut usage_lines = Vec::new();
+    let (live_header, title) = match crate::actions::live_usage_summary() {
         Ok(u) => {
             let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
-            lines.push("ログイン中アカウント".into());
-            lines.push(format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)));
-            lines.push(format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)));
-            format!("{}%", u.five_pct.max(u.seven_pct).round() as i64)
+            usage_lines.push(format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)));
+            usage_lines.push(format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)));
+            let header = match &live_name {
+                Some(name) => format!("ログイン中: {name}"),
+                None => "ログイン中アカウント".to_string(),
+            };
+            (header, format!("{}%", u.five_pct.max(u.seven_pct).round() as i64))
         }
         Err(_) => {
-            lines.push("使用量を取得できません".into());
-            lines.push("Claude Code でログインしてください".into());
-            "-".to_string()
+            usage_lines.push("使用量を取得できません".into());
+            usage_lines.push("Claude Code でログインしてください".into());
+            ("ログイン中アカウント".to_string(), "-".to_string())
         }
     };
 
-    // 他の登録アカウントは使用率を取得しない（監視用長期トークンを全廃したため）。
-    // 名前だけを列挙し、切り替え先の見当をつけられるようにする
-    #[cfg(target_os = "macos")]
-    {
-        let others: Vec<_> = crate::accounts::registered_accounts()
-            .into_iter()
-            .filter(|a| !a.is_live)
-            .collect();
-        if !others.is_empty() {
-            lines.push("---".into());
-            lines.push("登録済みの他アカウント".into());
-            for a in others {
-                lines.push(a.display_name);
-            }
-        }
+    StatusData {
+        title,
+        live_header,
+        usage_lines,
+        other_accounts,
     }
-
-    StatusData { title, lines }
 }
 
 /// StatusData からメニューを組み立てる（メインスレッドで呼ぶこと）
 fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
-    for (i, line) in data.lines.iter().enumerate() {
-        if line == "---" {
-            menu.append(&PredefinedMenuItem::separator(app)?)?;
-        } else {
-            // 情報行。enabled=false だと macOS がグレー表示して読みづらいため、
-            // 有効のままにして通常の文字色で出す（クリックしても何も起きない）。
-            // id は連番で一意にする（重複 id は Windows の muda でイベント誤配の恐れ）
-            menu.append(&MenuItem::with_id(
-                app,
-                format!("info-{i}"),
-                line,
-                true,
-                None::<&str>,
-            )?)?;
+
+    // 情報行。enabled=false だと macOS がグレー表示して読みづらいため、有効のままにして
+    // 通常の文字色で出す（クリックしても何も起きない）
+    menu.append(&MenuItem::with_id(
+        app,
+        "info-live-header",
+        &data.live_header,
+        true,
+        None::<&str>,
+    )?)?;
+    for (i, line) in data.usage_lines.iter().enumerate() {
+        menu.append(&MenuItem::with_id(
+            app,
+            format!("info-usage-{i}"),
+            line,
+            true,
+            None::<&str>,
+        )?)?;
+    }
+
+    if !data.other_accounts.is_empty() {
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
+        menu.append(&MenuItem::with_id(
+            app,
+            "info-others-header",
+            "その他のアカウント",
+            true,
+            None::<&str>,
+        )?)?;
+        for a in &data.other_accounts {
+            if a.has_credentials {
+                menu.append(&MenuItem::with_id(
+                    app,
+                    format!("{SWITCH_ID_PREFIX}{}", a.name),
+                    format!("「{}」に切り替え", a.display_name),
+                    true,
+                    None::<&str>,
+                )?)?;
+            } else {
+                // 資格情報スナップショットが無いアカウントは切り替え不可（disabled）
+                menu.append(&MenuItem::with_id(
+                    app,
+                    format!("noop-{}", a.name),
+                    format!("「{}」（未取り込み）", a.display_name),
+                    false,
+                    None::<&str>,
+                )?)?;
+            }
         }
     }
+
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(
         app,
@@ -164,10 +204,58 @@ pub fn refresh<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
+fn info_dialog<R: Runtime>(app: &AppHandle<R>, title: &str, message: &str) {
+    app.dialog()
+        .message(message)
+        .title(title)
+        .kind(MessageDialogKind::Info)
+        .blocking_show();
+}
+
+/// トレイのメニュー項目クリックによるアカウント切り替え。
+/// 確認ダイアログを出せない導線のため常に force=true で実行する
+/// （実行中ジョブに対する ensure_app_not_busy のハードブロックは維持）。
+///
+/// switch_account は Keychain 読み書き・profile API 呼び出し等のブロッキング処理を含むため、
+/// tokio ランタイムのコンテキストを持つスレッド（NSMenu イベントハンドラ）から直接呼ばず、
+/// oauth_get_with_token と同様に素の std::thread::spawn へ逃がす
+/// （reqwest::blocking をランタイムコンテキスト内で呼ぶと過去に tokio パニックを踏んでいる）
+fn switch_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
+    std::thread::spawn(move || match crate::accounts::switch_account(&name, true) {
+        Ok(crate::accounts::SwitchOutcome::Switched { warning }) => {
+            refresh(app.clone());
+            if let Some(w) = warning {
+                info_dialog(&app, "CC Anatomy", &w);
+            }
+        }
+        Ok(crate::accounts::SwitchOutcome::NeedsImport { .. }) => {
+            info_dialog(
+                &app,
+                "CC Anatomy",
+                "現在ログイン中のアカウントが未登録のため、トレイからは切り替えられません。\
+                 アプリのアカウント画面から操作してください。",
+            );
+        }
+        Ok(crate::accounts::SwitchOutcome::SessionsRunning { .. }) => {
+            // force=true では発生しないはずだが、念のため同じ案内で受ける
+            info_dialog(
+                &app,
+                "CC Anatomy",
+                "アプリのアカウント画面から操作してください。",
+            );
+        }
+        Err(e) => {
+            info_dialog(&app, "CC Anatomy", &format!("切り替えに失敗しました: {e}"));
+        }
+    });
+}
+
 pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let placeholder = StatusData {
         title: "…".into(),
-        lines: vec!["取得中…".into()],
+        live_header: "取得中…".into(),
+        usage_lines: Vec::new(),
+        other_accounts: Vec::new(),
     };
     let menu = build_menu(app, &placeholder)?;
 
@@ -181,7 +269,12 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| {
-            match event.id.as_ref() {
+            let id = event.id.as_ref();
+            if let Some(name) = id.strip_prefix(SWITCH_ID_PREFIX) {
+                switch_from_tray(app.clone(), name.to_string());
+                return;
+            }
+            match id {
                 "refresh" => refresh(app.clone()),
                 "check-update" => crate::updater::check(app.clone(), true),
                 "open" => {

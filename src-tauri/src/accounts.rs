@@ -398,9 +398,13 @@ fn validate_name(name: &str) -> Result<(), String> {
 /// メニューバーのアカウント一覧用。使用率は監視用長期トークンの全廃により持たない
 /// （表示名とライブ状態だけ返す。使用率はライブアカウントのみ `actions::live_usage_summary` で別途表示）
 pub struct TrayAccount {
+    /// switch_account に渡す内部識別子（Keychain サービス名の一部）
+    pub name: String,
     /// 表示名（display_name があればそちら、無ければ内部識別子 name）
     pub display_name: String,
     pub is_live: bool,
+    /// false の場合は資格情報スナップショットが無く、切り替え不可（未取り込み）
+    pub has_credentials: bool,
 }
 
 pub fn registered_accounts() -> Vec<TrayAccount> {
@@ -409,8 +413,10 @@ pub fn registered_accounts() -> Vec<TrayAccount> {
     meta.accounts
         .iter()
         .map(|a| TrayAccount {
+            name: a.name.clone(),
             display_name: resolve_display_name(&a.name, a.display_name.as_deref()),
             is_live: is_live_account(&a.org_id, live.as_deref()),
+            has_credentials: a.has_credentials,
         })
         .collect()
 }

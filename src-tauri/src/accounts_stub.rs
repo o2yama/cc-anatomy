@@ -27,8 +27,10 @@ pub struct AccountsState {
 }
 
 pub struct TrayAccount {
+    pub name: String,
     pub display_name: String,
     pub is_live: bool,
+    pub has_credentials: bool,
 }
 
 #[derive(Serialize)]
