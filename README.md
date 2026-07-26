@@ -1,6 +1,6 @@
 # cc-dashboard
 
-Claude Code の活動状況をローカルデータから可視化するデスクトップアプリ（Tauri v2 + React + TypeScript）。
+PC の環境を Claude Code が最も効果的に動けるようにセットアップするデスクトップアプリ（Tauri v2 + React + TypeScript）。まずは Claude Code の活動状況をローカルデータから可視化するところから始まる。
 
 ## 機能
 

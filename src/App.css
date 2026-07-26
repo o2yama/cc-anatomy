@@ -1233,58 +1233,79 @@ main {
 .acct-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 56px;
   border: 1px solid var(--border);
   border-radius: 10px;
-  padding: 4px 10px 4px 4px;
+  padding: 8px 12px;
+  cursor: grab;
 }
 
-.acct-item.active {
+.acct-item.live {
   border-color: var(--accent);
 }
 
-.acct-radio {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  background: none;
-  border: none;
-  padding: 8px 10px;
-  cursor: pointer;
-  text-align: left;
-  color: inherit;
-  border-radius: 8px;
+/* ドラッグ&ドロップでの並び替え。ドラッグ中のカードは半透明にし、
+   ドロップ先は上境界線で「ここに挿入される」ことを示す */
+.acct-item-dragging {
+  opacity: 0.5;
+  cursor: grabbing;
 }
 
-.acct-radio:disabled {
-  cursor: default;
+.acct-item-drag-over {
+  border-top: 2px solid var(--accent);
+  margin-top: -1px;
 }
 
-.acct-radio .dot {
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  border: 2px solid var(--border);
-  flex-shrink: 0;
-}
-
-.acct-radio .dot.on {
-  border-color: var(--accent);
-  background: var(--accent);
-  box-shadow: inset 0 0 0 2px var(--panel, #fff);
-}
-
-.acct-meta {
+.acct-info {
   display: flex;
   flex-direction: column;
   gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.acct-name-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
   min-width: 0;
 }
 
 .acct-name {
   font-size: 13px;
   font-weight: 600;
+  cursor: text;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+}
+
+.acct-name:hover {
+  background: var(--panel-alt, rgba(127, 127, 127, 0.1));
+}
+
+/* クリックして表示名を編集する input。編集していないときの見た目に馴染ませ、
+   フォーカス時だけ枠線で「編集中」と分かるようにする */
+.acct-name-input {
+  font-size: 13px;
+  font-weight: 600;
+  font-family: inherit;
+  color: inherit;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  min-width: 80px;
+  max-width: 200px;
+}
+
+.acct-name-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  background: var(--panel, transparent);
 }
 
 .acct-email {
@@ -1294,19 +1315,109 @@ main {
   white-space: nowrap;
 }
 
-.acct-remove {
+.acct-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+/* ボタンサイズを1トークンに統一（行内・バナー・モーダル共通） */
+.acct-btn {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 12px;
+  line-height: 1;
+  border-radius: 7px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+}
+
+.acct-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.acct-btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+}
+
+.acct-btn-secondary {
   background: none;
   border: 1px solid var(--border);
-  border-radius: 7px;
   color: inherit;
-  opacity: 0.7;
+}
+
+.acct-btn-secondary:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.acct-btn-ghost {
+  background: none;
+  border: 1px solid var(--border);
+  color: inherit;
+  opacity: 0.75;
+}
+
+.acct-btn-ghost:hover:not(:disabled) {
+  opacity: 1;
+}
+
+.acct-btn-danger {
+  background: none;
+  border: 1px solid var(--danger, #d2544b);
+  color: var(--danger, #d2544b);
+}
+
+.acct-btn-danger:hover:not(:disabled) {
+  background: var(--danger, #d2544b);
+  color: #fff;
+}
+
+/* 起動中セッション続行 / 未登録ログイン取り込みの確認は、押したボタンから離れた
+   バナーではなくモーダル中央のカードに統一する（何に対する確認か分かりやすくする） */
+.acct-modal-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+}
+
+.acct-modal-card {
+  width: min(380px, 86%);
+  background: var(--bg-panel, var(--panel, #fff));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+
+.acct-modal-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   font-size: 12px;
-  padding: 4px 10px;
+  color: var(--text-dim);
   cursor: pointer;
 }
 
-.acct-remove:hover {
-  opacity: 1;
+.acct-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .acct-pending {
@@ -1360,13 +1471,6 @@ main {
 
 .acct-confirm {
   font-size: 11px;
-  text-align: right;
-}
-
-.acct-remove.danger {
-  color: var(--danger, #d2544b);
-  border-color: currentColor;
-  opacity: 1;
 }
 
 

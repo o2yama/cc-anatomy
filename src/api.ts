@@ -137,33 +137,50 @@ export interface DiagnosisProgress {
 }
 
 export interface Account {
+  /** 内部識別子。Keychain サービス名・照合キーに使うため不変。表示には accountLabel() を使うこと */
   name: string;
+  /** ユーザーが自由に付けられる表示名。null なら name をそのまま表示する */
+  display_name: string | null;
   email: string;
   plan: string;
-  active: boolean;
-  /** Claude Code が現在 /login しているアカウント（起動中セッションが消費する先） */
+  /** Claude Code が現在 /login しているアカウント（起動中セッションが消費する先。＝選択中） */
   is_live: boolean;
-  /** Keychain 側のトークンが失われている（手動削除・1年の期限切れ等）。切り替えできない */
-  missing_token: boolean;
+  /** ライブ資格情報のスナップショットが登録済みか。無いと「切り替え」できない */
+  has_credentials: boolean;
+}
+
+/** 表示名のフォールバック規則。Rust 側の resolve_display_name と同じ規則
+ * （display_name があればそれ、無ければ内部識別子 name） */
+export function accountLabel(a: Pick<Account, "name" | "display_name">): string {
+  return a.display_name?.trim() || a.name;
 }
 
 export interface AccountsState {
   accounts: Account[];
-  /** .zshrc に読み込み行が入っているか。無いと切り替えても新しいシェルに効かない */
-  shell_integration: boolean;
+  /** 現在 PC にログイン中のアカウントの email（取得できなければ null） */
+  live_email: string | null;
+  /** 現在のログインがすでにどれかのアカウントとして登録済みか */
+  live_registered: boolean;
   /** 起動中の claude CLI セッション数。切り替えの反映には再起動が要る */
   running_sessions: number;
 }
 
-export interface AccountUsageDetail {
-  name: string;
-  email: string;
-  plan: string;
-  active: boolean;
-  is_live: boolean;
-  usage: RateLimits | null;
-  error: string | null;
-}
+/** Flow B: claude auth login の完了検知ポーリング結果 */
+export type PollResult =
+  | { status: "waiting" }
+  | { status: "done"; account: Account };
+
+/** Flow C: Keychain スワップ切り替えの結果 */
+export type SwitchOutcome =
+  | { status: "switched"; warning: string | null }
+  | { status: "needs_import"; live_email: string | null }
+  | { status: "sessions_running"; count: number };
+
+/** Flow B 開始（claude auth login を Terminal で起動）の結果。事前 sync-back を含む */
+export type StartLoginOutcome =
+  | { status: "started"; baseline: string; warning: string | null }
+  | { status: "needs_import"; live_email: string | null }
+  | { status: "sessions_running"; count: number };
 
 export const api = {
   listProjects: () => invoke<ProjectInfo[]>("list_projects"),
@@ -191,14 +208,18 @@ export const api = {
   runFixesInTerminal: (prompts: string[]) =>
     invoke<void>("run_fixes_in_terminal", { prompts }),
   getAccounts: () => invoke<AccountsState>("get_accounts"),
-  getAccountsUsage: () => invoke<AccountUsageDetail[]>("get_accounts_usage"),
-  addAccountInTerminal: (name: string) =>
-    invoke<void>("add_account_in_terminal", { name }),
-  claimPendingAccount: (name: string) =>
-    invoke<Account | null>("claim_pending_account", { name }),
-  switchAccount: (name: string) => invoke<void>("switch_account", { name }),
+  importLiveAccount: () => invoke<Account>("import_live_account"),
+  startAddAccountLogin: (force = false) =>
+    invoke<StartLoginOutcome>("start_add_account_login", { force }),
+  pollAddAccountLogin: (baseline: string) =>
+    invoke<PollResult>("poll_add_account_login", { baseline }),
+  switchAccount: (name: string, force = false) =>
+    invoke<SwitchOutcome>("switch_account", { name, force }),
   removeAccount: (name: string) => invoke<void>("remove_account", { name }),
-  installShellIntegration: () => invoke<void>("install_shell_integration"),
+  renameAccount: (name: string, displayName: string) =>
+    invoke<void>("rename_account", { name, displayName }),
+  reorderAccounts: (names: string[]) =>
+    invoke<void>("reorder_accounts", { names }),
   getRateLimits: async (): Promise<RateLimits> => {
     const raw = await invoke<string>("get_rate_limits");
     return JSON.parse(raw) as RateLimits;

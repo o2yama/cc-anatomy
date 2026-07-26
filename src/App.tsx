@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   api,
+  accountLabel,
   formatEpoch,
   AccountProfile,
   LimitEntry,
@@ -150,7 +151,8 @@ function formatReset(iso: string | null): string {
   });
 }
 
-/** カルーセルの1枚に渡す統一形（登録アカウント / ライブログインの両方をこの形に寄せる） */
+/** 使用量ポップオーバーに渡す統一形。常にライブ（現在ログイン中）アカウント1枚だけを表示する
+ * （2026-07-25 ユーザー決定で複数アカウントの使用量並列表示は全廃した） */
 interface UsageCard {
   name: string;
   email: string;
@@ -158,12 +160,6 @@ interface UsageCard {
   isLive: boolean;
   usage: RateLimits | null;
   error: string | null;
-}
-
-function planLabelRaw(plan: string): string {
-  if (plan === "claude_max") return "Max";
-  if (plan === "claude_pro") return "Pro";
-  return plan || "不明";
 }
 
 /** 1アカウント分の使用量（枠ごとのゲージ）を描画する */
@@ -207,94 +203,56 @@ function UsageCardView({ card }: { card: UsageCard }) {
           );
         })}
       </div>
-      {limits.length > 0 &&
-        !limits.some((l) => l.kind === "weekly_scoped") && (
-          <p className="muted usage-note">
-            モデル別（Fable
-            等）の内訳は、アカウント切り替え中は取得できません（長期トークンの権限制限）。
-          </p>
-        )}
     </>
   );
 }
 
-/** 各アカウントの使用状況を左右の矢印で見比べられるポップオーバー */
+/** 現在ログイン中（ライブ）アカウントの使用状況を表示するポップオーバー。
+ * 2026-07-25 ユーザー決定で複数アカウントの並列表示（カルーセル）は全廃し、
+ * ライブアカウント1枚だけを常に表示する */
 function UsagePopover() {
   const [open, setOpen] = useState(false);
-  const [cards, setCards] = useState<UsageCard[] | null>(null);
-  const [idx, setIdx] = useState(0);
+  const [card, setCard] = useState<UsageCard | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     setError(null);
-    setCards(null);
-    api
-      .getAccountsUsage()
-      .then((accts) => {
-        if (accts.length > 0) {
-          setCards(
-            accts.map((a) => ({
-              name: a.name,
-              email: a.email,
-              planLabel: planLabelRaw(a.plan),
-              isLive: a.is_live,
-              usage: a.usage,
-              error: a.error,
-            }))
-          );
-          // 選択中アカウントを最初に表示する
-          const activeIdx = accts.findIndex((a) => a.active);
-          setIdx(activeIdx >= 0 ? activeIdx : 0);
-          return;
-        }
-        // アカウント未登録時はライブログインを1枚だけ表示する
-        return Promise.all([
-          api.getRateLimits(),
-          api.getAccountProfile(),
-        ]).then(([u, p]) => {
-          setCards([
-            {
-              name:
-                p.account?.display_name ?? p.account?.full_name ?? "(名前不明)",
-              email: p.account?.email ?? "",
-              planLabel: planLabel(p),
-              // アカウント未登録時はライブログインそのものを表示している
-              isLive: true,
-              usage: u,
-              error: null,
-            },
-          ]);
-          setIdx(0);
+    setCard(null);
+    Promise.all([
+      api.getRateLimits(),
+      api.getAccountProfile(),
+      // 登録済みアカウントに表示名（display_name）が設定されていればそちらを優先する。
+      // 非 macOS や未登録では失敗するので、Anthropic 側の profile 名にフォールバックする
+      api.getAccounts().catch(() => null),
+    ])
+      .then(([u, p, accountsState]) => {
+        const live = accountsState?.accounts.find((a) => a.is_live);
+        setCard({
+          name: live
+            ? accountLabel(live)
+            : (p.account?.display_name ?? p.account?.full_name ?? "(名前不明)"),
+          email: p.account?.email ?? "",
+          planLabel: planLabel(p),
+          isLive: true,
+          usage: u,
+          error: null,
         });
       })
       .catch((e) => setError(String(e)));
   }, []);
 
-  // 取得は open の立ち上がりだけで走らせる。cards を依存に入れると、load が cards を
-  // 更新→再取得…の無限ループになりポップオーバーがちらつくため分離する
   useEffect(() => {
     if (open) load();
   }, [open, load]);
 
-  // キー操作は最新の cards を参照する必要があるので別 effect にする（再取得は起こさない）
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
-      if (cards && cards.length > 1) {
-        if (e.key === "ArrowLeft")
-          setIdx((i) => (i - 1 + cards.length) % cards.length);
-        if (e.key === "ArrowRight") setIdx((i) => (i + 1) % cards.length);
-      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, cards]);
-
-  const count = cards?.length ?? 0;
-  const prev = () => setIdx((i) => (i - 1 + count) % count);
-  const next = () => setIdx((i) => (i + 1) % count);
-  const card = cards?.[idx];
+  }, [open]);
 
   return (
     <div className="usage-anchor">
@@ -325,36 +283,10 @@ function UsagePopover() {
           <div className="usage-popover">
             {error ? (
               <p className="error-box">{error}</p>
-            ) : !cards || !card ? (
+            ) : !card ? (
               <p className="muted">取得中…</p>
             ) : (
               <>
-                {count > 1 && (
-                  <div className="usage-carousel-nav">
-                    <button
-                      className="icon-btn"
-                      title="前のアカウント（←）"
-                      onClick={prev}
-                    >
-                      ‹
-                    </button>
-                    <span className="usage-carousel-dots">
-                      {cards.map((_, i) => (
-                        <span
-                          key={i}
-                          className={i === idx ? "dot on" : "dot"}
-                        />
-                      ))}
-                    </span>
-                    <button
-                      className="icon-btn"
-                      title="次のアカウント（→）"
-                      onClick={next}
-                    >
-                      ›
-                    </button>
-                  </div>
-                )}
                 <UsageCardView card={card} />
                 <hr />
                 <p className="usage-extra muted">

@@ -1,5 +1,8 @@
-//! メニューバー常駐アイコン。登録済みアカウントの使用状況を並列表示する（閲覧のみ）。
+//! メニューバー常駐アイコン。ライブ（現在ログイン中）アカウントの使用状況のみ表示する（閲覧のみ）。
 //! 切り替えはアプリ内のアカウント画面で行う。5分ごと自動更新。
+//!
+//! 2026-07-25 ユーザー決定で、監視用長期トークンによる複数アカウント使用率の並列表示は
+//! 全廃した。他の登録アカウントは名前だけを列挙し、使用率・リセット時刻は出さない。
 
 use std::time::Duration;
 use tauri::{
@@ -47,74 +50,40 @@ fn reset_suffix(epoch: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
-/// 登録アカウントが無いときの表示。ライブ（ログイン中）資格情報の使用量が取れるなら
-/// それを出す。アカウント登録機能の無い Windows/Linux ではこれが唯一の経路で、
-/// ここでライブを引かないとトレイ監視自体が成立しない
-fn live_only_status() -> StatusData {
-    match crate::actions::live_usage_summary() {
+fn fetch_status() -> StatusData {
+    // ライブ（現在ログイン中）アカウントの使用率だけを表示する。切り替えはアプリ内の
+    // アカウント画面で行うため、ここは閲覧のみ
+    let mut lines = Vec::new();
+    let title = match crate::actions::live_usage_summary() {
         Ok(u) => {
             let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
-            StatusData {
-                title: format!("{}%", u.five_pct.max(u.seven_pct).round() as i64),
-                lines: vec![
-                    "ログイン中アカウント".into(),
-                    format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)),
-                    format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)),
-                ],
-            }
+            lines.push("ログイン中アカウント".into());
+            lines.push(format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)));
+            lines.push(format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)));
+            format!("{}%", u.five_pct.max(u.seven_pct).round() as i64)
         }
-        Err(_) => StatusData {
-            title: "-".into(),
-            #[cfg(target_os = "macos")]
-            lines: vec!["アカウント未登録".into(), "CC Anatomy で追加してください".into()],
-            #[cfg(not(target_os = "macos"))]
-            lines: vec![
-                "使用量を取得できません".into(),
-                "Claude Code でログインしてください".into(),
-            ],
-        },
-    }
-}
+        Err(_) => {
+            lines.push("使用量を取得できません".into());
+            lines.push("Claude Code でログインしてください".into());
+            "-".to_string()
+        }
+    };
 
-fn fetch_status() -> StatusData {
-    // 登録済みアカウントの使用状況を並べる（アプリを開かず見比べられるように）。
-    // 切り替えはアプリ内のアカウント画面で行うため、ここは閲覧のみ
-    let accounts = crate::accounts::accounts_with_usage();
-    if accounts.is_empty() {
-        return live_only_status();
-    }
-
-    let mut lines = Vec::new();
-    let mut title = "-".to_string();
-    for (i, a) in accounts.iter().enumerate() {
-        // アカウントごとにセクションを区切る（先頭以外の前に区切り線）
-        if i > 0 {
+    // 他の登録アカウントは使用率を取得しない（監視用長期トークンを全廃したため）。
+    // 名前だけを列挙し、切り替え先の見当をつけられるようにする
+    #[cfg(target_os = "macos")]
+    {
+        let others: Vec<_> = crate::accounts::registered_accounts()
+            .into_iter()
+            .filter(|a| !a.is_live)
+            .collect();
+        if !others.is_empty() {
             lines.push("---".into());
-        }
-        // メニューバーは閲覧専用なので、意味のある「ログイン中」（起動中セッションの
-        // 実際の消費先）だけを印として付ける。アプリ内の選択状態(active)はここには出さない
-        let live = if a.is_live { "　⦿ ログイン中" } else { "" };
-        lines.push(format!("{}{live}", a.name));
-        match &a.usage {
-            Some(u) => {
-                // バッジはログイン中アカウントの使用率にする（起動中セッションの実際の消費先）
-                if a.is_live {
-                    title = format!("{}%", u.five_pct.max(u.seven_pct).round() as i64);
-                }
-                let f = u.five_pct.round() as i64;
-                let s = u.seven_pct.round() as i64;
-                lines.push(format!("5h   {} {f}%{}", gauge(f), reset_suffix(u.five_reset)));
-                lines.push(format!("週次 {} {s}%{}", gauge(s), reset_suffix(u.seven_reset)));
+            lines.push("登録済みの他アカウント".into());
+            for a in others {
+                lines.push(a.display_name);
             }
-            None => lines.push("使用量取得不可".into()),
-        }
-    }
-
-    // ログイン中アカウントが未登録なら、ライブ Keychain から直接バッジ用の使用率を取る
-    if title == "-" {
-        if let Ok(u) = crate::actions::live_usage_summary() {
-            title = format!("{}%", u.five_pct.max(u.seven_pct).round() as i64);
         }
     }
 
@@ -173,8 +142,9 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
     Ok(menu)
 }
 
-/// 取得（別スレッド）→ メニュー反映（メインスレッド）
-fn refresh<R: Runtime>(app: AppHandle<R>) {
+/// 取得（別スレッド）→ メニュー反映（メインスレッド）。
+/// アカウント切り替え直後にも外部から呼べるよう公開する（m7: 切り替え後の即時反映）
+pub fn refresh<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || {
         let data = fetch_status();
         let handle = app.clone();

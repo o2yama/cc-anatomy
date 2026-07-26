@@ -122,7 +122,6 @@ pub fn run_diagnosis(app: &tauri::AppHandle) -> Result<DiagnosisReport, String> 
 
     let mut cmd = Command::new(claude);
     cmd.current_dir(&home)
-        .envs(crate::accounts::claude_env())
         .args([
             "-p",
             "--model",
@@ -313,6 +312,12 @@ fn parse_report(text: &str) -> Result<DiagnosisReport, String> {
     let end = text.rfind('}').ok_or("診断結果の JSON が閉じていません")?;
     serde_json::from_str(&text[start..=end])
         .map_err(|e| format!("診断結果の解析に失敗: {e}"))
+}
+
+/// 環境診断が実行中か。アカウント切り替え・追加は、診断が起動する claude -p 子プロセスも
+/// ライブ資格情報を消費・書き戻しうるため、実行中はブロックする（accounts::ensure_no_running_sessions）
+pub fn is_running() -> bool {
+    RUNNING_PID.lock().unwrap().is_some()
 }
 
 pub fn cancel_diagnosis() -> Result<(), String> {

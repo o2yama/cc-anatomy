@@ -31,6 +31,10 @@ pub fn cancel_diagnosis() -> Result<(), String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
+pub fn is_running() -> bool {
+    false
+}
+
 pub fn run_fixes_in_terminal(_app: &tauri::AppHandle, _prompts: Vec<String>) -> Result<(), String> {
     Err(crate::actions::MAC_ONLY.into())
 }
