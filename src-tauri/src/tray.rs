@@ -1,5 +1,5 @@
 //! メニューバー常駐アイコン。ライブ（現在ログイン中）アカウントの使用状況を表示し、
-//! 他の登録アカウントはクリックで Keychain スワップ切り替えができる。5分ごと自動更新。
+//! 他の登録アカウントはクリックで Keychain スワップ切り替えができる。1分ごと自動更新。
 //!
 //! 2026-07-25 ユーザー決定で、監視用長期トークン（`claude setup-token` による長期発行）は
 //! 全廃した。2026-07-26、切り替え前にどのアカウントが空いているか見えるようにする要望を受け、
@@ -25,7 +25,7 @@ use tauri::{
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
 const TRAY_ID: &str = "status-tray";
-const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// クリックで切り替えるメニュー項目 id のプレフィックス（id は "switch-<name>"）。
 /// name は validate_name により英数字・ハイフン・アンダースコアのみと保証されるため、
 /// このプレフィックスを剥がすだけで元の name を復元できる
@@ -70,29 +70,25 @@ struct OtherAccountEntry {
 /// 「その他のアカウント」1件分の使用率行。ログイン中セクションと同じ2行構成
 /// （`5h <バー> x%（リセット時刻）` / `週次 <バー> y%（リセット時刻）`）で揃える
 /// （2026-07-26 ユーザー要望: サフィックス方式では見づらいため統一した）。
-/// stale（キャッシュ返し）のときは % の直後に "*" を付ける。usage 自体が無い
-/// （キャッシュも無い）ときは縦に長くなりすぎないよう「未取得」1行（画像なし）にまとめる。
+/// usage 自体が無い（キャッシュも無い）ときは縦に長くなりすぎないよう「未取得」1行
+/// （画像なし）にまとめる。
 ///
 /// バーはグレー配色（`muted: true`）にして、ライブが主・その他アカウントが従という
 /// 視覚的階層をつける（2026-07-26 追加要望）
 fn usage_info_lines(usage: Option<&crate::accounts::AccountUsage>) -> Vec<InfoLine> {
     let Some(u) = usage else { return vec![InfoLine::Plain("未取得".to_string())] };
     let Some(five_pct) = u.five_pct else { return vec![InfoLine::Plain("未取得".to_string())] };
-    // バックエンドの stale フラグ（今回キャッシュ返しだったか）だけでなく、実際の経過時間
-    // （5分以上）でも判定し直す。取得直後でも stale=true になりうるため、そのままだと
-    // 「*」が常時ちらつく（2026-07-26 ユーザー指摘。Accounts.tsx の「0分前時点」と同じ問題）
-    let stale_mark = if is_display_stale(u.fetched_at, now_epoch()) { "*" } else { "" };
     // リセット時刻を過ぎている想定なら実質 0% とみなす
     let five_val = if u.five_probably_reset { 0 } else { five_pct.round() as i64 };
     let seven_val = u.seven_pct.unwrap_or(0.0).round() as i64;
     vec![
         InfoLine::Gauge {
-            label: format!("5h {five_val}%{stale_mark}{}", reset_suffix(u.five_reset)),
+            label: format!("5h {five_val}%{}", reset_suffix(u.five_reset)),
             pct: five_val,
             muted: true,
         },
         InfoLine::Gauge {
-            label: format!("週次 {seven_val}%{stale_mark}{}", reset_suffix(u.seven_reset)),
+            label: format!("週次 {seven_val}%{}", reset_suffix(u.seven_reset)),
             pct: seven_val,
             muted: true,
         },
@@ -159,21 +155,6 @@ fn reset_suffix(epoch: Option<i64>) -> String {
         .and_then(reset_local)
         .map(|t| format!("（{t} 復活）"))
         .unwrap_or_default()
-}
-
-fn now_epoch() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-/// 取得時刻から5分以上経っていれば「表示上も stale」とみなす。
-/// Accounts.tsx（フロント）の閾値と揃えている
-const STALE_DISPLAY_THRESHOLD_SECS: i64 = 5 * 60;
-
-fn is_display_stale(fetched_at: Option<i64>, now: i64) -> bool {
-    fetched_at.is_some_and(|t| now - t >= STALE_DISPLAY_THRESHOLD_SECS)
 }
 
 fn fetch_status() -> StatusData {
@@ -533,19 +514,4 @@ mod tests {
         assert_eq!(live_fill_color(100), (0xff, 0x3b, 0x30));
     }
 
-    #[test]
-    fn is_display_stale_uses_five_minute_threshold() {
-        // 取得直後（0分経過）は stale 扱いにしない（「0分前」表記が出ていた不具合の回帰確認）
-        assert!(!is_display_stale(Some(1_000), 1_000));
-        // 5分未満は stale 扱いにしない
-        assert!(!is_display_stale(Some(1_000), 1_000 + 299));
-        // ちょうど5分・それ以上は stale 扱いにする
-        assert!(is_display_stale(Some(1_000), 1_000 + 300));
-        assert!(is_display_stale(Some(1_000), 1_000 + 3600));
-    }
-
-    #[test]
-    fn is_display_stale_false_when_fetched_at_unknown() {
-        assert!(!is_display_stale(None, 1_000));
-    }
 }

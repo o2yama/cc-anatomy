@@ -17,7 +17,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToParentElement, restrictToVerticalAxis } from "@dnd-kit/modifiers";
-import { api, Account, AccountsState, AccountUsage, accountLabel, relativeTime } from "./api";
+import { api, Account, AccountsState, AccountUsage, accountLabel } from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
   claude_max: "Max",
@@ -29,18 +29,6 @@ const POLL_INTERVAL_MS = 2000;
 /** 使用量の常時監視（claude setup-token）は完全に任意の後付け機能なので、
  * ログイン待ち（5分）より短いタイムアウトでスキップ扱いにする */
 const MONITOR_TIMEOUT_MS = 90 * 1000;
-/** 取得時刻の注記（「◯分前時点」）を出す猶予。バックエンドの usage.stale フラグは
- * 「今回キャッシュ返しだったか」を示すだけで、取得直後でも true になりうるため
- * （「0分前時点」と出てしまっていた不具合）、表示側では経過時間で判定し直す。
- * トレイ（tray.rs）の stale マーク「*」も同じ5分閾値に揃えている */
-const STALE_DISPLAY_THRESHOLD_MS = 5 * 60 * 1000;
-
-/** fetched_at（epoch 秒 or ミリ秒。relativeTime と同じ桁判定）から5分以上経っていれば
- * 「表示上も stale」とみなす */
-function isDisplayStale(fetchedAtEpoch: number): boolean {
-  const ms = fetchedAtEpoch < 1e12 ? fetchedAtEpoch * 1000 : fetchedAtEpoch;
-  return Date.now() - ms >= STALE_DISPLAY_THRESHOLD_MS;
-}
 
 /**
  * 「起動中セッションがあります」確認ダイアログの「今後この確認を表示しない」設定。
@@ -142,14 +130,7 @@ function AccountRowContent({
         {account.email || "(メール未取得)"}
         {account.plan ? ` ・ ${PLAN_LABEL[account.plan] ?? account.plan}` : ""}
       </span>
-      {usageLine && (
-        <span className="muted acct-usage">
-          {usageLine}
-          {usage?.fetched_at != null && isDisplayStale(usage.fetched_at) && (
-            <span className="acct-usage-stale">（{relativeTime(usage.fetched_at)}時点）</span>
-          )}
-        </span>
-      )}
+      {usageLine && <span className="muted acct-usage">{usageLine}</span>}
       {/* 常時監視は切り替え機能とは独立の任意機能。過密にならないよう、未設定のときだけ
           小さなテキストリンクとして出す（設定済みは上のバッジで示すので導線は消える） */}
       {!account.has_monitor_token && onStartMonitor && (
