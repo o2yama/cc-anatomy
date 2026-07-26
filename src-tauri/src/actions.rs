@@ -156,6 +156,10 @@ fn oauth_get_with_token_blocking(token: &str, url: &str) -> Result<String, Strin
     Ok(body)
 }
 
+/// `/api/oauth/usage` のエンドポイント。ライブアカウントの使用量表示（actions.rs）と
+/// 登録済み全アカウントの使用率一括取得（accounts::get_accounts_usage）の両方から使うため公開する
+pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
 /// メニューバー向けの使用量サマリー。使用率は 0〜100、リセットは epoch 秒
 pub struct UsageSummary {
     pub five_pct: f64,
@@ -168,14 +172,11 @@ fn iso_to_epoch(s: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
 }
 
-/// 現在ログイン中（ライブ）アカウントの使用率。`/api/oauth/usage` を直接叩く
-/// （2026-07-25 ユーザー決定: 監視用長期トークンによる複数アカウント表示は全廃し、
-/// ライブアカウントのみを表示する一本道にした）
-pub fn live_usage_summary() -> Result<UsageSummary, String> {
-    let token = live_keychain_token()?;
-    let body = oauth_get_with_token(&token, "https://api.anthropic.com/api/oauth/usage")?;
+/// `/api/oauth/usage` の応答本文を UsageSummary へ変換する。ライブアカウント・登録済み他
+/// アカウント問わず同じ形の応答なので、accounts::get_accounts_usage からも共有して使う
+pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
     let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| "使用量の応答が不正です".to_string())?;
+        serde_json::from_str(body).map_err(|_| "使用量の応答が不正です".to_string())?;
     let five_pct = v
         .pointer("/five_hour/utilization")
         .and_then(|x| x.as_f64())
@@ -200,9 +201,18 @@ pub fn live_usage_summary() -> Result<UsageSummary, String> {
     })
 }
 
+/// 現在ログイン中（ライブ）アカウントの使用率。`/api/oauth/usage` を直接叩く
+/// （2026-07-25 ユーザー決定: 監視用長期トークンによる複数アカウント表示は全廃し、
+/// ライブアカウントのみを表示する一本道にした）
+pub fn live_usage_summary() -> Result<UsageSummary, String> {
+    let token = live_keychain_token()?;
+    let body = oauth_get_with_token(&token, USAGE_URL)?;
+    parse_usage_body(&body)
+}
+
 /// 表示対象アカウントのレートリミットを取得する（常にライブアカウント）
 pub fn get_rate_limits() -> Result<String, String> {
-    oauth_get("https://api.anthropic.com/api/oauth/usage")
+    oauth_get(USAGE_URL)
 }
 
 /// アカウント・組織・プラン情報を取得する（常にライブアカウント）

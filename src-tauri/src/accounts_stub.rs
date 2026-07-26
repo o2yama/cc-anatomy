@@ -33,6 +33,18 @@ pub struct TrayAccount {
     pub has_credentials: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AccountUsage {
+    pub name: String,
+    pub five_pct: Option<f64>,
+    pub seven_pct: Option<f64>,
+    pub five_reset: Option<i64>,
+    pub seven_reset: Option<i64>,
+    pub fetched_at: Option<i64>,
+    pub stale: bool,
+    pub five_probably_reset: bool,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "status")]
 pub enum PollResult {
@@ -106,5 +118,9 @@ pub fn rename_account(_name: &str, _display_name: &str) -> Result<(), String> {
 }
 
 pub fn reorder_accounts(_names: &[String]) -> Result<(), String> {
+    Err(crate::actions::MAC_ONLY.into())
+}
+
+pub fn get_accounts_usage() -> Result<Vec<AccountUsage>, String> {
     Err(crate::actions::MAC_ONLY.into())
 }

@@ -165,6 +165,22 @@ export interface AccountsState {
   running_sessions: number;
 }
 
+/** アカウント1件分の使用率。監視用長期トークンは復活させず、保存済みスナップショットの
+ * access token（期限内のときだけ）で /api/oauth/usage を照会した結果。
+ * stale=true はキャッシュ返し（今回は新規取得できなかった）を示す */
+export interface AccountUsage {
+  name: string;
+  five_pct: number | null;
+  seven_pct: number | null;
+  five_reset: number | null;
+  seven_reset: number | null;
+  /** 取得時刻（epoch 秒）。cache が無ければ null */
+  fetched_at: number | null;
+  stale: boolean;
+  /** 5h 枠のリセット時刻を過ぎている想定（実質 0% とみなせる） */
+  five_probably_reset: boolean;
+}
+
 /** Flow B: claude auth login の完了検知ポーリング結果 */
 export type PollResult =
   | { status: "waiting" }
@@ -220,6 +236,9 @@ export const api = {
     invoke<void>("rename_account", { name, displayName }),
   reorderAccounts: (names: string[]) =>
     invoke<void>("reorder_accounts", { names }),
+  /** 登録済み全アカウントの使用率一括取得。get_accounts とは別コマンドで、
+   * 一覧表示をブロックせずモーダルを開いた後に非同期で埋める想定 */
+  getAccountsUsage: () => invoke<AccountUsage[]>("get_accounts_usage"),
   getRateLimits: async (): Promise<RateLimits> => {
     const raw = await invoke<string>("get_rate_limits");
     return JSON.parse(raw) as RateLimits;

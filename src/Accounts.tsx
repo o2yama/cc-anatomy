@@ -17,7 +17,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToParentElement, restrictToVerticalAxis } from "@dnd-kit/modifiers";
-import { api, Account, AccountsState, accountLabel } from "./api";
+import { api, Account, AccountsState, AccountUsage, accountLabel, relativeTime } from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
   claude_max: "Max",
@@ -52,10 +52,21 @@ type SessionsConfirm =
   | { kind: "switch"; name: string; count: number }
   | { kind: "login"; count: number };
 
-/** 1行分の名前・email・バッジ表示。行本体（AccountRow）とドラッグ中のプレビュー
- * （AccountRowPreview）で共有する。編集中はクリック対象の名前が input に差し替わる */
+/** 使用率の1行分のテキスト（例: "5h 9% ・ 週 52%"）。リセット時刻を過ぎている想定なら
+ * 「5h リセット済み」に置き換える。値が無ければ null（呼び出し側は行ごと出さない） */
+function usageText(usage: AccountUsage): string | null {
+  if (usage.five_pct == null) return null;
+  const five = usage.five_probably_reset ? "5h リセット済み" : `5h ${Math.round(usage.five_pct)}%`;
+  const seven = usage.seven_pct != null ? ` ・ 週 ${Math.round(usage.seven_pct)}%` : "";
+  return `${five}${seven}`;
+}
+
+/** 1行分の名前・email・バッジ・使用率表示。行本体（AccountRow）とドラッグ中のプレビュー
+ * （AccountRowPreview）で共有する。編集中はクリック対象の名前が input に差し替わる。
+ * 使用率は get_accounts とは別コマンド（get_accounts_usage）で非同期に埋まるため任意（undefined 可） */
 function AccountRowContent({
   account,
+  usage,
   editing = false,
   editingValue = "",
   onEditingValueChange,
@@ -64,6 +75,7 @@ function AccountRowContent({
   onCancelEditingViaEscape,
 }: {
   account: Account;
+  usage?: AccountUsage;
   editing?: boolean;
   editingValue?: string;
   onEditingValueChange?: (v: string) => void;
@@ -71,6 +83,7 @@ function AccountRowContent({
   onCommitRename?: () => void;
   onCancelEditingViaEscape?: () => void;
 }) {
+  const usageLine = usage ? usageText(usage) : null;
   return (
     <div className="acct-info">
       <span className="acct-name-row">
@@ -103,6 +116,14 @@ function AccountRowContent({
         {account.email || "(メール未取得)"}
         {account.plan ? ` ・ ${PLAN_LABEL[account.plan] ?? account.plan}` : ""}
       </span>
+      {usageLine && (
+        <span className="muted acct-usage">
+          {usageLine}
+          {usage?.stale && usage.fetched_at != null && (
+            <span className="acct-usage-stale">（{relativeTime(usage.fetched_at)}時点）</span>
+          )}
+        </span>
+      )}
     </div>
   );
 }
@@ -125,6 +146,7 @@ function AccountRowPreview({ account }: { account: Account }) {
  */
 function AccountRow({
   account,
+  usage,
   dragDisabled,
   editing,
   editingValue,
@@ -141,6 +163,7 @@ function AccountRow({
   busy,
 }: {
   account: Account;
+  usage?: AccountUsage;
   dragDisabled: boolean;
   editing: boolean;
   editingValue: string;
@@ -190,6 +213,7 @@ function AccountRow({
 
       <AccountRowContent
         account={account}
+        usage={usage}
         editing={editing}
         editingValue={editingValue}
         onEditingValueChange={onEditingValueChange}
@@ -276,6 +300,9 @@ export function AccountsOverlay({
   onClose: () => void;
 }) {
   const [state, setState] = useState<AccountsState | null>(null);
+  // アカウントごとの使用率。get_accounts とは別コマンドで、一覧表示をブロックせず
+  // モーダルを開いた後に非同期で埋める（切り替え前にどのアカウントが空いているか見えるように）
+  const [usageByName, setUsageByName] = useState<Record<string, AccountUsage>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -314,6 +341,20 @@ export function AccountsOverlay({
   useEffect(() => {
     if (open) reload();
   }, [open, reload]);
+
+  // 使用率は一覧表示をブロックしないよう別コマンドで取りに行く。取得できなくても
+  // 一覧自体は成立するので、失敗は静かに無視する（行ごとの使用率表示が出ないだけ）
+  useEffect(() => {
+    if (!open) return;
+    api
+      .getAccountsUsage()
+      .then((list) => {
+        const map: Record<string, AccountUsage> = {};
+        for (const u of list) map[u.name] = u;
+        setUsageByName(map);
+      })
+      .catch(() => {});
+  }, [open]);
 
   // サーバーから再取得するたびに表示順をリセットする（並び替え失敗時の巻き戻しもこれで行う）
   useEffect(() => {
@@ -615,6 +656,7 @@ export function AccountsOverlay({
                   <AccountRow
                     key={a.name}
                     account={a}
+                    usage={usageByName[a.name]}
                     dragDisabled={dragDisabled}
                     editing={editingName === a.name}
                     editingValue={editingValue}

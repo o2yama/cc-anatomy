@@ -1,9 +1,11 @@
 //! メニューバー常駐アイコン。ライブ（現在ログイン中）アカウントの使用状況を表示し、
 //! 他の登録アカウントはクリックで Keychain スワップ切り替えができる。5分ごと自動更新。
 //!
-//! 2026-07-25 ユーザー決定で、監視用長期トークンによる複数アカウント使用率の並列表示は
-//! 全廃した。他の登録アカウントは名前だけを列挙し、使用率・リセット時刻は出さない。
-//! 2026-07-26 トレイからのワンクリック切り替えに対応（確認ダイアログを出せないため常に force）。
+//! 2026-07-25 ユーザー決定で、監視用長期トークン（`claude setup-token` による長期発行）は
+//! 全廃した。2026-07-26、切り替え前にどのアカウントが空いているか見えるようにする要望を受け、
+//! 保存済みスナップショットの access token（期限内のときだけ・refresh はしない）で他の
+//! 登録アカウントの使用率も表示するようにした（`accounts::get_accounts_usage` 参照）。
+//! 併せてトレイからのワンクリック切り替えにも対応した（確認ダイアログを出せないため常に force）。
 
 use std::time::Duration;
 use tauri::{
@@ -30,7 +32,35 @@ struct StatusData {
     /// 使用率ゲージ行（5h/週次）。ログイン中アカウントが分かる時だけ入る
     usage_lines: Vec<String>,
     /// ライブ以外の登録アカウント。クリックでそのアカウントへ切り替える
-    other_accounts: Vec<crate::accounts::TrayAccount>,
+    other_accounts: Vec<OtherAccountEntry>,
+}
+
+/// 「その他のアカウント」1件分。クリックで切り替えるメニュー項目に使用率も添える
+/// （2026-07-26: 切り替え前にどのアカウントが空いているか見えるようにする要望）
+struct OtherAccountEntry {
+    name: String,
+    display_name: String,
+    has_credentials: bool,
+    usage: Option<crate::accounts::AccountUsage>,
+}
+
+/// メニュー項目の末尾に添える使用率サフィックス（例: " — 5h 9% / 週 52%*"）。
+/// キャッシュ返し（stale）のときは末尾に "*" を付けるだけに留め、トレイの限られた幅で
+/// 「いつ時点か」の詳細までは出さない（詳細はアカウント画面側で見せる）
+fn usage_suffix(usage: Option<&crate::accounts::AccountUsage>) -> String {
+    let Some(u) = usage else { return String::new() };
+    let Some(five) = u.five_pct else { return String::new() };
+    let five_text = if u.five_probably_reset {
+        "5hリセット済み".to_string()
+    } else {
+        format!("5h {}%", five.round() as i64)
+    };
+    let seven_text = u
+        .seven_pct
+        .map(|p| format!(" / 週{}%", p.round() as i64))
+        .unwrap_or_default();
+    let stale_mark = if u.stale { "*" } else { "" };
+    format!(" — {five_text}{seven_text}{stale_mark}")
 }
 
 /// テキストのステータスバー（NSMenu は実バーを描けないので block 文字で表現する）
@@ -61,11 +91,27 @@ fn reset_suffix(epoch: Option<i64>) -> String {
 }
 
 fn fetch_status() -> StatusData {
-    // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す。
-    // 監視用長期トークンは全廃済みなので、使用率はライブアカウントのみ別途取得する
+    // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す
     let registered = crate::accounts::registered_accounts();
     let live_name = registered.iter().find(|a| a.is_live).map(|a| a.display_name.clone());
-    let other_accounts: Vec<_> = registered.into_iter().filter(|a| !a.is_live).collect();
+
+    // 一括照会はここ（トレイの定期更新・手動更新）とアカウント画面を開いた時だけに絞る
+    // （レート配慮。get_accounts_usage 自身も前回取得から60秒未満はキャッシュ返しにする）。
+    // 監視用長期トークンは復活させず、保存済みスナップショットの access token をそのまま使う
+    let usage = crate::accounts::get_accounts_usage().unwrap_or_default();
+    let other_accounts: Vec<_> = registered
+        .into_iter()
+        .filter(|a| !a.is_live)
+        .map(|a| {
+            let u = usage.iter().find(|u| u.name == a.name).cloned();
+            OtherAccountEntry {
+                name: a.name,
+                display_name: a.display_name,
+                has_credentials: a.has_credentials,
+                usage: u,
+            }
+        })
+        .collect();
 
     let mut usage_lines = Vec::new();
     let (live_header, title) = match crate::actions::live_usage_summary() {
@@ -132,7 +178,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
                 menu.append(&MenuItem::with_id(
                     app,
                     format!("{SWITCH_ID_PREFIX}{}", a.name),
-                    format!("「{}」に切り替え", a.display_name),
+                    format!("「{}」に切り替え{}", a.display_name, usage_suffix(a.usage.as_ref())),
                     true,
                     None::<&str>,
                 )?)?;

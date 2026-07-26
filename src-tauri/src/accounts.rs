@@ -149,6 +149,23 @@ struct StoredAccount {
     /// ライブ資格情報のスナップショット（CC Anatomy-cred-<name>）を登録済みか
     #[serde(default)]
     has_credentials: bool,
+    /// 直近に取得できた使用率のキャッシュ。get_accounts_usage が保存・参照する
+    /// （監視用長期トークンは復活させず、保存済みスナップショットの access token が
+    /// 有効期限内のときだけ照会する。refresh は絶対に行わない）
+    #[serde(default)]
+    usage_cache: Option<UsageCache>,
+}
+
+/// 使用率キャッシュ。access token が期限切れ・照会失敗のときはこれをそのまま返し、
+/// `fetched_at` で「いつ時点の値か」を示す
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct UsageCache {
+    five_pct: f64,
+    seven_pct: f64,
+    five_reset: Option<i64>,
+    seven_reset: Option<i64>,
+    /// 取得時刻（epoch 秒）
+    fetched_at: i64,
 }
 
 /// 表示名のフォールバック規則: 表示名が設定されていればそれを、無ければ内部識別子(name)を使う。
@@ -419,6 +436,149 @@ pub fn registered_accounts() -> Vec<TrayAccount> {
             has_credentials: a.has_credentials,
         })
         .collect()
+}
+
+/// 一括照会の連打防止。前回取得からこの秒数未満ならキャッシュをそのまま返す
+/// （モーダルを開き直す・トレイの手動更新連打で毎回 API を叩かないようにする）
+const USAGE_MIN_REFETCH_SECS: i64 = 60;
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 登録済み全アカウントの使用率表示用。切り替え前に「どのアカウントが空いているか」を
+/// 見られるようにするための情報で、監視用長期トークンは復活させない（2026-07-25 全廃済み）。
+/// 保存済みスナップショットの access token をそのまま使い、期限切れでも refresh は一切しない
+/// （refresh してしまうと当該アカウントの refresh token が消費され、切り替え機能の安全性の
+/// 根幹である「refresh token は Claude Code 本体だけが触る」という前提が崩れるため）
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AccountUsage {
+    pub name: String,
+    pub five_pct: Option<f64>,
+    pub seven_pct: Option<f64>,
+    pub five_reset: Option<i64>,
+    pub seven_reset: Option<i64>,
+    /// 取得時刻（epoch 秒）。cache が無ければ None
+    pub fetched_at: Option<i64>,
+    /// true ならキャッシュ返し（今回は新規取得できなかった）
+    pub stale: bool,
+    /// 5h 枠のリセット時刻を過ぎている想定（実質 0% とみなせる）
+    pub five_probably_reset: bool,
+}
+
+/// access token の有効期限（epoch ミリ秒）が現在時刻（epoch 秒）より未来かどうか。
+/// 期限切れなら照会せずキャッシュへフォールバックする（refresh は絶対にしない）
+fn token_is_still_valid(expires_at_ms: i64, now_secs: i64) -> bool {
+    expires_at_ms > now_secs * 1000
+}
+
+/// UsageCache から API 返却用の AccountUsage を組み立てる純粋関数（テスト容易性のため
+/// ネットワーク・ファイル IO と分離する）。stale は呼び出し側が「今回は新規取得したか」を渡す
+fn to_account_usage(name: &str, cache: Option<&UsageCache>, stale: bool, now: i64) -> AccountUsage {
+    match cache {
+        Some(c) => AccountUsage {
+            name: name.to_string(),
+            five_pct: Some(c.five_pct),
+            seven_pct: Some(c.seven_pct),
+            five_reset: c.five_reset,
+            seven_reset: c.seven_reset,
+            fetched_at: Some(c.fetched_at),
+            stale,
+            five_probably_reset: c.five_reset.is_some_and(|reset| reset <= now),
+        },
+        None => AccountUsage {
+            name: name.to_string(),
+            five_pct: None,
+            seven_pct: None,
+            five_reset: None,
+            seven_reset: None,
+            fetched_at: None,
+            stale: true,
+            five_probably_reset: false,
+        },
+    }
+}
+
+/// 直近の取得から USAGE_MIN_REFETCH_SECS 未満なら再照会せずキャッシュを返してよいか
+fn cache_is_fresh_enough(fetched_at: i64, now: i64) -> bool {
+    now - fetched_at < USAGE_MIN_REFETCH_SECS
+}
+
+/// 保存済みスナップショット（CC Anatomy-cred-<name>）から access token と有効期限
+/// （epoch ミリ秒、claudeAiOauth.expiresAt）を取り出す
+fn stored_access_token(name: &str) -> Option<(String, i64)> {
+    let raw = keychain_read(&cred_svc(name))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let token = v.pointer("/claudeAiOauth/accessToken")?.as_str()?.to_string();
+    let expires_at = v.pointer("/claudeAiOauth/expiresAt")?.as_i64()?;
+    Some((token, expires_at))
+}
+
+/// 登録済み全アカウント（has_credentials のもの）の使用率をまとめて取得する。
+///
+/// - ライブアカウントはライブ Keychain の access token、他は保存済みスナップショットの
+///   access token を使う。どちらも期限切れなら照会せず usage_cache をそのまま返す（stale=true）
+/// - 前回取得から USAGE_MIN_REFETCH_SECS 未満のアカウントも同様にキャッシュを返す（連打防止）
+/// - 照会に成功したら usage_cache へ保存する。切り替え後もこれが「最終既知値」として残る
+/// - refresh は一切行わない（access token 期限切れは正常な状態として静かにキャッシュへ委ねる）
+pub fn get_accounts_usage() -> Result<Vec<AccountUsage>, String> {
+    let mut meta = load_meta();
+    let live = live_org_id();
+    let now = now_epoch();
+    let mut changed = false;
+    let mut results = Vec::with_capacity(meta.accounts.len());
+
+    for idx in 0..meta.accounts.len() {
+        if !meta.accounts[idx].has_credentials {
+            continue;
+        }
+        let name = meta.accounts[idx].name.clone();
+        let is_live = is_live_account(&meta.accounts[idx].org_id, live.as_deref());
+        let cache = meta.accounts[idx].usage_cache.clone();
+
+        if cache.as_ref().is_some_and(|c| cache_is_fresh_enough(c.fetched_at, now)) {
+            results.push(to_account_usage(&name, cache.as_ref(), true, now));
+            continue;
+        }
+
+        let token = if is_live {
+            crate::credentials::live_token().ok()
+        } else {
+            stored_access_token(&name)
+                .filter(|(_, expires_at)| token_is_still_valid(*expires_at, now))
+                .map(|(token, _)| token)
+        };
+
+        let fetched = token.and_then(|t| {
+            crate::actions::oauth_get_with_token(&t, crate::actions::USAGE_URL)
+                .ok()
+                .and_then(|body| crate::actions::parse_usage_body(&body).ok())
+        });
+
+        match fetched {
+            Some(summary) => {
+                let new_cache = UsageCache {
+                    five_pct: summary.five_pct,
+                    seven_pct: summary.seven_pct,
+                    five_reset: summary.five_reset,
+                    seven_reset: summary.seven_reset,
+                    fetched_at: now,
+                };
+                meta.accounts[idx].usage_cache = Some(new_cache.clone());
+                changed = true;
+                results.push(to_account_usage(&name, Some(&new_cache), false, now));
+            }
+            None => results.push(to_account_usage(&name, cache.as_ref(), true, now)),
+        }
+    }
+
+    if changed {
+        save_meta(&meta)?;
+    }
+    Ok(results)
 }
 
 /// ユーザーが開いている Claude Code セッション数（＝再起動すれば切り替わるもの）。
@@ -712,6 +872,7 @@ pub fn import_live_account() -> Result<Account, String> {
             org_id: org_id.clone().unwrap_or_default(),
             oauth_account: Some(oauth_account),
             has_credentials: true,
+            usage_cache: None,
         }),
     }
     sync_active_pointer(&mut meta);
@@ -1254,6 +1415,7 @@ mod tests {
             org_id: org_id.to_string(),
             oauth_account: None,
             has_credentials: false,
+            usage_cache: None,
         }
     }
 
@@ -1536,5 +1698,76 @@ mod tests {
         })
         .expect("profile が一致すれば成功するはず");
         assert!(!owner.mismatched);
+    }
+
+    fn cache(five_pct: f64, seven_pct: f64, five_reset: Option<i64>, fetched_at: i64) -> UsageCache {
+        UsageCache {
+            five_pct,
+            seven_pct,
+            five_reset,
+            seven_reset: None,
+            fetched_at,
+        }
+    }
+
+    #[test]
+    fn token_is_still_valid_compares_ms_to_secs() {
+        // expiresAt は epoch ミリ秒、now は epoch 秒。単位を揃え忘れると
+        // 「期限切れなのに有効」「有効なのに期限切れ」の両方の誤判定になりうる
+        assert!(token_is_still_valid(1_000_000, 900)); // 1_000_000ms = 1000s > 900s
+        assert!(!token_is_still_valid(1_000_000, 1_100)); // 1000s <= 1100s
+    }
+
+    #[test]
+    fn cache_is_fresh_enough_within_window() {
+        assert!(cache_is_fresh_enough(1_000, 1_059));
+        assert!(!cache_is_fresh_enough(1_000, 1_060));
+    }
+
+    #[test]
+    fn to_account_usage_no_cache_reports_stale_without_values() {
+        let usage = to_account_usage("acct", None, false, 1_000);
+        assert_eq!(usage.five_pct, None);
+        assert!(usage.stale, "キャッシュが無ければ stale 扱いにする");
+        assert!(!usage.five_probably_reset);
+    }
+
+    #[test]
+    fn to_account_usage_fresh_fetch_is_not_stale() {
+        let c = cache(9.0, 52.0, Some(2_000), 1_000);
+        let usage = to_account_usage("acct", Some(&c), false, 1_000);
+        assert_eq!(usage.five_pct, Some(9.0));
+        assert_eq!(usage.seven_pct, Some(52.0));
+        assert_eq!(usage.fetched_at, Some(1_000));
+        assert!(!usage.stale);
+    }
+
+    #[test]
+    fn to_account_usage_cached_fetch_is_stale() {
+        let c = cache(9.0, 52.0, Some(2_000), 1_000);
+        let usage = to_account_usage("acct", Some(&c), true, 5_000);
+        assert!(usage.stale);
+    }
+
+    #[test]
+    fn to_account_usage_flags_five_hour_probably_reset() {
+        // 現在時刻(5_000) がリセット時刻(2_000) を過ぎている＝実質 0% とみなせる
+        let c = cache(80.0, 52.0, Some(2_000), 1_000);
+        let usage = to_account_usage("acct", Some(&c), true, 5_000);
+        assert!(usage.five_probably_reset);
+    }
+
+    #[test]
+    fn to_account_usage_not_yet_reset_before_reset_time() {
+        let c = cache(80.0, 52.0, Some(9_000), 1_000);
+        let usage = to_account_usage("acct", Some(&c), true, 5_000);
+        assert!(!usage.five_probably_reset);
+    }
+
+    #[test]
+    fn to_account_usage_no_reset_time_never_flags_reset() {
+        let c = cache(80.0, 52.0, None, 1_000);
+        let usage = to_account_usage("acct", Some(&c), true, 5_000);
+        assert!(!usage.five_probably_reset);
     }
 }

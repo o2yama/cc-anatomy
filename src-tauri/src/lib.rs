@@ -176,6 +176,13 @@ fn reorder_accounts(names: Vec<String>) -> Result<(), String> {
     accounts::reorder_accounts(&names)
 }
 
+/// 登録済み全アカウントの使用率一括取得。Keychain 読み取り・ネットワーク呼び出しを
+/// 伴うため async にし、一覧表示（get_accounts）をブロックしない別コマンドにする
+#[tauri::command(async)]
+fn get_accounts_usage() -> Result<Vec<accounts::AccountUsage>, String> {
+    accounts::get_accounts_usage()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -231,7 +238,8 @@ pub fn run() {
             switch_account,
             remove_account,
             rename_account,
-            reorder_accounts
+            reorder_accounts,
+            get_accounts_usage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

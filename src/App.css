@@ -1346,6 +1346,19 @@ main {
   white-space: nowrap;
 }
 
+/* 切り替え前にどのアカウントが空いているか一目で分かるよう、email 行の下に小さく出す */
+.acct-usage {
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* キャッシュ返し（stale）のときだけ「（3時間前時点）」等を薄く添える */
+.acct-usage-stale {
+  opacity: 0.7;
+}
+
 .acct-actions {
   display: flex;
   align-items: center;
