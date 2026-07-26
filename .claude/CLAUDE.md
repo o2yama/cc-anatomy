@@ -54,6 +54,11 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 - アプリ更新時は .app 差し替えだけでは反映されない。実行中プロセスの kill → open -a 再起動まで必要
 - tauri build の .dmg 生成はバックグラウンドシェルからだと失敗する（Finder 操作が絡む）。フォアグラウンドで実行する
 - 配布物は無署名・aarch64 のみ。初回起動は「プライバシーとセキュリティ → このまま開く」が必要
+- **Tauri v2 の WebView はデフォルトで `dragDropEnabled: true`**（ネイティブのファイルドロップ処理が
+  HTML5 の dragstart/dragover/drop イベントを横取りし、webview 内で発火しなくなる）。
+  HTML5 Drag and Drop を使う画面（アカウント一覧の並び替え等）がある限り、
+  `src-tauri/tauri.conf.json` の `app.windows[0]` に `"dragDropEnabled": false` が必須
+  （v0.4.0 でこの設定漏れにより D&D 並び替えが実機で全く動かないバグを出した。patch で修正）
 
 ---
 

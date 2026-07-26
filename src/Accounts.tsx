@@ -393,6 +393,8 @@ export function AccountsOverlay({
                   }
                   setDragIndex(idx);
                   e.dataTransfer.effectAllowed = "move";
+                  // WebKit（macOS の WKWebView）は setData が無いとドラッグ自体を開始しない
+                  e.dataTransfer.setData("text/plain", a.name);
                 }}
                 onDragOver={(e) => {
                   if (dragIndex === null) return;
