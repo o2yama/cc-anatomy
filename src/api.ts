@@ -239,6 +239,11 @@ export const api = {
   /** 登録済み全アカウントの使用率一括取得。get_accounts とは別コマンドで、
    * 一覧表示をブロックせずモーダルを開いた後に非同期で埋める想定 */
   getAccountsUsage: () => invoke<AccountUsage[]>("get_accounts_usage"),
+  /** トレイパネル（tray-panel ウィンドウ）の「アプリを開く」/「終了」から呼ぶ。
+   * capabilities を増やさずに済むよう、ウィンドウ操作は独自コマンド越しに行う
+   * （@tauri-apps/api/window 等のプラグイン API は tray-panel の capability 未設定だと使えない） */
+  showMainWindow: () => invoke<void>("show_main_window"),
+  quitApp: () => invoke<void>("quit_app"),
   getRateLimits: async (): Promise<RateLimits> => {
     const raw = await invoke<string>("get_rate_limits");
     return JSON.parse(raw) as RateLimits;

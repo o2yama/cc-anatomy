@@ -1565,3 +1565,184 @@ main {
   border-radius: 5px;
   padding: 1px 5px;
 }
+
+/* ---- トレイのカスタムパネル（tray-panel ウィンドウ、CleanMyMac 風のフレームレス小窓） ----
+   ウィンドウ自体は transparent: true なので、角丸の外側が実際に透過して見えるよう
+   html/body の背景も透明にする（main.tsx 経由の TrayPanel だけがこのクラスを付ける） */
+html.tray-panel-mode,
+html.tray-panel-mode body {
+  background: transparent;
+}
+
+.tray-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  color: var(--text);
+}
+
+.tray-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.tray-panel-error {
+  font-size: 12px;
+  padding: 8px 10px;
+}
+
+.tray-panel-live {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tray-panel-name {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.tray-panel-email {
+  font-size: 12px;
+}
+
+.tray-panel-gauges {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.tray-panel-reset {
+  color: var(--text-dim);
+  font-weight: 400;
+}
+
+.tray-panel-section-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  margin-bottom: 8px;
+}
+
+.tray-panel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  list-style: none;
+}
+
+.tray-panel-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-card);
+}
+
+.tray-panel-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+
+.tray-panel-row-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tray-panel-mini {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+.tray-panel-mini.stale {
+  opacity: 0.65;
+}
+
+.tray-panel-mini-empty {
+  font-size: 10.5px;
+}
+
+.tray-mini-bar {
+  width: 48px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-hover);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.tray-mini-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+}
+
+.tray-mini-bar.level-low .tray-mini-fill {
+  background: #34c759;
+}
+
+.tray-mini-bar.level-mid .tray-mini-fill {
+  background: #ffb020;
+}
+
+.tray-mini-bar.level-high .tray-mini-fill {
+  background: #ff5d5d;
+}
+
+.tray-mini-text {
+  white-space: nowrap;
+}
+
+.tray-panel-switch {
+  flex-shrink: 0;
+  min-width: 64px;
+}
+
+.tray-panel-footer {
+  display: flex;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.tray-panel-footer-btn {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 10px 6px;
+  cursor: pointer;
+}
+
+.tray-panel-footer-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.tray-panel-footer-btn + .tray-panel-footer-btn {
+  border-left: 1px solid var(--border);
+}

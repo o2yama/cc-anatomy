@@ -26,13 +26,6 @@ pub struct AccountsState {
     pub running_sessions: usize,
 }
 
-pub struct TrayAccount {
-    pub name: String,
-    pub display_name: String,
-    pub is_live: bool,
-    pub has_credentials: bool,
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AccountUsage {
     pub name: String,
@@ -77,10 +70,6 @@ pub enum SwitchOutcome {
     NeedsImport { live_email: Option<String> },
     #[serde(rename = "sessions_running")]
     SessionsRunning { count: usize },
-}
-
-pub fn registered_accounts() -> Vec<TrayAccount> {
-    Vec::new()
 }
 
 pub fn get_accounts() -> Result<AccountsState, String> {

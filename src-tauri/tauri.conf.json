@@ -12,10 +12,24 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "CC Anatomy",
         "width": 1280,
         "height": 820,
         "dragDropEnabled": false
+      },
+      {
+        "label": "tray-panel",
+        "url": "index.html?panel=tray",
+        "width": 340,
+        "height": 420,
+        "visible": false,
+        "decorations": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "transparent": true,
+        "shadow": false
       }
     ],
     "security": {

@@ -20,6 +20,8 @@ mod transcript;
 mod tray;
 mod updater;
 
+use tauri::Manager;
+
 #[tauri::command]
 fn list_projects() -> Result<Vec<db::ProjectInfo>, String> {
     db::list_projects()
@@ -183,12 +185,32 @@ fn get_accounts_usage() -> Result<Vec<accounts::AccountUsage>, String> {
     accounts::get_accounts_usage()
 }
 
+/// トレイのカスタムパネル（tray-panel ウィンドウ）の「アプリを開く」から呼ぶ。
+/// tray-panel は capabilities に登録していないため、@tauri-apps/api/window 等の
+/// プラグイン API は使えない。ウィンドウ操作を独自コマンド越しにすることで
+/// capabilities を増やさずに済ませる
+#[tauri::command]
+fn show_main_window(app: tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
+}
+
+/// トレイのカスタムパネルの「終了」から呼ぶ
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
+        // トレイパネル（tray-panel ウィンドウ）をアイコン直下に位置決めするための座標計算
+        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             // 旧方式（.zshrc への CLAUDE_CODE_OAUTH_TOKEN 注入）の撤去。冪等なので毎起動で呼んでよい。
             // 「除去できていない」という報告が過去にあったため、エラーだけでなく
@@ -204,12 +226,18 @@ pub fn run() {
             updater::setup_periodic_check(app.handle());
             Ok(())
         })
-        // ウィンドウを閉じてもメニューバー常駐を続ける（終了はトレイの「終了」から）
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            // ウィンドウを閉じてもメニューバー常駐を続ける（終了はトレイの「終了」から）
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.hide();
                 api.prevent_close();
             }
+            // トレイのカスタムパネルはフォーカスを失ったら自動で隠す
+            // （CleanMyMac 風のポップオーバー挙動。他ウィンドウには影響しない）
+            tauri::WindowEvent::Focused(false) if window.label() == "tray-panel" => {
+                let _ = window.hide();
+            }
+            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
@@ -239,7 +267,9 @@ pub fn run() {
             remove_account,
             rename_account,
             reorder_accounts,
-            get_accounts_usage
+            get_accounts_usage,
+            show_main_window,
+            quit_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

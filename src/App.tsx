@@ -131,8 +131,9 @@ function limitLabel(l: LimitEntry): string {
   return model ? `${l.kind}（${model}）` : l.kind;
 }
 
-/** "default_claude_max_20x" → "Max 20x" のようにプラン名に整形 */
-function planLabel(p: AccountProfile): string {
+/** "default_claude_max_20x" → "Max 20x" のようにプラン名に整形。
+ * TrayPanel（トレイのカスタムパネル）でも同じ整形が要るため export する */
+export function planLabel(p: AccountProfile): string {
   const tier = p.organization?.rate_limit_tier ?? "";
   const m = tier.match(/claude_(\w+?)_(\d+x)/);
   if (m) return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}`;

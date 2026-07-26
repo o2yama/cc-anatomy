@@ -168,15 +168,6 @@ struct UsageCache {
     fetched_at: i64,
 }
 
-/// 表示名のフォールバック規則: 表示名が設定されていればそれを、無ければ内部識別子(name)を使う。
-/// Rust 側（tray 等）・フロント側どちらでも同じ規則を使うため、ロジックをここに集約する
-fn resolve_display_name(name: &str, display_name: Option<&str>) -> String {
-    display_name
-        .filter(|d| !d.is_empty())
-        .unwrap_or(name)
-        .to_string()
-}
-
 /// ~/.claude.json 全体を読む
 fn read_claude_json() -> Result<serde_json::Value, String> {
     let path = crate::db::home_dir().join(".claude.json");
@@ -410,32 +401,6 @@ fn validate_name(name: &str) -> Result<(), String> {
     } else {
         Err("アカウント名は英数字・ハイフン・アンダースコア（32文字以内）で指定してください".into())
     }
-}
-
-/// メニューバーのアカウント一覧用。使用率は監視用長期トークンの全廃により持たない
-/// （表示名とライブ状態だけ返す。使用率はライブアカウントのみ `actions::live_usage_summary` で別途表示）
-pub struct TrayAccount {
-    /// switch_account に渡す内部識別子（Keychain サービス名の一部）
-    pub name: String,
-    /// 表示名（display_name があればそちら、無ければ内部識別子 name）
-    pub display_name: String,
-    pub is_live: bool,
-    /// false の場合は資格情報スナップショットが無く、切り替え不可（未取り込み）
-    pub has_credentials: bool,
-}
-
-pub fn registered_accounts() -> Vec<TrayAccount> {
-    let meta = load_meta();
-    let live = live_org_id();
-    meta.accounts
-        .iter()
-        .map(|a| TrayAccount {
-            name: a.name.clone(),
-            display_name: resolve_display_name(&a.name, a.display_name.as_deref()),
-            is_live: is_live_account(&a.org_id, live.as_deref()),
-            has_credentials: a.has_credentials,
-        })
-        .collect()
 }
 
 /// 一括照会の連打防止。前回取得からこの秒数未満ならキャッシュをそのまま返す
@@ -1484,23 +1449,6 @@ mod tests {
         assert!(!is_live_account("", Some("")));
         assert!(!is_live_account("org-1", None));
         assert!(is_live_account("org-1", Some("org-1")));
-    }
-
-    #[test]
-    fn resolve_display_name_falls_back_to_name() {
-        assert_eq!(resolve_display_name("share3", None), "share3");
-    }
-
-    #[test]
-    fn resolve_display_name_prefers_display_name_when_set() {
-        assert_eq!(resolve_display_name("share3", Some("仕事用")), "仕事用");
-    }
-
-    #[test]
-    fn resolve_display_name_falls_back_when_display_name_is_empty() {
-        // rename_account がトリム後に空文字を None へ正規化するが、
-        // 何らかの経路で空文字が入っても表示が壊れないよう表示側でも防御する
-        assert_eq!(resolve_display_name("share3", Some("")), "share3");
     }
 
     fn names(accounts: &[StoredAccount]) -> Vec<&str> {
