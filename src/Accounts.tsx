@@ -719,7 +719,6 @@ export function AccountsOverlay({
 
   const accounts = state?.accounts ?? [];
   const hasLegacyAccounts = accounts.some((a) => !a.has_credentials);
-  const runningSessionsCount = state?.running_sessions ?? 0;
   // 確認ダイアログは対象アカウントの内部識別子(name)しか持たないため、表示名を引き直す
   const labelFor = (name: string) => {
     const found = accounts.find((a) => a.name === name);
@@ -748,13 +747,6 @@ export function AccountsOverlay({
         <div className="drawer-body">
           {error && <p className="acct-error">{error}</p>}
           {notice && <p className="muted">{notice}</p>}
-
-          {runningSessionsCount > 0 && (
-            <p className="muted">
-              起動中の Claude Code セッションが{runningSessionsCount}
-              件あります。切り替え・追加を行うと確認ダイアログが出ます。
-            </p>
-          )}
 
           {hasLegacyAccounts && (
             <p className="muted">
