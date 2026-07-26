@@ -1,4 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  DndContext,
+  DragOverlay,
+  PointerSensor,
+  closestCenter,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+  type DragStartEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { restrictToParentElement, restrictToVerticalAxis } from "@dnd-kit/modifiers";
 import { api, Account, AccountsState, accountLabel } from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
@@ -34,6 +52,196 @@ type SessionsConfirm =
   | { kind: "switch"; name: string; count: number }
   | { kind: "login"; count: number };
 
+/** 1行分の名前・email・バッジ表示。行本体（AccountRow）とドラッグ中のプレビュー
+ * （AccountRowPreview）で共有する。編集中はクリック対象の名前が input に差し替わる */
+function AccountRowContent({
+  account,
+  editing = false,
+  editingValue = "",
+  onEditingValueChange,
+  onStartEditing,
+  onCommitRename,
+  onCancelEditingViaEscape,
+}: {
+  account: Account;
+  editing?: boolean;
+  editingValue?: string;
+  onEditingValueChange?: (v: string) => void;
+  onStartEditing?: () => void;
+  onCommitRename?: () => void;
+  onCancelEditingViaEscape?: () => void;
+}) {
+  return (
+    <div className="acct-info">
+      <span className="acct-name-row">
+        {editing ? (
+          <input
+            className="acct-name-input"
+            autoFocus
+            draggable={false}
+            value={editingValue}
+            onChange={(e) => onEditingValueChange?.(e.target.value)}
+            onBlur={onCommitRename}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.currentTarget.blur();
+              } else if (e.key === "Escape") {
+                onCancelEditingViaEscape?.();
+                e.currentTarget.blur();
+              }
+            }}
+          />
+        ) : (
+          <span className="acct-name" title="クリックして表示名を変更" onClick={onStartEditing}>
+            {accountLabel(account)}
+          </span>
+        )}
+        {account.is_live && <span className="acct-live">ログイン中</span>}
+        {!account.has_credentials && <span className="acct-warn">未取り込み</span>}
+      </span>
+      <span className="muted acct-email">
+        {account.email || "(メール未取得)"}
+        {account.plan ? ` ・ ${PLAN_LABEL[account.plan] ?? account.plan}` : ""}
+      </span>
+    </div>
+  );
+}
+
+/** DragOverlay に浮かせる、掴んだカードの静的なコピー（クリック等の副作用は持たない） */
+function AccountRowPreview({ account }: { account: Account }) {
+  return (
+    <div className={account.is_live ? "acct-item acct-drag-preview live" : "acct-item acct-drag-preview"}>
+      <span className="acct-drag-handle">⠿</span>
+      <AccountRowContent account={account} />
+      <div className="acct-actions" />
+    </div>
+  );
+}
+
+/**
+ * 一覧の1行。ドラッグはハンドル（⠿）からのみ開始できるよう、
+ * useSortable の attributes/listeners はハンドルにだけ付与する
+ * （行全体に付けると名前編集クリックやボタン操作と衝突するため）。
+ */
+function AccountRow({
+  account,
+  dragDisabled,
+  editing,
+  editingValue,
+  onEditingValueChange,
+  onStartEditing,
+  onCommitRename,
+  onCancelEditingViaEscape,
+  confirmingRemove,
+  onRequestRemove,
+  onCancelRemove,
+  onConfirmRemove,
+  onSwitch,
+  switchButtonDisabled,
+  busy,
+}: {
+  account: Account;
+  dragDisabled: boolean;
+  editing: boolean;
+  editingValue: string;
+  onEditingValueChange: (v: string) => void;
+  onStartEditing: () => void;
+  onCommitRename: () => void;
+  onCancelEditingViaEscape: () => void;
+  confirmingRemove: boolean;
+  onRequestRemove: () => void;
+  onCancelRemove: () => void;
+  onConfirmRemove: () => void;
+  onSwitch: () => void;
+  switchButtonDisabled: boolean;
+  busy: boolean;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: account.name,
+    disabled: dragDisabled,
+  });
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+  };
+
+  return (
+    <li
+      ref={setNodeRef}
+      style={style}
+      className={[
+        account.is_live ? "acct-item live" : "acct-item",
+        isDragging ? "acct-item-dragging" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      <button
+        type="button"
+        className="acct-drag-handle"
+        disabled={dragDisabled}
+        aria-label="ドラッグして並び替え"
+        title="ドラッグして並び替え"
+        {...attributes}
+        {...listeners}
+      >
+        ⠿
+      </button>
+
+      <AccountRowContent
+        account={account}
+        editing={editing}
+        editingValue={editingValue}
+        onEditingValueChange={onEditingValueChange}
+        onStartEditing={onStartEditing}
+        onCommitRename={onCommitRename}
+        onCancelEditingViaEscape={onCancelEditingViaEscape}
+      />
+
+      <div className="acct-actions">
+        {confirmingRemove ? (
+          <>
+            <span className="acct-confirm muted">
+              削除すると、追加ボタンから元のアカウントでログインし直す必要があります
+            </span>
+            <button className="acct-btn acct-btn-ghost" onClick={onCancelRemove}>
+              やめる
+            </button>
+            <button className="acct-btn acct-btn-danger" disabled={busy} onClick={onConfirmRemove}>
+              削除する
+            </button>
+          </>
+        ) : (
+          <>
+            <button
+              className="acct-btn acct-btn-primary"
+              disabled={switchButtonDisabled || account.is_live || !account.has_credentials}
+              title={
+                !account.has_credentials
+                  ? "追加ボタンからこのアカウントでログインすると資格情報が取り込まれます"
+                  : account.is_live
+                    ? "現在ログイン中です"
+                    : "このアカウントに切り替える"
+              }
+              onClick={onSwitch}
+            >
+              切り替える
+            </button>
+            <button
+              className="acct-btn acct-btn-ghost"
+              disabled={busy}
+              onClick={onRequestRemove}
+              title="登録を削除（Claude 側のアカウントは消えません）"
+            >
+              削除
+            </button>
+          </>
+        )}
+      </div>
+    </li>
+  );
+}
+
 /**
  * アカウント切り替えビュー（Keychain スワップ方式）。
  *
@@ -51,6 +259,11 @@ type SessionsConfirm =
  *
  * アカウント名はクリックしてインライン編集できる（表示名のみ変更。Keychain 照合キーである
  * 内部識別子 name は不変。表示は accountLabel() = display_name ?? name で統一する）。
+ *
+ * 一覧の並び替えは @dnd-kit/core + @dnd-kit/sortable によるドラッグ&ドロップ（2026-07-26
+ * ユーザー評価を受けて自前 HTML5 DnD 実装から作り直した）。ドラッグはカード左端のハンドル
+ * （⠿）からのみ開始し、名前編集・ボタン操作とは競合しない。並び替えはドロップ確定時に
+ * 楽観的更新 → reorder_accounts、失敗時は reload() で巻き戻す。
  *
  * 2026-07-25 ユーザー決定で監視用長期トークンの仕組みを全廃した。使用量は現在ライブの
  * アカウントのみをツールバー/メニューバーで表示し、ここでは切り替え管理のみを行う。
@@ -81,8 +294,11 @@ export function AccountsOverlay({
   // ドラッグ&ドロップでの並び替え。サーバーの accounts.json の並びを楽観的に更新し、
   // reorder_accounts の失敗時のみ reload() で巻き戻す
   const [displayAccounts, setDisplayAccounts] = useState<Account[]>([]);
-  const [dragIndex, setDragIndex] = useState<number | null>(null);
-  const [dragOverIndex, setDragOverIndex] = useState<number | null>(null);
+  const [activeDragName, setActiveDragName] = useState<string | null>(null);
+  const sensors = useSensors(
+    // distance: 6 で、クリック（名前編集ボタン等）と誤って競合しないようにする
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } })
+  );
 
   // Flow B: claude auth login のログイン待ち
   const [loginPending, setLoginPending] = useState(false);
@@ -289,16 +505,18 @@ export function AccountsOverlay({
       .catch((e) => setError(String(e)));
   };
 
-  const handleDrop = (dropIndex: number) => {
-    setDragOverIndex(null);
-    if (dragIndex === null || dragIndex === dropIndex) {
-      setDragIndex(null);
-      return;
-    }
-    const next = [...displayAccounts];
-    const [moved] = next.splice(dragIndex, 1);
-    next.splice(dropIndex, 0, moved);
-    setDragIndex(null);
+  const handleDragStart = (event: DragStartEvent) => {
+    setActiveDragName(String(event.active.id));
+  };
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    setActiveDragName(null);
+    if (!over || active.id === over.id) return;
+    const oldIndex = displayAccounts.findIndex((a) => a.name === active.id);
+    const newIndex = displayAccounts.findIndex((a) => a.name === over.id);
+    if (oldIndex === -1 || newIndex === -1) return;
+    const next = arrayMove(displayAccounts, oldIndex, newIndex);
     setDisplayAccounts(next); // 楽観的に確定
     api
       .reorderAccounts(next.map((a) => a.name))
@@ -321,6 +539,7 @@ export function AccountsOverlay({
   // 名前編集中・busy中・確認ダイアログ表示中はドラッグ操作を無効にする
   const dragDisabled =
     switchBusy || busy || editingName !== null || pendingConfirm !== null || sessionsConfirm !== null;
+  const activeDragAccount = displayAccounts.find((a) => a.name === activeDragName) ?? null;
 
   return (
     <div className="drawer-overlay" onClick={onClose}>
@@ -379,136 +598,47 @@ export function AccountsOverlay({
             </p>
           )}
 
-          <ul className="acct-list">
-            {displayAccounts.map((a, idx) => (
-              <li
-                key={a.name}
-                draggable={!dragDisabled}
-                onDragStart={(e) => {
-                  const target = e.target as HTMLElement;
-                  // input/button からのドラッグ開始は編集・誤操作と競合するため抑止する
-                  if (dragDisabled || target.closest("input, button")) {
-                    e.preventDefault();
-                    return;
-                  }
-                  setDragIndex(idx);
-                  e.dataTransfer.effectAllowed = "move";
-                  // WebKit（macOS の WKWebView）は setData が無いとドラッグ自体を開始しない
-                  e.dataTransfer.setData("text/plain", a.name);
-                }}
-                onDragOver={(e) => {
-                  if (dragIndex === null) return;
-                  e.preventDefault();
-                  if (dragOverIndex !== idx) setDragOverIndex(idx);
-                }}
-                onDragLeave={() => setDragOverIndex((v) => (v === idx ? null : v))}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  handleDrop(idx);
-                }}
-                onDragEnd={() => {
-                  setDragIndex(null);
-                  setDragOverIndex(null);
-                }}
-                className={[
-                  a.is_live ? "acct-item live" : "acct-item",
-                  dragIndex === idx ? "acct-item-dragging" : "",
-                  dragOverIndex === idx && dragIndex !== idx ? "acct-item-drag-over" : "",
-                ]
-                  .filter(Boolean)
-                  .join(" ")}
-              >
-                <div className="acct-info">
-                  <span className="acct-name-row">
-                    {editingName === a.name ? (
-                      <input
-                        className="acct-name-input"
-                        autoFocus
-                        draggable={false}
-                        value={editingValue}
-                        onChange={(e) => setEditingValue(e.target.value)}
-                        onBlur={() => commitRename(a.name)}
-                        onKeyDown={(e) => {
-                          if (e.key === "Enter") {
-                            e.currentTarget.blur();
-                          } else if (e.key === "Escape") {
-                            cancelingEditRef.current = true;
-                            e.currentTarget.blur();
-                          }
-                        }}
-                      />
-                    ) : (
-                      <span
-                        className="acct-name"
-                        title="クリックして表示名を変更"
-                        onClick={() => startEditingName(a)}
-                      >
-                        {accountLabel(a)}
-                      </span>
-                    )}
-                    {a.is_live && (
-                      <span
-                        className="acct-live"
-                        title="Claude Code が現在ログイン中。連携なしの起動中セッションはこのアカウントを消費します"
-                      >
-                        ログイン中
-                      </span>
-                    )}
-                    {!a.has_credentials && <span className="acct-warn">未取り込み</span>}
-                  </span>
-                  <span className="muted acct-email">
-                    {a.email || "(メール未取得)"}
-                    {a.plan ? ` ・ ${PLAN_LABEL[a.plan] ?? a.plan}` : ""}
-                  </span>
-                </div>
-
-                <div className="acct-actions">
-                  {confirmRemove === a.name ? (
-                    <>
-                      <span className="acct-confirm muted">
-                        削除すると、追加ボタンから元のアカウントでログインし直す必要があります
-                      </span>
-                      <button className="acct-btn acct-btn-ghost" onClick={() => setConfirmRemove(null)}>
-                        やめる
-                      </button>
-                      <button
-                        className="acct-btn acct-btn-danger"
-                        disabled={busy}
-                        onClick={() => remove(a.name)}
-                      >
-                        削除する
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <button
-                        className="acct-btn acct-btn-primary"
-                        disabled={switchBusy || a.is_live || !a.has_credentials}
-                        title={
-                          !a.has_credentials
-                            ? "追加ボタンからこのアカウントでログインすると資格情報が取り込まれます"
-                            : a.is_live
-                              ? "現在ログイン中です"
-                              : "このアカウントに切り替える"
-                        }
-                        onClick={() => doSwitch(a.name)}
-                      >
-                        切り替える
-                      </button>
-                      <button
-                        className="acct-btn acct-btn-ghost"
-                        disabled={busy}
-                        onClick={() => setConfirmRemove(a.name)}
-                        title="登録を削除（Claude 側のアカウントは消えません）"
-                      >
-                        削除
-                      </button>
-                    </>
-                  )}
-                </div>
-              </li>
-            ))}
-          </ul>
+          <DndContext
+            sensors={sensors}
+            collisionDetection={closestCenter}
+            modifiers={[restrictToVerticalAxis, restrictToParentElement]}
+            onDragStart={handleDragStart}
+            onDragEnd={handleDragEnd}
+            onDragCancel={() => setActiveDragName(null)}
+          >
+            <SortableContext
+              items={displayAccounts.map((a) => a.name)}
+              strategy={verticalListSortingStrategy}
+            >
+              <ul className="acct-list">
+                {displayAccounts.map((a) => (
+                  <AccountRow
+                    key={a.name}
+                    account={a}
+                    dragDisabled={dragDisabled}
+                    editing={editingName === a.name}
+                    editingValue={editingValue}
+                    onEditingValueChange={setEditingValue}
+                    onStartEditing={() => startEditingName(a)}
+                    onCommitRename={() => commitRename(a.name)}
+                    onCancelEditingViaEscape={() => {
+                      cancelingEditRef.current = true;
+                    }}
+                    confirmingRemove={confirmRemove === a.name}
+                    onRequestRemove={() => setConfirmRemove(a.name)}
+                    onCancelRemove={() => setConfirmRemove(null)}
+                    onConfirmRemove={() => remove(a.name)}
+                    onSwitch={() => doSwitch(a.name)}
+                    switchButtonDisabled={switchBusy}
+                    busy={busy}
+                  />
+                ))}
+              </ul>
+            </SortableContext>
+            <DragOverlay>
+              {activeDragAccount ? <AccountRowPreview account={activeDragAccount} /> : null}
+            </DragOverlay>
+          </DndContext>
 
           {loginPending ? (
             <div className="acct-pending">

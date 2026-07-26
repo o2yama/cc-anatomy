@@ -1234,28 +1234,59 @@ main {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   min-height: 56px;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 8px 12px;
-  cursor: grab;
+  /* @dnd-kit/sortable の transform/transition をここへ適用する
+     （並び替え中に他のカードがリアルタイムで場所を空けるアニメーション） */
+  touch-action: none;
 }
 
 .acct-item.live {
   border-color: var(--accent);
 }
 
-/* ドラッグ&ドロップでの並び替え。ドラッグ中のカードは半透明にし、
-   ドロップ先は上境界線で「ここに挿入される」ことを示す */
+/* ドラッグ中の元位置カードは半透明のプレースホルダにする
+   （実体は DragOverlay 側でカーソルに追従する。参照: .acct-drag-preview） */
 .acct-item-dragging {
-  opacity: 0.5;
+  opacity: 0.4;
+}
+
+/* ハンドル（⠿）。常時薄く表示し、hover で明瞭化する。ドラッグはここからのみ開始する */
+.acct-drag-handle {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  padding: 4px 6px;
+  font-size: 16px;
+  line-height: 1;
+  color: var(--text-dim);
+  opacity: 0.4;
+  cursor: grab;
+  touch-action: none;
+}
+
+.acct-drag-handle:hover:not(:disabled) {
+  opacity: 1;
+}
+
+.acct-drag-handle:active:not(:disabled) {
   cursor: grabbing;
 }
 
-.acct-item-drag-over {
-  border-top: 2px solid var(--accent);
-  margin-top: -1px;
+.acct-drag-handle:disabled {
+  opacity: 0.15;
+  cursor: default;
+}
+
+/* DragOverlay に浮かぶ、掴んだカードのコピー。元の一覧の中の1枚のような見た目にし、
+   浮遊感を出すため影を強めにする */
+.acct-drag-preview {
+  cursor: grabbing;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+  background: var(--bg-panel, var(--panel, #fff));
 }
 
 .acct-info {
