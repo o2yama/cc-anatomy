@@ -3,6 +3,7 @@ import {
   api,
   accountLabel,
   formatEpoch,
+  UsageExpiredError,
   AccountProfile,
   LimitEntry,
   ProjectInfo,
@@ -131,9 +132,8 @@ function limitLabel(l: LimitEntry): string {
   return model ? `${l.kind}（${model}）` : l.kind;
 }
 
-/** "default_claude_max_20x" → "Max 20x" のようにプラン名に整形。
- * TrayPanel（トレイのカスタムパネル）でも同じ整形が要るため export する */
-export function planLabel(p: AccountProfile): string {
+/** "default_claude_max_20x" → "Max 20x" のようにプラン名に整形 */
+function planLabel(p: AccountProfile): string {
   const tier = p.organization?.rate_limit_tier ?? "";
   const m = tier.match(/claude_(\w+?)_(\d+x)/);
   if (m) return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}`;
@@ -215,9 +215,13 @@ function UsagePopover() {
   const [open, setOpen] = useState(false);
   const [card, setCard] = useState<UsageCard | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // access token 期限切れ（Claude Code を一度使うと自動更新される正常な待ち状態）。
+  // エラーではないので error とは別に持ち、error-box ではなく薄字の案内を出す
+  const [expired, setExpired] = useState(false);
 
   const load = useCallback(() => {
     setError(null);
+    setExpired(false);
     setCard(null);
     Promise.all([
       api.getRateLimits(),
@@ -239,7 +243,13 @@ function UsagePopover() {
           error: null,
         });
       })
-      .catch((e) => setError(String(e)));
+      .catch((e) => {
+        if (e instanceof UsageExpiredError) {
+          setExpired(true);
+        } else {
+          setError(String(e));
+        }
+      });
   }, []);
 
   useEffect(() => {
@@ -284,6 +294,10 @@ function UsagePopover() {
           <div className="usage-popover">
             {error ? (
               <p className="error-box">{error}</p>
+            ) : expired ? (
+              <p className="muted usage-note">
+                最新の使用量は Claude Code を一度使うと取得できます。
+              </p>
             ) : !card ? (
               <p className="muted">取得中…</p>
             ) : (

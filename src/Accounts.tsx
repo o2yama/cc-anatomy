@@ -26,6 +26,21 @@ const PLAN_LABEL: Record<string, string> = {
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 2000;
+/** 使用量の常時監視（claude setup-token）は完全に任意の後付け機能なので、
+ * ログイン待ち（5分）より短いタイムアウトでスキップ扱いにする */
+const MONITOR_TIMEOUT_MS = 90 * 1000;
+/** 取得時刻の注記（「◯分前時点」）を出す猶予。バックエンドの usage.stale フラグは
+ * 「今回キャッシュ返しだったか」を示すだけで、取得直後でも true になりうるため
+ * （「0分前時点」と出てしまっていた不具合）、表示側では経過時間で判定し直す。
+ * トレイ（tray.rs）の stale マーク「*」も同じ5分閾値に揃えている */
+const STALE_DISPLAY_THRESHOLD_MS = 5 * 60 * 1000;
+
+/** fetched_at（epoch 秒 or ミリ秒。relativeTime と同じ桁判定）から5分以上経っていれば
+ * 「表示上も stale」とみなす */
+function isDisplayStale(fetchedAtEpoch: number): boolean {
+  const ms = fetchedAtEpoch < 1e12 ? fetchedAtEpoch * 1000 : fetchedAtEpoch;
+  return Date.now() - ms >= STALE_DISPLAY_THRESHOLD_MS;
+}
 
 /**
  * 「起動中セッションがあります」確認ダイアログの「今後この確認を表示しない」設定。
@@ -73,6 +88,8 @@ function AccountRowContent({
   onStartEditing,
   onCommitRename,
   onCancelEditingViaEscape,
+  monitorBusy = false,
+  onStartMonitor,
 }: {
   account: Account;
   usage?: AccountUsage;
@@ -82,6 +99,10 @@ function AccountRowContent({
   onStartEditing?: () => void;
   onCommitRename?: () => void;
   onCancelEditingViaEscape?: () => void;
+  /** この行の「常時監視を設定」が実行中（Terminal でのブラウザ承認待ち） */
+  monitorBusy?: boolean;
+  /** 未指定（ドラッグ中プレビュー等）なら常時監視の導線自体を出さない */
+  onStartMonitor?: () => void;
 }) {
   const usageLine = usage ? usageText(usage) : null;
   return (
@@ -111,6 +132,11 @@ function AccountRowContent({
         )}
         {account.is_live && <span className="acct-live">ログイン中</span>}
         {!account.has_credentials && <span className="acct-warn">未取り込み</span>}
+        {account.has_monitor_token && (
+          <span className="acct-live acct-monitor-badge" title="使用量を常時監視しています">
+            常時監視中
+          </span>
+        )}
       </span>
       <span className="muted acct-email">
         {account.email || "(メール未取得)"}
@@ -119,10 +145,25 @@ function AccountRowContent({
       {usageLine && (
         <span className="muted acct-usage">
           {usageLine}
-          {usage?.stale && usage.fetched_at != null && (
+          {usage?.fetched_at != null && isDisplayStale(usage.fetched_at) && (
             <span className="acct-usage-stale">（{relativeTime(usage.fetched_at)}時点）</span>
           )}
         </span>
+      )}
+      {/* 常時監視は切り替え機能とは独立の任意機能。過密にならないよう、未設定のときだけ
+          小さなテキストリンクとして出す（設定済みは上のバッジで示すので導線は消える） */}
+      {!account.has_monitor_token && onStartMonitor && (
+        <button
+          type="button"
+          className="acct-monitor-link"
+          disabled={monitorBusy}
+          onClick={(e) => {
+            e.stopPropagation();
+            onStartMonitor();
+          }}
+        >
+          {monitorBusy ? "承認待ち…" : "常時監視を設定"}
+        </button>
       )}
     </div>
   );
@@ -161,6 +202,8 @@ function AccountRow({
   onSwitch,
   switchButtonDisabled,
   busy,
+  monitorBusy,
+  onStartMonitor,
 }: {
   account: Account;
   usage?: AccountUsage;
@@ -178,6 +221,8 @@ function AccountRow({
   onSwitch: () => void;
   switchButtonDisabled: boolean;
   busy: boolean;
+  monitorBusy: boolean;
+  onStartMonitor: () => void;
 }) {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: account.name,
@@ -220,6 +265,8 @@ function AccountRow({
         onStartEditing={onStartEditing}
         onCommitRename={onCommitRename}
         onCancelEditingViaEscape={onCancelEditingViaEscape}
+        monitorBusy={monitorBusy}
+        onStartMonitor={onStartMonitor}
       />
 
       <div className="acct-actions">
@@ -331,6 +378,15 @@ export function AccountsOverlay({
   const [loginPending, setLoginPending] = useState(false);
   const loginPollRef = useRef<number | null>(null);
 
+  // 使用量の常時監視（claude setup-token、任意機能）の紐づけ待ち。
+  // 「＋アカウントを追加」の統合フロー・ステップ2（monitorFlowName）と、
+  // 登録済み行の単独「常時監視を設定」（rowMonitorName）の2箇所で使う。
+  // どちらも切り替え機能とは独立で、失敗・タイムアウトしても他の操作をブロックしない
+  const [monitorFlowName, setMonitorFlowName] = useState<string | null>(null);
+  const monitorFlowPollRef = useRef<number | null>(null);
+  const [rowMonitorName, setRowMonitorName] = useState<string | null>(null);
+  const rowMonitorPollRef = useRef<number | null>(null);
+
   const reload = useCallback(() => {
     api
       .getAccounts()
@@ -372,14 +428,122 @@ export function AccountsOverlay({
     setLoginPending(false);
   }, [stopLoginPolling]);
 
-  // 閉じても止めないと、ログイン待ちのまま2秒おきに Keychain を叩き続け、
-  // ユーザーが見ていないところで勝手にアカウントを取り込んでしまう
+  const stopMonitorFlowPolling = useCallback(() => {
+    if (monitorFlowPollRef.current !== null) {
+      window.clearInterval(monitorFlowPollRef.current);
+      monitorFlowPollRef.current = null;
+    }
+    setMonitorFlowName(null);
+  }, []);
+  const stopRowMonitorPolling = useCallback(() => {
+    if (rowMonitorPollRef.current !== null) {
+      window.clearInterval(rowMonitorPollRef.current);
+      rowMonitorPollRef.current = null;
+    }
+    setRowMonitorName(null);
+  }, []);
+
+  // 閉じても止めないと、待ちのまま2秒おきに Keychain を叩き続け、
+  // ユーザーが見ていないところで勝手に取り込み・監視の紐づけが進んでしまう
   useEffect(() => {
-    if (!open) cancelLogin();
-  }, [open, cancelLogin]);
+    if (!open) {
+      cancelLogin();
+      stopMonitorFlowPolling();
+      stopRowMonitorPolling();
+    }
+  }, [open, cancelLogin, stopMonitorFlowPolling, stopRowMonitorPolling]);
   useEffect(() => stopLoginPolling, [stopLoginPolling]);
+  useEffect(() => stopMonitorFlowPolling, [stopMonitorFlowPolling]);
+  useEffect(() => stopRowMonitorPolling, [stopRowMonitorPolling]);
 
   const switchBusy = busy || loginPending;
+
+  /** setup-token の紐づけ完了をポーリングする（統合フローのステップ2・単独の「常時監視を設定」共通）。
+   * onSettle は「紐づいた」「タイムアウト（スキップ扱い）」「照合不一致（別アカウントで承認された）」
+   * のいずれでも呼ばれる。監視は完全に任意の後付け機能なので、タイムアウトを「失敗」として
+   * busy 表示のまま固まらせず、必ず終わらせる */
+  const pollMonitorLinking = (
+    name: string,
+    pollRef: { current: number | null },
+    stop: () => void,
+    onSettle: (
+      result: { kind: "linked" } | { kind: "timeout" } | { kind: "mismatch"; label: string; email: string }
+    ) => void
+  ) => {
+    const deadline = Date.now() + MONITOR_TIMEOUT_MS;
+    pollRef.current = window.setInterval(() => {
+      if (Date.now() > deadline) {
+        stop();
+        onSettle({ kind: "timeout" });
+        return;
+      }
+      api
+        .pollMonitorSetup(name)
+        .then((result) => {
+          if (result.status === "waiting") return;
+          stop();
+          if (result.status === "mismatch") {
+            onSettle({ kind: "mismatch", label: result.expected_label, email: result.expected_email });
+          } else {
+            onSettle({ kind: "linked" });
+          }
+        })
+        .catch(() => {
+          stop();
+          onSettle({ kind: "timeout" });
+        });
+    }, POLL_INTERVAL_MS);
+  };
+
+  /** 誤紐づけ（照合不一致）の案内文言。「常時監視を設定」導線の両方で共有する */
+  const monitorMismatchMessage = (label: string, email: string) =>
+    `承認されたアカウントが「${label}」と一致しません。ブラウザで ${email} にログインしてからやり直してください。`;
+
+  /** 「＋アカウントを追加」統合フローのステップ2を開始する（Flow B 完了直後に呼ぶ） */
+  const beginMonitorFlow = (name: string) => {
+    setMonitorFlowName(name);
+    pollMonitorLinking(name, monitorFlowPollRef, stopMonitorFlowPolling, (result) => {
+      if (result.kind === "linked") {
+        setNotice("使用量の常時監視を設定しました。");
+      } else if (result.kind === "mismatch") {
+        setError(monitorMismatchMessage(result.label, result.email));
+      } else {
+        setNotice("使用量監視の設定はスキップされました。後から「常時監視を設定」から追加できます。");
+      }
+      reload();
+    });
+  };
+
+  /** ステップ2の「スキップ」ボタン。アカウント追加自体はすでに成功しているので、
+   * ここでの中止は監視の設定を諦めるだけで、追加の成否には一切影響しない */
+  const skipMonitorFlow = () => {
+    stopMonitorFlowPolling();
+    setNotice("使用量監視の設定をスキップしました。後から「常時監視を設定」から追加できます。");
+  };
+
+  /** 登録済みアカウント行の「常時監視を設定」単独フロー */
+  const startRowMonitor = (name: string) => {
+    setError(null);
+    setRowMonitorName(name);
+    api
+      .startMonitorSetup(name)
+      .then(() => {
+        pollMonitorLinking(name, rowMonitorPollRef, stopRowMonitorPolling, (result) => {
+          if (result.kind === "linked") {
+            setNotice("使用量の常時監視を設定しました。");
+          } else if (result.kind === "mismatch") {
+            setError(monitorMismatchMessage(result.label, result.email));
+          } else {
+            setNotice("使用量監視の設定がタイムアウトしました。もう一度お試しください。");
+          }
+          reload();
+        });
+      })
+      .catch((e) => {
+        setRowMonitorName(null);
+        setError(String(e));
+      });
+  };
 
   const pollForCompletion = (baseline: string) => {
     setLoginPending(true);
@@ -399,6 +563,9 @@ export function AccountsOverlay({
             `「${result.account.email || accountLabel(result.account)}」を取り込みました。本人のアカウントか確認してください。`
           );
           reload();
+          // 統合フロー・ステップ2: 続けて使用量の常時監視（任意）を設定する。
+          // ここでの成否はアカウント追加の成否に一切影響しない
+          beginMonitorFlow(result.account.name);
         })
         .catch((e) => {
           cancelLogin();
@@ -673,6 +840,8 @@ export function AccountsOverlay({
                     onSwitch={() => doSwitch(a.name)}
                     switchButtonDisabled={switchBusy}
                     busy={busy}
+                    monitorBusy={rowMonitorName === a.name || monitorFlowName === a.name}
+                    onStartMonitor={() => startRowMonitor(a.name)}
                   />
                 ))}
               </ul>
@@ -686,13 +855,27 @@ export function AccountsOverlay({
             <div className="acct-pending">
               <span className="diag-spinner" />
               <div>
-                <strong>ブラウザ認証を待っています</strong>
+                <strong>1/2 ブラウザでログインを待っています</strong>
                 <p className="muted">
                   Terminal でログインを完了してください。完了すると自動で取り込みます。
                 </p>
               </div>
               <button className="acct-btn acct-btn-ghost" onClick={cancelLogin}>
                 中止
+              </button>
+            </div>
+          ) : monitorFlowName ? (
+            <div className="acct-pending">
+              <span className="diag-spinner" />
+              <div>
+                <strong>2/2 使用量監視の承認を待っています（任意）</strong>
+                <p className="muted">
+                  Terminal でブラウザ承認を完了してください。不要ならスキップしても、
+                  アカウントの追加・切り替えには影響しません。
+                </p>
+              </div>
+              <button className="acct-btn acct-btn-ghost" onClick={skipMonitorFlow}>
+                スキップ
               </button>
             </div>
           ) : (

@@ -147,6 +147,9 @@ export interface Account {
   is_live: boolean;
   /** ライブ資格情報のスナップショットが登録済みか。無いと「切り替え」できない */
   has_credentials: boolean;
+  /** 使用量の常時監視用に claude setup-token の長期トークンが紐づいているか（任意機能）。
+   * 切り替え機能とは完全に独立で、これが無くても切り替え・使用量取得は成立する */
+  has_monitor_token: boolean;
 }
 
 /** 表示名のフォールバック規則。Rust 側の resolve_display_name と同じ規則
@@ -198,6 +201,15 @@ export type StartLoginOutcome =
   | { status: "needs_import"; live_email: string | null }
   | { status: "sessions_running"; count: number };
 
+/** 使用量の常時監視（claude setup-token、任意機能）の紐づけ完了検知ポーリング結果。
+ * 「＋アカウントを追加」のステップ2、または既存アカウントの「常時監視を設定」の両方で使う。
+ * mismatch はブラウザ側が期待していたアカウントと別アカウントで承認していた場合
+ * （org_id 照合の不一致）。トークンは紐づけ済みではなく破棄されている */
+export type MonitorSetupPoll =
+  | { status: "waiting" }
+  | { status: "linked" }
+  | { status: "mismatch"; expected_label: string; expected_email: string };
+
 export const api = {
   listProjects: () => invoke<ProjectInfo[]>("list_projects"),
   getHomeDir: () => invoke<string>("get_home_dir"),
@@ -239,20 +251,43 @@ export const api = {
   /** 登録済み全アカウントの使用率一括取得。get_accounts とは別コマンドで、
    * 一覧表示をブロックせずモーダルを開いた後に非同期で埋める想定 */
   getAccountsUsage: () => invoke<AccountUsage[]>("get_accounts_usage"),
-  /** トレイパネル（tray-panel ウィンドウ）の「アプリを開く」/「終了」から呼ぶ。
-   * capabilities を増やさずに済むよう、ウィンドウ操作は独自コマンド越しに行う
-   * （@tauri-apps/api/window 等のプラグイン API は tray-panel の capability 未設定だと使えない） */
-  showMainWindow: () => invoke<void>("show_main_window"),
-  quitApp: () => invoke<void>("quit_app"),
-  getRateLimits: async (): Promise<RateLimits> => {
-    const raw = await invoke<string>("get_rate_limits");
-    return JSON.parse(raw) as RateLimits;
-  },
-  getAccountProfile: async (): Promise<AccountProfile> => {
-    const raw = await invoke<string>("get_account_profile");
-    return JSON.parse(raw) as AccountProfile;
-  },
+  /** 登録済みアカウントへ使用量の常時監視（claude setup-token、任意機能）を設定する。
+   * Terminal を開いて setup-token を実行するだけで、完了は pollMonitorSetup で検知する */
+  startMonitorSetup: (name: string) => invoke<void>("start_monitor_setup", { name }),
+  pollMonitorSetup: (name: string) => invoke<MonitorSetupPoll>("poll_monitor_setup", { name }),
+  getRateLimits: () => unwrapUsageFetch<RateLimits>("get_rate_limits"),
+  getAccountProfile: () => unwrapUsageFetch<AccountProfile>("get_account_profile"),
 };
+
+/** get_rate_limits/get_account_profile の生の戻り値（Rust の UsageFetch と同じ形）。
+ * "expired" は access token の期限切れ（Claude Code 側の自動 refresh 待ちの正常な状態）で、
+ * エラーではない */
+type UsageFetchRaw =
+  | { status: "ok"; body: string }
+  | { status: "expired" }
+  | { status: "error"; message: string };
+
+/** ライブ access token が期限切れであることを示す（2026-07-26 追加）。
+ * 「再ログインが必要かもしれません」という誤誘導なエラー文言を廃止し、代わりにこの型で
+ * 呼び出し側が「エラーではなく待ち状態」と判別できるようにする。
+ * 呼び出し側は catch した値が `instanceof UsageExpiredError` かで分岐し、
+ * エラーボックスではなく薄字の案内（例:「最新の使用量は Claude Code を一度使うと取得できます」）
+ * を出すこと */
+export class UsageExpiredError extends Error {
+  constructor() {
+    super("ライブの access token が期限切れです（Claude Code を一度使うと更新されます）");
+    this.name = "UsageExpiredError";
+  }
+}
+
+/** get_rate_limits/get_account_profile 共通の unwrap。呼び出し側の型（Promise<RateLimits> /
+ * Promise<AccountProfile>）は変えず、期限切れだけ UsageExpiredError として投げ分ける */
+async function unwrapUsageFetch<T>(command: string): Promise<T> {
+  const raw = await invoke<UsageFetchRaw>(command);
+  if (raw.status === "ok") return JSON.parse(raw.body) as T;
+  if (raw.status === "expired") throw new UsageExpiredError();
+  throw new Error(raw.message);
+}
 
 export interface RateLimitWindow {
   utilization: number | null;

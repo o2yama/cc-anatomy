@@ -20,8 +20,6 @@ mod transcript;
 mod tray;
 mod updater;
 
-use tauri::Manager;
-
 #[tauri::command]
 fn list_projects() -> Result<Vec<db::ProjectInfo>, String> {
     db::list_projects()
@@ -94,14 +92,15 @@ fn extract_tasks(project: String) -> Result<String, String> {
     actions::extract_tasks(&project)
 }
 
-/// ネットワーク呼び出しなので async
+/// ネットワーク呼び出しなので async。期限切れ（expired）はエラーではなく
+/// 正常な待ち状態として区別してフロントへ返す（UsageFetch 参照）
 #[tauri::command(async)]
-fn get_rate_limits() -> Result<String, String> {
+fn get_rate_limits() -> actions::UsageFetch {
     actions::get_rate_limits()
 }
 
 #[tauri::command(async)]
-fn get_account_profile() -> Result<String, String> {
+fn get_account_profile() -> actions::UsageFetch {
     actions::get_account_profile()
 }
 
@@ -134,16 +133,35 @@ fn import_live_account() -> Result<accounts::Account, String> {
 }
 
 /// `claude auth login` を Terminal で起動し、完了検知の基準値を返す（Flow B）。
-/// 事前 sync-back を含むので async。`force` は外部セッション確認済みの再実行フラグ
+/// 事前 sync-back を含むので async。`force` は外部セッション確認済みの再実行フラグ。
+/// 2026-07-26、統合フロー（1/2 ログイン→2/2 監視の承認）のため同じ Terminal で
+/// 続けて setup-token も起動するようになり、スクリプトの書き出し先に AppHandle が要る
 #[tauri::command(async)]
-fn start_add_account_login(force: bool) -> Result<accounts::StartLoginOutcome, String> {
-    accounts::start_add_account_login(force)
+fn start_add_account_login(
+    app: tauri::AppHandle,
+    force: bool,
+) -> Result<accounts::StartLoginOutcome, String> {
+    accounts::start_add_account_login(&app, force)
 }
 
 /// フロントが2秒間隔で呼ぶ完了検知ポーリング（Flow B）
 #[tauri::command(async)]
 fn poll_add_account_login(baseline: String) -> Result<accounts::PollResult, String> {
     accounts::poll_add_account_login(&baseline)
+}
+
+/// 登録済みアカウントへ「常時監視を設定」（setup-token のみを Terminal で起動する単独フロー）。
+/// 使用量の常時監視は切り替え機能とは完全に独立した任意機能
+#[tauri::command(async)]
+fn start_monitor_setup(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    accounts::start_monitor_setup(&app, &name)
+}
+
+/// フロントが2秒間隔で呼ぶ、監視トークンの紐づけ完了検知ポーリング
+/// （「＋アカウントを追加」のステップ2、または既存アカウントの「常時監視を設定」の両方で使う）
+#[tauri::command(async)]
+fn poll_monitor_setup(name: String) -> Result<accounts::MonitorSetupPoll, String> {
+    accounts::poll_monitor_setup(&name)
 }
 
 /// Keychain スワップによる切り替え（Flow C）。sync-back・読み戻し検証を伴うので async。
@@ -185,32 +203,12 @@ fn get_accounts_usage() -> Result<Vec<accounts::AccountUsage>, String> {
     accounts::get_accounts_usage()
 }
 
-/// トレイのカスタムパネル（tray-panel ウィンドウ）の「アプリを開く」から呼ぶ。
-/// tray-panel は capabilities に登録していないため、@tauri-apps/api/window 等の
-/// プラグイン API は使えない。ウィンドウ操作を独自コマンド越しにすることで
-/// capabilities を増やさずに済ませる
-#[tauri::command]
-fn show_main_window(app: tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.show();
-        let _ = win.set_focus();
-    }
-}
-
-/// トレイのカスタムパネルの「終了」から呼ぶ
-#[tauri::command]
-fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
-        // トレイパネル（tray-panel ウィンドウ）をアイコン直下に位置決めするための座標計算
-        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             // 旧方式（.zshrc への CLAUDE_CODE_OAUTH_TOKEN 注入）の撤去。冪等なので毎起動で呼んでよい。
             // 「除去できていない」という報告が過去にあったため、エラーだけでなく
@@ -220,24 +218,16 @@ pub fn run() {
                 Ok(false) => println!("legacy shell integration: no stale block found (already clean)"),
                 Err(e) => eprintln!("legacy shell integration cleanup failed: {e}"),
             }
-            // 旧「監視用長期トークン」方式の撤去（2026-07-25 ユーザー決定）。冪等
-            accounts::remove_legacy_monitor_tokens();
             tray::setup(app.handle())?;
             updater::setup_periodic_check(app.handle());
             Ok(())
         })
-        .on_window_event(|window, event| match event {
-            // ウィンドウを閉じてもメニューバー常駐を続ける（終了はトレイの「終了」から）
-            tauri::WindowEvent::CloseRequested { api, .. } => {
+        // ウィンドウを閉じてもメニューバー常駐を続ける（終了はトレイの「終了」から）
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 let _ = window.hide();
                 api.prevent_close();
             }
-            // トレイのカスタムパネルはフォーカスを失ったら自動で隠す
-            // （CleanMyMac 風のポップオーバー挙動。他ウィンドウには影響しない）
-            tauri::WindowEvent::Focused(false) if window.label() == "tray-panel" => {
-                let _ = window.hide();
-            }
-            _ => {}
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
@@ -268,8 +258,8 @@ pub fn run() {
             rename_account,
             reorder_accounts,
             get_accounts_usage,
-            show_main_window,
-            quit_app
+            start_monitor_setup,
+            poll_monitor_setup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

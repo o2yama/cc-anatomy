@@ -50,16 +50,28 @@
 //!   呼び出し頻度・ファイルサイズ的に現状は許容範囲だが、気になるなら1回読んで使い回す形に
 //!   リファクタできる。
 //!
-//! ## 監視用長期トークンの全廃（2026-07-25 ユーザー決定）
+//! ## 監視用長期トークン（2026-07-25 に全廃 → 2026-07-26 に「任意機能」として部分的に復活）
 //!
 //! 当初は `claude setup-token` で発行する長期トークン（`CC Anatomy-token-<name>`）を
 //! メニューバーの複数アカウント使用率監視専用に維持していた（`CC Anatomy-active` は
-//! その「選択中」ポインタ）。しかし切り替えが Keychain スワップで簡単になったため、
-//! 複数アカウントの使用量を並べて見る機能自体が不要と判断し、この仕組みを全廃した。
-//! 使用量は「現在ライブのアカウントのみ」を `/api/oauth/usage` `/api/oauth/profile`
-//! （`actions::live_usage_summary` / `get_rate_limits` / `get_account_profile`）から表示する。
-//! `remove_legacy_monitor_tokens` がアプリ起動時に旧 `CC Anatomy-token-*` / `CC Anatomy-active`
-//! の Keychain エントリを一度だけ掃除する（冪等）。
+//! その「選択中」ポインタ）。切り替えが Keychain スワップで簡単になったため一度は全廃したが、
+//! 「全アカウントを常時監視したい」というユーザー要望を受け、位置づけを変えて復活させた:
+//!
+//! - **完全に任意**。「＋アカウントを追加」の最終ステップ（1/2 ログイン → 2/2 監視の承認）、
+//!   または登録済みアカウント行の「常時監視を設定」からのみ発行される。ユーザーが setup-token
+//!   をスキップ・キャンセルしても、アカウント追加・切り替え機能には一切影響しない
+//! - **切り替え機能とは完全独立**。監視トークンの有無・失効は `switch_account` の判断に絡まない
+//!   （Keychain スワップは `CC Anatomy-cred-<name>` スナップショットのみを見る）
+//! - `CC Anatomy-active`（旧「選択中」ポインタ）は復活させない。選択中の記録は
+//!   `meta.active`（Keychain の裏付けを持たない表示専用のブックキーピング）のままでよい
+//! - 旧実装は起動時に `CC Anatomy-token-*` を一律削除するマイグレーションを持っていたが、
+//!   復活に伴い削除している（これ以上消さない）
+//!
+//! 使用量取得の優先順位（`get_accounts_usage`）: (1) ライブアカウントはライブ OAuth
+//! `/api/oauth/usage` → (2) 監視トークンがあれば `/v1/messages` の
+//! `anthropic-ratelimit-unified-*` ヘッダ（`actions::usage_via_monitor_token`）→
+//! (3) スナップショット access token が期限内ならそれで `/api/oauth/usage` →
+//! (4) どれも取れなければ `usage_cache`（stale 表示）。取得結果はすべて usage_cache に保存する。
 //!
 //! `meta.active` フィールド自体は「ライブ追随の記録専用」として存置する
 //! （Keychain の裏付けは持たない、表示・記録用のブックキーピングのみ）。
@@ -69,11 +81,18 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tauri::Manager;
 
-/// 旧「監視用長期トークン」方式のサービス名。撤去マイグレーション（remove_legacy_monitor_tokens）
-/// でのみ使う。新規に読み書きすることはない
-const LEGACY_TOKEN_SVC_PREFIX: &str = "CC Anatomy-token-";
-const LEGACY_ACTIVE_SVC: &str = "CC Anatomy-active";
+/// 監視用長期トークン（`claude setup-token` 発行）のサービス名プレフィックス。
+/// 発行直後は Terminal 側のスクリプトが `PENDING_MONITOR_TOKEN_SVC`（アカウント名が
+/// 確定する前の一時置き場）にいったん書き、アプリ側が対象アカウントの名前で claim してから
+/// この形（`CC Anatomy-token-<name>`）に移す
+const TOKEN_SVC_PREFIX: &str = "CC Anatomy-token-";
+/// setup-token 発行直後の一時置き場。「＋アカウントを追加」の統合フローでは
+/// スクリプト起動時点でアカウント名がまだ確定していない（ログイン完了後に確定する）ため、
+/// 固定のこのサービス名にいったん書かせ、`poll_monitor_setup` が対象アカウント名で
+/// claim（コピー＋削除）する
+const PENDING_MONITOR_TOKEN_SVC: &str = "CC Anatomy-token-pending";
 const CRED_SVC_PREFIX: &str = "CC Anatomy-cred-";
 const LIVE_CREDENTIALS_SVC: &str = "Claude Code-credentials";
 /// 旧方式（.zshrc への CLAUDE_CODE_OAUTH_TOKEN 注入）のマーカー。撤去処理のみで使う
@@ -94,6 +113,10 @@ pub struct Account {
     /// ライブ資格情報のスナップショット（CC Anatomy-cred-<name>）が登録済みか。
     /// これが無いアカウントには切り替えできない（旧登録は「再ログイン」での取り込みが必要）
     pub has_credentials: bool,
+    /// 使用量の常時監視用に `claude setup-token` の長期トークンが紐づいているか（任意機能）。
+    /// 切り替え機能とは完全に独立で、これが無くても切り替え・使用量取得（スナップショット AT
+    /// 経由）自体は成立する
+    pub has_monitor_token: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -278,6 +301,15 @@ fn cred_svc(name: &str) -> String {
     format!("{CRED_SVC_PREFIX}{name}")
 }
 
+fn monitor_token_svc(name: &str) -> String {
+    format!("{TOKEN_SVC_PREFIX}{name}")
+}
+
+/// 監視トークンが紐づいているか（秘密自体は読まず `acct` 属性の有無だけで判定する）
+fn has_monitor_token(name: &str) -> bool {
+    keychain_account_attr(&monitor_token_svc(name)).is_some()
+}
+
 /// `security find-generic-password -s <svc>` の出力から `"acct"<blob>="value"` 行の値を取り出す。
 /// 値が無い属性は `"acct"<blob>=<NULL>`（引用符無し）で出るため、引用符で囲まれていない値は
 /// 無効として弾く。これをやらないと、二重引用符探索だけの素朴な実装では `<NULL>` のケースで
@@ -384,11 +416,6 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// AppleScript の文字列リテラルに埋め込む（osascript -e に渡す1行の中で使う）
-fn applescript_quote(s: &str) -> String {
-    s.replace('\\', r"\\").replace('"', "\\\"")
-}
-
 /// Keychain のサービス名とシェル引数に埋め込むため、名前は英数字・ハイフン・アンダースコアに限る
 fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
@@ -401,6 +428,41 @@ fn validate_name(name: &str) -> Result<(), String> {
     } else {
         Err("アカウント名は英数字・ハイフン・アンダースコア（32文字以内）で指定してください".into())
     }
+}
+
+/// 表示名のフォールバック規則: 表示名が設定されていればそれを、無ければ内部識別子(name)を使う。
+/// Rust 側（tray 等）・フロント側どちらでも同じ規則を使うため、ロジックをここに集約する
+fn resolve_display_name(name: &str, display_name: Option<&str>) -> String {
+    display_name
+        .filter(|d| !d.is_empty())
+        .unwrap_or(name)
+        .to_string()
+}
+
+/// メニューバーのアカウント一覧用。使用率は監視用長期トークンの全廃により持たない
+/// （表示名とライブ状態だけ返す。使用率は accounts::get_accounts_usage で別途取得する）
+pub struct TrayAccount {
+    /// switch_account に渡す内部識別子（Keychain サービス名の一部）
+    pub name: String,
+    /// 表示名（display_name があればそちら、無ければ内部識別子 name）
+    pub display_name: String,
+    pub is_live: bool,
+    /// false の場合は資格情報スナップショットが無く、切り替え不可（未取り込み）
+    pub has_credentials: bool,
+}
+
+pub fn registered_accounts() -> Vec<TrayAccount> {
+    let meta = load_meta();
+    let live = live_org_id();
+    meta.accounts
+        .iter()
+        .map(|a| TrayAccount {
+            name: a.name.clone(),
+            display_name: resolve_display_name(&a.name, a.display_name.as_deref()),
+            is_live: is_live_account(&a.org_id, live.as_deref()),
+            has_credentials: a.has_credentials,
+        })
+        .collect()
 }
 
 /// 一括照会の連打防止。前回取得からこの秒数未満ならキャッシュをそのまま返す
@@ -482,10 +544,34 @@ fn stored_access_token(name: &str) -> Option<(String, i64)> {
     Some((token, expires_at))
 }
 
+/// 使用量取得の優先順位（実際の I/O から分離した純粋な判定。テスト容易性のため）。
+/// (1) ライブなら常にライブ OAuth /api/oauth/usage → (2) 監視用長期トークンがあれば
+/// /v1/messages のヘッダ（oauth/usage のスコープ外のため長期トークンではこの経路しかない）
+/// → (3) スナップショット access token が期限内ならそれで /api/oauth/usage →
+/// (4) どれも使えなければ usage_cache（stale 表示）にフォールバックする
+#[derive(Debug, PartialEq, Eq)]
+enum UsageSource {
+    LiveOauth,
+    MonitorToken,
+    SnapshotOauth,
+    Cache,
+}
+
+fn resolve_usage_source(is_live: bool, has_monitor_token: bool, has_valid_snapshot_token: bool) -> UsageSource {
+    if is_live {
+        UsageSource::LiveOauth
+    } else if has_monitor_token {
+        UsageSource::MonitorToken
+    } else if has_valid_snapshot_token {
+        UsageSource::SnapshotOauth
+    } else {
+        UsageSource::Cache
+    }
+}
+
 /// 登録済み全アカウント（has_credentials のもの）の使用率をまとめて取得する。
+/// 取得元の優先順位は `resolve_usage_source` を参照。
 ///
-/// - ライブアカウントはライブ Keychain の access token、他は保存済みスナップショットの
-///   access token を使う。どちらも期限切れなら照会せず usage_cache をそのまま返す（stale=true）
 /// - 前回取得から USAGE_MIN_REFETCH_SECS 未満のアカウントも同様にキャッシュを返す（連打防止）
 /// - 照会に成功したら usage_cache へ保存する。切り替え後もこれが「最終既知値」として残る
 /// - refresh は一切行わない（access token 期限切れは正常な状態として静かにキャッシュへ委ねる）
@@ -509,19 +595,31 @@ pub fn get_accounts_usage() -> Result<Vec<AccountUsage>, String> {
             continue;
         }
 
-        let token = if is_live {
-            crate::credentials::live_token().ok()
-        } else {
-            stored_access_token(&name)
-                .filter(|(_, expires_at)| token_is_still_valid(*expires_at, now))
-                .map(|(token, _)| token)
-        };
+        let snapshot_token = stored_access_token(&name).filter(|(_, exp)| token_is_still_valid(*exp, now));
+        let source = resolve_usage_source(is_live, has_monitor_token(&name), snapshot_token.is_some());
 
-        let fetched = token.and_then(|t| {
-            crate::actions::oauth_get_with_token(&t, crate::actions::USAGE_URL)
-                .ok()
-                .and_then(|body| crate::actions::parse_usage_body(&body).ok())
-        });
+        let fetched = match source {
+            UsageSource::LiveOauth => {
+                // 期限切れなら照会せずキャッシュへフォールバックする（無駄な401リクエストを
+                // 避ける。expiresAt が取れない場合は「不明」として素通しし、実際の応答で判断する）
+                crate::credentials::live_token_with_expiry()
+                    .ok()
+                    .filter(|(_, expires_at)| expires_at.is_none_or(|exp| token_is_still_valid(exp, now)))
+                    .and_then(|(token, _)| {
+                        crate::actions::oauth_get_with_token(&token, crate::actions::USAGE_URL)
+                            .ok()
+                            .and_then(|body| crate::actions::parse_usage_body(&body).ok())
+                    })
+            }
+            UsageSource::MonitorToken => keychain_read(&monitor_token_svc(&name))
+                .and_then(|token| crate::actions::usage_via_monitor_token(&token).ok()),
+            UsageSource::SnapshotOauth => snapshot_token.and_then(|(token, _)| {
+                crate::actions::oauth_get_with_token(&token, crate::actions::USAGE_URL)
+                    .ok()
+                    .and_then(|body| crate::actions::parse_usage_body(&body).ok())
+            }),
+            UsageSource::Cache => None,
+        };
 
         match fetched {
             Some(summary) => {
@@ -754,6 +852,7 @@ pub fn get_accounts() -> Result<AccountsState, String> {
             plan: a.plan.clone(),
             is_live: is_live_account(&a.org_id, live.as_deref()),
             has_credentials: a.has_credentials,
+            has_monitor_token: has_monitor_token(&a.name),
         })
         .collect();
 
@@ -775,7 +874,7 @@ pub fn get_accounts() -> Result<AccountsState, String> {
 }
 
 /// ライブ資格情報 JSON をそのまま読む（accessToken だけでなくスナップショット全体が要るため、
-/// accessToken だけを返す credentials::live_token() とは別に用意する）
+/// accessToken 等だけを返す credentials::live_token_with_expiry() とは別に用意する）
 fn live_credentials_value() -> Result<serde_json::Value, String> {
     let out = Command::new("security")
         .args(["find-generic-password", "-s", LIVE_CREDENTIALS_SVC, "-w"])
@@ -864,6 +963,7 @@ pub fn import_live_account() -> Result<Account, String> {
         plan,
         is_live: is_live_account(&final_org_id, live.as_deref()),
         has_credentials: true,
+        has_monitor_token: has_monitor_token(&name),
     })
 }
 
@@ -1106,6 +1206,96 @@ fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
     }
 }
 
+/// setup-token 実行部分のシェルスクリプト断片。トークンは `PENDING_MONITOR_TOKEN_SVC`
+/// （固定の一時置き場）へ書く。「＋アカウントを追加」の統合フローではスクリプト起動時点で
+/// 対象アカウント名がまだ確定していない（ログイン完了後に確定する）ため、常に固定の
+/// pending サービス名へいったん書かせ、`poll_monitor_setup` が対象アカウント名で claim する
+/// （登録済みアカウントへの「常時監視を設定」でも同じ経路を使い、経路を1本にまとめる）。
+///
+/// setup-token の失敗・キャンセル・トークン抽出失敗は、いずれも `exit 0`
+/// （スクリプト全体としては成功）で抜ける。監視トークンは完全に任意の後付け機能であり、
+/// ここで失敗させてもアカウント追加・切り替え自体には一切影響しない設計なので、
+/// 呼び出し側（Terminal を見ているユーザー）に「スキップされた」と分かるログだけ残せば十分
+fn setup_token_script_body(claude_bin: &str) -> String {
+    const BODY: &str = r#"
+echo
+echo "==================================================="
+echo " CC Anatomy: 使用量の常時監視を設定します（任意・スキップ可）"
+echo " ブラウザが開いたら、このアカウントで承認してください。"
+echo " 不要なら Ctrl+C で中止しても、アカウントの追加・切り替えには影響しません。"
+echo "==================================================="
+echo
+
+log="$(dirname "$0")/setup-token.log"
+umask 077
+: > "$log"
+
+# setup-token は端末幅でトークンを折り返す。折り返すと1行では拾えず、行を継ぎ足す方式は
+# 本文まで巻き込みうるため、pty を十分広くして折り返し自体を起こさせない
+script -q "$log" zsh -c "stty cols 400 >/dev/null 2>&1; exec __CLAUDE_BIN__ setup-token"
+rc=$?
+
+# Ink の再描画でトークンが途中まで描かれた行も記録に混ざるため、最長一致を採用する
+token=$(sed $'s/\033\[[0-9;?]*[a-zA-Z]//g' "$log" 2>/dev/null | tr -d '\r' \
+  | grep -oE 'sk-ant-oat[0-9]+-[A-Za-z0-9_-]+' \
+  | awk '{ if (length($0) > length(best)) best = $0 } END { print best }')
+rm -Pf "$log" 2>/dev/null || rm -f "$log"
+
+if [ -z "$token" ]; then
+  echo
+  if [ $rc -ne 0 ]; then
+    echo "setup-token がエラー終了しました。監視の設定はスキップします。"
+  else
+    echo "トークンを取得できませんでした。監視の設定はスキップします。"
+  fi
+  echo "後からアプリの「常時監視を設定」からやり直せます。"
+  exit 0
+fi
+
+case "$token" in
+  sk-ant-oat*) ;;
+  *) echo "トークンの形式が想定外だったため、監視の設定をスキップしました。"; exit 0 ;;
+esac
+
+# 折り返しの結合に失敗すると、先頭だけの切れたトークンが通ってしまう。
+# 実物は 100 文字強なので、短すぎるものは壊れたとみなす
+if [ ${#token} -lt 60 ]; then
+  echo "取得したトークンが短すぎるため、監視の設定をスキップしました（${#token} 文字）。"
+  exit 0
+fi
+
+security add-generic-password -a "$USER" -s "__PENDING_SVC__" -w "$token" -U || {
+  echo "Keychain への保存に失敗したため、監視の設定をスキップしました。"
+  exit 0
+}
+unset token
+echo
+echo "✅ 監視トークンを保存しました。CC Anatomy に戻ってください。"
+"#;
+    BODY.replace("__CLAUDE_BIN__", claude_bin)
+        .replace("__PENDING_SVC__", PENDING_MONITOR_TOKEN_SVC)
+}
+
+/// osascript 経由で Terminal.app にスクリプトを実行させる（run_fixes_in_terminal と同じ流儀）
+fn run_script_in_terminal(script_path: &Path) -> Result<(), String> {
+    let status = Command::new("osascript")
+        .args([
+            "-e",
+            &format!(
+                "tell application \"Terminal\" to do script \"'{}'\"",
+                script_path.display()
+            ),
+            "-e",
+            "tell application \"Terminal\" to activate",
+        ])
+        .status()
+        .map_err(|e| format!("Terminal の起動に失敗: {e}"))?;
+    if !status.success() {
+        return Err("Terminal の起動に失敗しました（オートメーション権限を確認してください）".into());
+    }
+    Ok(())
+}
+
 /// `claude auth login` はブラウザ承認を伴う対話フローなので、GUI から隠して実行できない。
 /// 完了検知は Terminal の終了コードに頼らず、ライブ資格情報のハッシュ・org・email の
 /// 変化ポーリングで行う（仕様上 exit code での完了判定は保証されていないため）。
@@ -1114,7 +1304,14 @@ fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
 /// 事前に行う。未登録アカウントがログイン中なら（取り込まずに進むと失うため）ここで止める。
 /// 実行中セッションがあると、そのセッションが自分のトークンをライブへ書き戻して
 /// ログイン結果を踏み潰しうるため、force=false の間は `SessionsRunning` を返して確認を挟む
-pub fn start_add_account_login(force: bool) -> Result<StartLoginOutcome, String> {
+///
+/// 2026-07-26、統合フロー（ユーザー承認）により、ログイン完了後に**同じ Terminal で続けて**
+/// `claude setup-token` を実行するようにした（1/2 ブラウザでログイン → 2/2 使用量監視の承認）。
+/// アカウント名はこの時点で確定していないため、トークンは `PENDING_MONITOR_TOKEN_SVC` へ
+/// 書かせ、フロントが Flow B 完了（import_live_account）後に `poll_monitor_setup` で
+/// 対象アカウント名に claim する。setup-token 側の失敗・キャンセルはアカウント追加の成否に
+/// 一切影響しない
+pub fn start_add_account_login(app: &tauri::AppHandle, force: bool) -> Result<StartLoginOutcome, String> {
     ensure_app_not_busy()?;
     let sessions = count_running_sessions_unless_forced(force);
     if sessions > 0 {
@@ -1136,30 +1333,153 @@ pub fn start_add_account_login(force: bool) -> Result<StartLoginOutcome, String>
     };
     let baseline_json = serde_json::to_string(&baseline).map_err(|e| e.to_string())?;
 
+    // 中断した過去の追加が孤児トークンを残していることがある。消さずに始めると、
+    // poll_monitor_setup が古いトークンを今回のログインの成果と誤認して claim してしまう
+    keychain_delete(PENDING_MONITOR_TOKEN_SVC);
+
     let claude = crate::actions::resolve_claude_bin()?;
-    let command = format!(
-        "unset CLAUDE_CODE_OAUTH_TOKEN; {} auth login",
-        shell_quote(&claude.display().to_string())
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("accounts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let script_path = dir.join("add-account.sh");
+    let script = format!(
+        "#!/bin/zsh\nset -uo pipefail\nunset CLAUDE_CODE_OAUTH_TOKEN\n\
+         echo \"1/2 ブラウザでログインしてください\"\n\
+         if {claude} auth login; then\n\
+         echo\n\
+         echo \"2/2 使用量の常時監視を設定します\"\n{setup_token}\n\
+         else\n\
+         echo \"ログインが完了しなかったため、監視の設定は行いません。\"\n\
+         fi\n",
+        claude = shell_quote(&claude.display().to_string()),
+        setup_token = setup_token_script_body(&claude.display().to_string()),
     );
-    let status = Command::new("osascript")
-        .args([
-            "-e",
-            &format!(
-                "tell application \"Terminal\" to do script \"{}\"",
-                applescript_quote(&command)
-            ),
-            "-e",
-            "tell application \"Terminal\" to activate",
-        ])
-        .status()
-        .map_err(|e| format!("Terminal の起動に失敗: {e}"))?;
-    if !status.success() {
-        return Err("Terminal の起動に失敗しました（オートメーション権限を確認してください）".into());
+    fs::write(&script_path, script).map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
     }
+    run_script_in_terminal(&script_path)?;
+
     Ok(StartLoginOutcome::Started {
         baseline: baseline_json,
         warning: sync_warning,
     })
+}
+
+/// 登録済みアカウントへ「常時監視を設定」（setup-token のみを実行する単独フロー）。
+/// `claude auth login` は行わない＝現在ログイン中のアカウントを変えない。
+/// setup-token 自体は独自のブラウザ承認フローを持つため、対象アカウントが
+/// ライブでなくても実行できる
+pub fn start_monitor_setup(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
+    validate_name(name)?;
+    if !load_meta().accounts.iter().any(|a| a.name == name) {
+        return Err(format!("アカウント「{name}」は登録されていません"));
+    }
+    // 追加フローと同じく、孤児の pending トークンを消してから始める
+    keychain_delete(PENDING_MONITOR_TOKEN_SVC);
+
+    let claude = crate::actions::resolve_claude_bin()?;
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("accounts");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    let script_path = dir.join("setup-monitor.sh");
+    let script = format!(
+        "#!/bin/zsh\nset -uo pipefail\n{}\n",
+        setup_token_script_body(&claude.display().to_string())
+    );
+    fs::write(&script_path, script).map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| e.to_string())?;
+    }
+    run_script_in_terminal(&script_path)
+}
+
+#[derive(Serialize)]
+#[serde(tag = "status")]
+pub enum MonitorSetupPoll {
+    #[serde(rename = "waiting")]
+    Waiting,
+    #[serde(rename = "linked")]
+    Linked,
+    /// ブラウザ側が期待していたアカウントと別のアカウントで setup-token を承認していた
+    /// （2026-07-26 ユーザー報告: share1/2/3 のような紛らわしい複数アカウント運用では、
+    /// 黙って紐づけると別アカウントの使用率が以後ずっと誤表示され続ける事故になる）。
+    /// トークンは紐づけず破棄済みなので、UI は再試行を促すこと
+    #[serde(rename = "mismatch")]
+    Mismatch { expected_label: String, expected_email: String },
+}
+
+/// 期待する org_id とトークンの org_id が一致するか（テスト容易性のため純粋関数に分離）。
+/// 対象アカウントに org_id が無い（レアケース。org_id 導入前からの旧登録等）場合は
+/// 照合しようがないため、照合をスキップして従来どおり紐づけを許可する
+fn org_id_matches(expected_org_id: &str, token_org_id: &str) -> bool {
+    expected_org_id.is_empty() || expected_org_id == token_org_id
+}
+
+/// フロントが2秒間隔で呼ぶ（「＋アカウントを追加」のステップ2、または「常時監視を設定」）。
+/// pending 置き場にトークンが現れたら、対象アカウントの org_id と照合してから
+/// 監視トークンとして claim（コピーして pending 側を消す）する。
+/// 既存の監視トークンがあれば上書きする（「常時監視を設定」の再実行＝更新の意味にもなる）。
+///
+/// 照合不一致（ブラウザ側が別アカウントのまま承認された）ならトークンを破棄して
+/// `Mismatch` を返す。トークン自体が無効（401）なら破棄してエラーにする。
+/// レート上限・通信断等で確認できなかった場合は、有効なトークンを誤って捨てないよう
+/// pending のトークンは消さず `Waiting` を返して次回ポーリングで再確認する
+/// （旧実装 `claim_pending_account` と同じ方針）
+pub fn poll_monitor_setup(name: &str) -> Result<MonitorSetupPoll, String> {
+    validate_name(name)?;
+    let Some(token) = keychain_read(PENDING_MONITOR_TOKEN_SVC) else {
+        return Ok(MonitorSetupPoll::Waiting);
+    };
+
+    let meta = load_meta();
+    let target = meta
+        .accounts
+        .iter()
+        .find(|a| a.name == name)
+        .ok_or_else(|| format!("アカウント「{name}」は登録されていません"))?;
+
+    if !target.org_id.is_empty() {
+        match crate::actions::check_monitor_token(&token) {
+            crate::actions::TokenCheck::Valid(token_org_id) => {
+                if !org_id_matches(&target.org_id, &token_org_id) {
+                    keychain_delete(PENDING_MONITOR_TOKEN_SVC);
+                    return Ok(MonitorSetupPoll::Mismatch {
+                        expected_label: resolve_display_name(&target.name, target.display_name.as_deref()),
+                        expected_email: target.email.clone(),
+                    });
+                }
+            }
+            crate::actions::TokenCheck::Invalid => {
+                keychain_delete(PENDING_MONITOR_TOKEN_SVC);
+                return Err(
+                    "取得したトークンが無効でした。もう一度「常時監視を設定」からやり直してください。".into(),
+                );
+            }
+            crate::actions::TokenCheck::Unavailable(reason) => {
+                // 一時的な不調（レート上限・通信断等）。診断用にログへ残すだけで、
+                // pending のトークンは消さず次回ポーリングで再確認する
+                eprintln!("monitor token check unavailable (will retry): {reason}");
+                return Ok(MonitorSetupPoll::Waiting);
+            }
+        }
+    }
+
+    keychain_write(&monitor_token_svc(name), &token)?;
+    keychain_delete(PENDING_MONITOR_TOKEN_SVC);
+    Ok(MonitorSetupPoll::Linked)
 }
 
 #[derive(Serialize)]
@@ -1353,18 +1673,10 @@ pub fn remove_account(name: &str) -> Result<(), String> {
     meta.accounts.retain(|a| a.name != name);
     save_meta(&meta)?;
     keychain_delete(&cred_svc(name));
+    // 監視トークンは切り替え機能とは独立した任意機能だが、アカウント自体を削除するなら
+    // 紐づく監視トークンも道連れで消す（孤児のまま Keychain に残さない）
+    keychain_delete(&monitor_token_svc(name));
     Ok(())
-}
-
-/// 旧「監視用長期トークン」方式の撤去（2026-07-25 ユーザー決定で機能ごと廃止）。
-/// 登録済みアカウント名を辿って `CC Anatomy-token-<name>` を削除し、`CC Anatomy-active` も
-/// 削除する。アプリ起動時に一度呼ぶ。エントリが元々無くても失敗しない冪等な処理
-pub fn remove_legacy_monitor_tokens() {
-    let meta = load_meta();
-    for a in &meta.accounts {
-        keychain_delete(&format!("{LEGACY_TOKEN_SVC_PREFIX}{}", a.name));
-    }
-    keychain_delete(LEGACY_ACTIVE_SVC);
 }
 
 #[cfg(test)]
@@ -1449,6 +1761,23 @@ mod tests {
         assert!(!is_live_account("", Some("")));
         assert!(!is_live_account("org-1", None));
         assert!(is_live_account("org-1", Some("org-1")));
+    }
+
+    #[test]
+    fn resolve_display_name_falls_back_to_name() {
+        assert_eq!(resolve_display_name("share3", None), "share3");
+    }
+
+    #[test]
+    fn resolve_display_name_prefers_display_name_when_set() {
+        assert_eq!(resolve_display_name("share3", Some("仕事用")), "仕事用");
+    }
+
+    #[test]
+    fn resolve_display_name_falls_back_when_display_name_is_empty() {
+        // rename_account がトリム後に空文字を None へ正規化するが、
+        // 何らかの経路で空文字が入っても表示が壊れないよう表示側でも防御する
+        assert_eq!(resolve_display_name("share3", Some("")), "share3");
     }
 
     fn names(accounts: &[StoredAccount]) -> Vec<&str> {
@@ -1664,6 +1993,40 @@ mod tests {
         // 「期限切れなのに有効」「有効なのに期限切れ」の両方の誤判定になりうる
         assert!(token_is_still_valid(1_000_000, 900)); // 1_000_000ms = 1000s > 900s
         assert!(!token_is_still_valid(1_000_000, 1_100)); // 1000s <= 1100s
+    }
+
+    #[test]
+    fn resolve_usage_source_live_wins_regardless_of_monitor_token() {
+        // ライブなら監視トークン・スナップショットの有無に関わらず常にライブ OAuth を使う
+        assert_eq!(resolve_usage_source(true, true, true), UsageSource::LiveOauth);
+        assert_eq!(resolve_usage_source(true, false, false), UsageSource::LiveOauth);
+    }
+
+    #[test]
+    fn resolve_usage_source_monitor_token_beats_snapshot() {
+        // 非ライブで監視トークンがあれば、スナップショットが有効でも監視トークン優先
+        assert_eq!(resolve_usage_source(false, true, true), UsageSource::MonitorToken);
+        assert_eq!(resolve_usage_source(false, true, false), UsageSource::MonitorToken);
+    }
+
+    #[test]
+    fn resolve_usage_source_falls_back_to_snapshot_then_cache() {
+        assert_eq!(resolve_usage_source(false, false, true), UsageSource::SnapshotOauth);
+        assert_eq!(resolve_usage_source(false, false, false), UsageSource::Cache);
+    }
+
+    #[test]
+    fn org_id_matches_requires_exact_match_when_expected_is_present() {
+        assert!(org_id_matches("org-1", "org-1"));
+        assert!(!org_id_matches("org-1", "org-2"));
+    }
+
+    #[test]
+    fn org_id_matches_skips_check_when_expected_is_empty() {
+        // org_id 導入前からの旧登録等、対象アカウントに org_id が無いレアケースは
+        // 照合しようがないため、従来どおり紐づけを許可する（トークン側の org_id は問わない）
+        assert!(org_id_matches("", "org-anything"));
+        assert!(org_id_matches("", ""));
     }
 
     #[test]

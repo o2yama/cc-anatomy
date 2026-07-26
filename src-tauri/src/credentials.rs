@@ -11,8 +11,14 @@ fn extract_access_token(creds: &serde_json::Value) -> Result<String, String> {
         .ok_or_else(|| "資格情報に accessToken がありません".to_string())
 }
 
+/// access token の有効期限（epoch ミリ秒）。旧形式の資格情報等で持たないこともあるため
+/// Option で返す（呼び出し側は「不明」を「期限切れではない」として扱う＝素通しする）
+fn extract_expires_at(creds: &serde_json::Value) -> Option<i64> {
+    creds.pointer("/claudeAiOauth/expiresAt").and_then(|v| v.as_i64())
+}
+
 #[cfg(target_os = "macos")]
-pub fn live_token() -> Result<String, String> {
+fn read_live_credentials() -> Result<serde_json::Value, String> {
     let keychain = std::process::Command::new("security")
         .args([
             "find-generic-password",
@@ -25,13 +31,11 @@ pub fn live_token() -> Result<String, String> {
     if !keychain.status.success() {
         return Err("Keychain から Claude Code の資格情報を取得できません".into());
     }
-    let creds: serde_json::Value =
-        serde_json::from_slice(&keychain.stdout).map_err(|e| e.to_string())?;
-    extract_access_token(&creds)
+    serde_json::from_slice(&keychain.stdout).map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn live_token() -> Result<String, String> {
+fn read_live_credentials() -> Result<serde_json::Value, String> {
     let dir = std::env::var("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| crate::db::home_dir().join(".claude"));
@@ -42,7 +46,13 @@ pub fn live_token() -> Result<String, String> {
             path.display()
         )
     })?;
-    let creds: serde_json::Value = serde_json::from_slice(&data)
-        .map_err(|_| "Claude Code の資格情報を読み取れませんでした".to_string())?;
-    extract_access_token(&creds)
+    serde_json::from_slice(&data).map_err(|_| "Claude Code の資格情報を読み取れませんでした".to_string())
+}
+
+/// access token と有効期限（epoch ミリ秒、取れなければ None）をまとめて返す。
+/// 期限切れかどうかを API を呼ばずに事前判定するためのもの（refresh は一切行わない）
+pub fn live_token_with_expiry() -> Result<(String, Option<i64>), String> {
+    let creds = read_live_credentials()?;
+    let token = extract_access_token(&creds)?;
+    Ok((token, extract_expires_at(&creds)))
 }

@@ -2,9 +2,13 @@
 //! 外部アプリ起動（Finder / cmux / Ghostty）とタスク抽出は macOS 限定機能。
 //! 使用量取得は全プラットフォーム共通。
 //!
-//! 2026-07-25 ユーザー決定で「監視用長期トークン」による複数アカウント使用率監視を全廃した。
-//! 使用量・プロフィールは常にライブ資格情報（Claude Code がログイン中のアカウント）の
-//! access token で `/api/oauth/usage` `/api/oauth/profile` を直接叩く一本道になっている。
+//! ライブアカウント（現在ログイン中）の使用量・プロフィールは常にライブ資格情報の
+//! access token で `/api/oauth/usage` `/api/oauth/profile` を直接叩く（`get_rate_limits`/
+//! `get_account_profile`/`live_usage_summary`）。2026-07-26 に任意機能として復活した
+//! 監視用長期トークン（`claude setup-token` 発行）は `oauth/usage` のスコープ外のため、
+//! `usage_via_monitor_token` が `/v1/messages` へ最小リクエストを投げてレスポンスヘッダ
+//! （`anthropic-ratelimit-unified-*`）から使用率を読む別経路を使う
+//! （`accounts::get_accounts_usage` の優先順位2番目）。
 
 #[cfg(target_os = "macos")]
 use std::path::Path;
@@ -95,11 +99,6 @@ pub fn open_in_terminal(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Claude Code がログインに使っているライブ資格情報のアクセストークン（保存場所は OS 別）
-fn live_keychain_token() -> Result<String, String> {
-    crate::credentials::live_token()
-}
-
 /// 使用量ポーリングで繰り返し呼ぶため、接続を使い回す共有クライアント。
 /// トークンは Authorization ヘッダで送る（argv に載らないので `ps` から見えない）
 static HTTP: std::sync::LazyLock<reqwest::blocking::Client> = std::sync::LazyLock::new(|| {
@@ -111,12 +110,6 @@ static HTTP: std::sync::LazyLock<reqwest::blocking::Client> = std::sync::LazyLoc
         .build()
         .expect("HTTP クライアントの初期化に失敗")
 });
-
-/// ライブ資格情報の access token で叩く。監視用長期トークンは全廃したため経路はこれ一本
-fn oauth_get(url: &str) -> Result<String, String> {
-    let token = live_keychain_token()?;
-    oauth_get_with_token(&token, url)
-}
 
 /// `reqwest::blocking` は内部に自前の tokio ランタイムを持つ。これを tokio ランタイム配下
 /// （`#[tauri::command(async)]` が自動で使う `spawn_blocking` のスレッドを含む）から直接呼ぶと、
@@ -159,6 +152,98 @@ fn oauth_get_with_token_blocking(token: &str, url: &str) -> Result<String, Strin
 /// `/api/oauth/usage` のエンドポイント。ライブアカウントの使用量表示（actions.rs）と
 /// 登録済み全アカウントの使用率一括取得（accounts::get_accounts_usage）の両方から使うため公開する
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
+
+/// ライブ access token の取得状態。`expired` は Claude Code 側の自動 refresh 待ちの
+/// 正常な状態であり、エラー扱いしない（2026-07-26 ユーザー報告: 期限切れ時の応答が
+/// そのまま「再ログインが必要かもしれません」という誤誘導なエラー文言として毎回
+/// 表示されていた）。`error` は本当に予期しない失敗（ネットワーク不通・応答の構文エラー等）
+/// だけに限定する
+#[derive(serde::Serialize, Clone)]
+#[serde(tag = "status")]
+pub enum UsageFetch {
+    #[serde(rename = "ok")]
+    Ok { body: String },
+    #[serde(rename = "expired")]
+    Expired,
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+/// 期限切れ相当（401 or 応答本文の error フィールド）と、それ以外の予期しない失敗を区別する
+enum FetchOutcome {
+    Ok(String),
+    Expired,
+    Other(String),
+}
+
+/// oauth_get_with_token と同じ理由でランタイムコンテキストの無い素の OS スレッドへ逃がす
+fn oauth_get_checked(token: &str, url: &str) -> FetchOutcome {
+    let token = token.to_string();
+    let url = url.to_string();
+    match std::thread::spawn(move || oauth_get_checked_blocking(&token, &url)).join() {
+        Ok(outcome) => outcome,
+        Err(_) => FetchOutcome::Other("API 呼び出し中に内部エラーが発生しました".to_string()),
+    }
+}
+
+fn oauth_get_checked_blocking(token: &str, url: &str) -> FetchOutcome {
+    let resp = match HTTP
+        .get(url)
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+    {
+        Ok(r) => r,
+        Err(_) => return FetchOutcome::Other("API への接続に失敗しました".to_string()),
+    };
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return FetchOutcome::Expired;
+    }
+    let body = match resp.text() {
+        Ok(b) => b,
+        Err(e) => return FetchOutcome::Other(e.to_string()),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return FetchOutcome::Other("API の応答が不正です".to_string()),
+    };
+    if parsed.get("error").is_some() {
+        // 実測: 期限切れの access token は 401 ではなく 200 + error フィールドで
+        // 返ってくることがある。「再ログインが必要」という誤誘導な文言は出さず、
+        // 期限切れと同列（Expired）に扱う
+        return FetchOutcome::Expired;
+    }
+    FetchOutcome::Ok(body)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 事前に access token の有効期限を確認し、期限切れなら API を呼ばずに Expired を返す
+/// （無駄な401リクエストを減らす）。期限内でも 401・error フィールド応答が返れば、
+/// 事前判定をすり抜けたケースとして同じ Expired 扱いにする。refresh は一切行わない
+/// （refresh してしまうと refresh token が消費され、アカウント切り替え機能の安全性の
+/// 根幹である「refresh token は Claude Code 本体だけが触る」という前提が崩れるため）
+fn fetch_live_usage_status(url: &str) -> UsageFetch {
+    let (token, expires_at) = match crate::credentials::live_token_with_expiry() {
+        Ok(v) => v,
+        Err(e) => return UsageFetch::Error { message: e },
+    };
+    if expires_at.is_some_and(|exp| exp <= now_ms()) {
+        return UsageFetch::Expired;
+    }
+    match oauth_get_checked(&token, url) {
+        FetchOutcome::Ok(body) => UsageFetch::Ok { body },
+        FetchOutcome::Expired => UsageFetch::Expired,
+        FetchOutcome::Other(message) => UsageFetch::Error { message },
+    }
+}
 
 /// メニューバー向けの使用量サマリー。使用率は 0〜100、リセットは epoch 秒
 pub struct UsageSummary {
@@ -201,23 +286,120 @@ pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
     })
 }
 
+/// 監視用長期トークン（`claude setup-token` 発行）で `/v1/messages` に最小リクエストを投げ、
+/// レスポンスヘッダを返す。
+///
+/// **この経路でしか長期トークンの使用率は取れない**: `/api/oauth/usage` は長期トークンの
+/// スコープ外で拒否される。ヘッダには `anthropic-ratelimit-unified-*`（そのトークンの
+/// アカウントの使用率）が入っている。429（枠を使い切った状態）でもヘッダは返るので
+/// ステータスでは弾かない。reqwest::blocking のランタイムパニック回避のため、
+/// oauth_get_with_token と同様に素の std::thread へ逃がす
+fn probe_headers(token: &str) -> Result<(u16, reqwest::header::HeaderMap), String> {
+    let token = token.to_string();
+    std::thread::spawn(move || probe_headers_blocking(&token))
+        .join()
+        .map_err(|_| "API 呼び出し中に内部エラーが発生しました".to_string())?
+}
+
+fn probe_headers_blocking(token: &str) -> Result<(u16, reqwest::header::HeaderMap), String> {
+    let body = r#"{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = HTTP
+        .post("https://api.anthropic.com/v1/messages")
+        .bearer_auth(token)
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(body)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .map_err(|_| "API に接続できませんでした".to_string())?;
+    Ok((resp.status().as_u16(), resp.headers().clone()))
+}
+
+fn header_value(headers: &reqwest::header::HeaderMap, key: &str) -> Option<String> {
+    headers.get(key).and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string())
+}
+
+/// 監視用長期トークンの検証結果（旧実装 `claim_pending_account` の `check_oauth_token` を移植）。
+/// レート上限（429）を「無効」と混同しないこと: 枠を使い切ったアカウントでも
+/// `anthropic-organization-id` ヘッダは返るためトークン自体は有効。無効と確定できるのは
+/// 401（認証拒否）のときだけ
+pub enum TokenCheck {
+    /// 使える。課金先の organization id を持つ（長期トークンではメールを引けないため、
+    /// アカウントの同一性判定はこの id で行う）
+    Valid(String),
+    /// 認証そのものが拒否された。トークンが壊れているか失効している
+    Invalid,
+    /// 認証は問題ないが今は確認できない（レート上限・ネットワーク断・サーバ側エラー等）。
+    /// 呼び出し側はここでトークンを破棄してはいけない（一時的な不調で有効なトークンを
+    /// 誤って捨てないため）
+    Unavailable(String),
+}
+
+/// トークンの生死と、紐づく organization id を確認する
+/// （2026-07-26: setup-token 承認時にブラウザ側が別アカウントのままだった場合の
+/// 誤紐づけ検知に使う。旧実装 `check_oauth_token` と同じ判定基準）
+pub fn check_monitor_token(token: &str) -> TokenCheck {
+    let (status, headers) = match probe_headers(token) {
+        Ok(v) => v,
+        Err(e) => return TokenCheck::Unavailable(e),
+    };
+    if status == 401 {
+        return TokenCheck::Invalid;
+    }
+    match header_value(&headers, "anthropic-organization-id") {
+        Some(org) => TokenCheck::Valid(org),
+        None => TokenCheck::Unavailable(format!("アカウントを特定できませんでした（HTTP {status}）")),
+    }
+}
+
+/// 監視用長期トークンでの使用率取得（`accounts::get_accounts_usage` の優先順位2番目）。
+/// 401（トークン自体が無効・失効）のときだけ Err にする。refresh の概念が無い長期トークン
+/// なので、失効したら「常時監視を設定」でのやり直しが必要になる（切り替え機能には影響しない）
+pub fn usage_via_monitor_token(token: &str) -> Result<UsageSummary, String> {
+    let (status, headers) = probe_headers(token)?;
+    if status == 401 {
+        return Err("監視トークンが無効です".into());
+    }
+    let pct = |prefix: &str| -> Option<f64> {
+        header_value(&headers, &format!("anthropic-ratelimit-unified-{prefix}-utilization"))
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| v * 100.0)
+    };
+    let reset = |prefix: &str| -> Option<i64> {
+        header_value(&headers, &format!("anthropic-ratelimit-unified-{prefix}-reset"))
+            .and_then(|v| v.parse::<i64>().ok())
+    };
+    let five_pct = pct("5h").ok_or("使用量を取得できませんでした")?;
+    Ok(UsageSummary {
+        five_pct,
+        seven_pct: pct("7d").unwrap_or(0.0),
+        five_reset: reset("5h"),
+        seven_reset: reset("7d"),
+    })
+}
+
 /// 現在ログイン中（ライブ）アカウントの使用率。`/api/oauth/usage` を直接叩く
 /// （2026-07-25 ユーザー決定: 監視用長期トークンによる複数アカウント表示は全廃し、
-/// ライブアカウントのみを表示する一本道にした）
+/// ライブアカウントのみを表示する一本道にした）。
+/// トレイアイコンのタイトル/ツールチップ表示専用で、期限切れも通常の失敗も区別せず
+/// 「取得できなかった」として扱ってよい（呼び出し側は "-" を出すだけで文言は表示しない）
 pub fn live_usage_summary() -> Result<UsageSummary, String> {
-    let token = live_keychain_token()?;
-    let body = oauth_get_with_token(&token, USAGE_URL)?;
-    parse_usage_body(&body)
+    match fetch_live_usage_status(USAGE_URL) {
+        UsageFetch::Ok { body } => parse_usage_body(&body),
+        UsageFetch::Expired => Err("access token が期限切れです".to_string()),
+        UsageFetch::Error { message } => Err(message),
+    }
 }
 
 /// 表示対象アカウントのレートリミットを取得する（常にライブアカウント）
-pub fn get_rate_limits() -> Result<String, String> {
-    oauth_get(USAGE_URL)
+pub fn get_rate_limits() -> UsageFetch {
+    fetch_live_usage_status(USAGE_URL)
 }
 
 /// アカウント・組織・プラン情報を取得する（常にライブアカウント）
-pub fn get_account_profile() -> Result<String, String> {
-    oauth_get("https://api.anthropic.com/api/oauth/profile")
+pub fn get_account_profile() -> UsageFetch {
+    fetch_live_usage_status(PROFILE_URL)
 }
 
 #[cfg(test)]

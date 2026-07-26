@@ -16,6 +16,7 @@ pub struct Account {
     pub plan: String,
     pub is_live: bool,
     pub has_credentials: bool,
+    pub has_monitor_token: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -24,6 +25,13 @@ pub struct AccountsState {
     pub live_email: Option<String>,
     pub live_registered: bool,
     pub running_sessions: usize,
+}
+
+pub struct TrayAccount {
+    pub name: String,
+    pub display_name: String,
+    pub is_live: bool,
+    pub has_credentials: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -72,6 +80,21 @@ pub enum SwitchOutcome {
     SessionsRunning { count: usize },
 }
 
+#[derive(Serialize)]
+#[serde(tag = "status")]
+pub enum MonitorSetupPoll {
+    #[serde(rename = "waiting")]
+    Waiting,
+    #[serde(rename = "linked")]
+    Linked,
+    #[serde(rename = "mismatch")]
+    Mismatch { expected_label: String, expected_email: String },
+}
+
+pub fn registered_accounts() -> Vec<TrayAccount> {
+    Vec::new()
+}
+
 pub fn get_accounts() -> Result<AccountsState, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
@@ -80,13 +103,19 @@ pub fn remove_legacy_shell_integration() -> Result<bool, String> {
     Ok(false)
 }
 
-pub fn remove_legacy_monitor_tokens() {}
-
 pub fn import_live_account() -> Result<Account, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
-pub fn start_add_account_login(_force: bool) -> Result<StartLoginOutcome, String> {
+pub fn start_add_account_login(_app: &tauri::AppHandle, _force: bool) -> Result<StartLoginOutcome, String> {
+    Err(crate::actions::MAC_ONLY.into())
+}
+
+pub fn start_monitor_setup(_app: &tauri::AppHandle, _name: &str) -> Result<(), String> {
+    Err(crate::actions::MAC_ONLY.into())
+}
+
+pub fn poll_monitor_setup(_name: &str) -> Result<MonitorSetupPoll, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
