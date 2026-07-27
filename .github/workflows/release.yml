@@ -4,6 +4,17 @@
 # 前提 Secrets:
 #   TAURI_SIGNING_PRIVATE_KEY          … ~/.tauri/cc-anatomy.key の中身（紛失すると更新配信不能）
 #   TAURI_SIGNING_PRIVATE_KEY_PASSWORD … 空文字列（鍵はパスワードなし生成）
+#
+# 以下は macOS の Apple 署名・公証用（任意。手順は docs/apple-signing-setup.md）。
+# APPLE_CERTIFICATE が未登録の間は署名インポート手順自体をスキップし、
+# 従来どおり未署名ビルドが通る（tauri-action への Apple 系 env は空文字列になるだけで、
+# 現状（Apple Secrets が一切無い状態）と同じ挙動になる）:
+#   APPLE_CERTIFICATE          … Developer ID Application 証明書（.p12）を base64 化したもの
+#   APPLE_CERTIFICATE_PASSWORD … .p12 書き出し時に設定したパスワード
+#   KEYCHAIN_PASSWORD           … CI 一時キーチェーン用の任意パスワード（Apple とは無関係、任意の文字列でよい）
+#   APPLE_ID                    … 署名に使う Apple ID のメールアドレス
+#   APPLE_PASSWORD               … その Apple ID の「App用パスワード」（app-specific password。通常のパスワードではない）
+#   APPLE_TEAM_ID                … Apple Developer の Team ID
 name: release
 
 on:
@@ -26,6 +37,15 @@ jobs:
           - platform: macos-latest
             args: '--target universal-apple-darwin --bundles app,dmg'
     runs-on: ${{ matrix.platform }}
+    env:
+      # ジョブ全体からアクセスできる env にしておく（if: 条件式では secrets コンテキストを
+      # 直接参照できないため、経由地点として使う）
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -45,6 +65,25 @@ jobs:
 
       - run: npm ci
 
+      # APPLE_CERTIFICATE が未登録なら丸ごとスキップする（署名なしビルドを継続するため）。
+      # CI 専用の一時キーチェーンを作って証明書をインポートし、次のビルドステップが
+      # 参照する署名IDを CERT_ID として $GITHUB_ENV 経由で渡す
+      # （公式サンプル: tauri-apps/tauri-action の examples/publish-to-auto-release-
+      # universal-macos-app-with-signing-certificate.yml を踏襲）
+      - name: Apple Developer Certificate をインポート
+        if: ${{ env.APPLE_CERTIFICATE != '' }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f certificate.p12
+          CERT_ID=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application" | head -1 | awk -F'"' '{print $2}')
+          echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
+
       # release.sh が注釈付きタグにリリースノートを入れて push してくる
       - name: タグ注釈をリリースノートとして取り出す
         id: notes
@@ -55,11 +94,16 @@ jobs:
           [ -z "$NOTES" ] && NOTES="CC Anatomy ${GITHUB_REF_NAME}"
           { echo 'body<<NOTES_EOF'; echo "$NOTES"; echo 'NOTES_EOF'; } >> "$GITHUB_OUTPUT"
 
+      # APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD / APPLE_ID / APPLE_PASSWORD /
+      # APPLE_TEAM_ID はジョブ共通 env（上）から継承される。APPLE_SIGNING_IDENTITY だけ
+      # ここで指定する（証明書インポート済みなら CERT_ID、未登録なら空文字列で従来どおり
+      # 未署名ビルドが通る）
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: 'CC Anatomy ${{ github.ref_name }}'
