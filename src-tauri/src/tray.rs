@@ -20,7 +20,7 @@ use tauri::{
     image::Image,
     menu::{IconMenuItemBuilder, Menu, MenuItem, PredefinedMenuItem},
     tray::TrayIconBuilder,
-    AppHandle, Manager, Runtime,
+    AppHandle, Emitter, Manager, Runtime,
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 
@@ -157,15 +157,37 @@ fn reset_suffix(epoch: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
+/// live_usage_summary() が失敗したときの第一フォールバック。get_accounts_usage() が
+/// 既に取得済みのライブアカウント分を、追加の HTTP 無しで UsageSummary へ変換できるかを
+/// 判定する（テスト容易性のため I/O から分離。2026-07-27 レビュー M-1）。
+/// five_pct が無ければ（キャッシュ自体が存在しない等）使える値なしとして None を返す
+fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>) -> Option<crate::actions::UsageSummary> {
+    let u = batch_entry?;
+    Some(crate::actions::UsageSummary {
+        five_pct: u.five_pct?,
+        seven_pct: u.seven_pct.unwrap_or(0.0),
+        five_reset: u.five_reset,
+        seven_reset: u.seven_reset,
+    })
+}
+
 fn fetch_status() -> StatusData {
     // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す
     let registered = crate::accounts::registered_accounts();
     let live_name = registered.iter().find(|a| a.is_live).map(|a| a.display_name.clone());
+    // 内部識別子（name）は get_accounts_usage の結果（AccountUsage.name）と突き合わせるための
+    // キー。表示名（display_name）とは別に持つ
+    let live_internal_name = registered.iter().find(|a| a.is_live).map(|a| a.name.clone());
 
     // 一括照会はここ（トレイの定期更新・手動更新）とアカウント画面を開いた時だけに絞る
     // （レート配慮。get_accounts_usage 自身も前回取得から60秒未満はキャッシュ返しにする）。
     // 監視用長期トークンは復活させず、保存済みスナップショットの access token をそのまま使う
     let usage = crate::accounts::get_accounts_usage().unwrap_or_default();
+    // ライブアカウント分を後段のフォールバックで再利用するため先に引いておく
+    // （get_accounts_usage は is_live のアカウントにもライブOAuth→監視トークン→
+    // スナップショットの順で既に試行済みなので、ここでもう一度 HTTP を打つ必要は無い）
+    let live_usage_from_batch = live_internal_name.as_ref().and_then(|name| usage.iter().find(|u| &u.name == name));
+
     let other_accounts: Vec<_> = registered
         .into_iter()
         .filter(|a| !a.is_live)
@@ -181,7 +203,26 @@ fn fetch_status() -> StatusData {
         .collect();
 
     let mut usage_lines = Vec::new();
-    let (live_header, title) = match crate::actions::live_usage_summary() {
+    // ライブ OAuth を最優先で試す。失敗したら（典型的には切り替え直後で、スナップショット
+    // 由来のライブトークンが期限切れ。リフレッシュは Claude Code 起動時にしか起きない）、
+    // まず上の get_accounts_usage() がこのライブアカウント分について既に試行済みの結果
+    // （ライブOAuth→監視トークン→スナップショットのフォールバック連鎖）を再利用する
+    // （追加の HTTP なし）。それでも使える値が無いとき（例: 初回でキャッシュも無く
+    // バッチ側の照会も失敗した）だけ、最後の手段として監視トークンへ直接照会する。
+    // 2026-07-27 レビュー M-1: 従来はここで無条件にもう一度監視トークンへ POST しており、
+    // 「ライブトークン期限切れ＋監視トークンあり」のケースで毎サイクル /v1/messages への
+    // 実リクエストが2回（get_accounts_usage 内と、ここ）走っていた
+    let usage_result = crate::actions::live_usage_summary()
+        .or_else(|_| {
+            usage_summary_from_batch(live_usage_from_batch)
+                .ok_or_else(|| "バッチ結果に使える値なし".to_string())
+        })
+        .or_else(|_| {
+            crate::accounts::live_account_monitor_token()
+                .ok_or_else(|| "監視トークンなし".to_string())
+                .and_then(|token| crate::actions::usage_via_monitor_token(&token))
+        });
+    let (live_header, title) = match usage_result {
         Ok(u) => {
             let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
@@ -337,6 +378,27 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
 /// アカウント切り替え直後にも外部から呼べるよう公開する（m7: 切り替え後の即時反映）
 pub fn refresh<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || {
+        // 手動「セッション更新」ボタンの廃止に伴う自動化（2026-07-26）。定期更新のたびに
+        // ライブセッションを確認し、登録済みアカウントかつスナップショットに変化があれば
+        // 資格情報を最新化する。アカウント画面が開いていれば "accounts-updated" で気づかせる。
+        // ユーザー操作を起点としない自動処理なので、エラーはダイアログを出さずログのみに留める。
+        // auto_sync_live 側でハッシュ変化が無ければ Unchanged を返すため、ここでの emit は
+        // 実際に状態が変わったときだけに絞られる（レビュー M-3: 未登録ライブが居座る間
+        // 毎分 emit → 画面の reload が走り、D&D 並び替え中に順序が巻き戻る問題への対応）
+        match crate::accounts::auto_sync_live() {
+            Ok(crate::accounts::AutoSyncResult::Synced { warning }) => {
+                let _ = app.emit("accounts-updated", crate::accounts::AccountsUpdatedEvent { warning });
+            }
+            Ok(crate::accounts::AutoSyncResult::Unregistered) => {
+                let _ = app.emit(
+                    "accounts-updated",
+                    crate::accounts::AccountsUpdatedEvent { warning: None },
+                );
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("auto_sync_live failed (will retry next cycle): {e}"),
+        }
+
         let data = fetch_status();
         let handle = app.clone();
         let _ = app.run_on_main_thread(move || {
@@ -443,7 +505,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let builder = builder.title("…");
     builder.build(app)?;
 
-    // 初回取得 + 5分ごとの自動更新
+    // 初回取得 + REFRESH_INTERVAL（1分）ごとの自動更新
     let handle = app.clone();
     std::thread::spawn(move || loop {
         refresh(handle.clone());
@@ -514,4 +576,41 @@ mod tests {
         assert_eq!(live_fill_color(100), (0xff, 0x3b, 0x30));
     }
 
+    fn account_usage(five_pct: Option<f64>) -> crate::accounts::AccountUsage {
+        crate::accounts::AccountUsage {
+            name: "acct".into(),
+            five_pct,
+            seven_pct: Some(12.0),
+            five_reset: Some(1_000),
+            seven_reset: Some(2_000),
+            fetched_at: Some(500),
+            stale: true,
+            five_probably_reset: false,
+        }
+    }
+
+    #[test]
+    fn usage_summary_from_batch_converts_when_five_pct_present() {
+        // stale（キャッシュ返し）でも値さえあれば使う。fresh かどうかは get_accounts_usage
+        // 側の関心事で、ここ（トレイタイトルの表示可否）では問わない
+        let u = usage_summary_from_batch(Some(&account_usage(Some(42.0)))).expect("値があるはず");
+        assert_eq!(u.five_pct, 42.0);
+        assert_eq!(u.seven_pct, 12.0);
+        assert_eq!(u.five_reset, Some(1_000));
+        assert_eq!(u.seven_reset, Some(2_000));
+    }
+
+    #[test]
+    fn usage_summary_from_batch_none_when_no_batch_entry() {
+        // ライブアカウントが registered に見つからない・get_accounts_usage の結果に
+        // 対応するエントリが無い場合
+        assert!(usage_summary_from_batch(None).is_none());
+    }
+
+    #[test]
+    fn usage_summary_from_batch_none_when_five_pct_missing() {
+        // キャッシュ自体が存在しない（five_pct が None）なら「使える値なし」として
+        // 呼び出し側（fetch_status）を最後の手段（監視トークン直接照会）へ進ませる
+        assert!(usage_summary_from_batch(Some(&account_usage(None))).is_none());
+    }
 }

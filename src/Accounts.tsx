@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   DndContext,
   DragOverlay,
@@ -17,7 +18,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToParentElement, restrictToVerticalAxis } from "@dnd-kit/modifiers";
-import { api, Account, AccountsState, AccountUsage, accountLabel } from "./api";
+import { api, Account, AccountsState, AccountUsage, AccountsUpdatedEvent, accountLabel } from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
   claude_max: "Max",
@@ -26,6 +27,9 @@ const PLAN_LABEL: Record<string, string> = {
 
 const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
 const POLL_INTERVAL_MS = 2000;
+/** 再ログイン導線の mismatch 誤検知対策。Keychain（完了検知）と ~/.claude.json（照合）の
+ * 書き込み順の隙間を待ってから1回だけ再確認する（2026-07-26 レビュー M-6b） */
+const MISMATCH_RETRY_DELAY_MS = 3000;
 /** 使用量の常時監視（claude setup-token）は完全に任意の後付け機能なので、
  * ログイン待ち（5分）より短いタイムアウトでスキップ扱いにする */
 const MONITOR_TIMEOUT_MS = 90 * 1000;
@@ -44,16 +48,18 @@ const skipSessionsConfirmEnabled = () =>
   localStorage.getItem(SKIP_SESSIONS_CONFIRM_KEY) === "1";
 
 /** 「取り込みますか？」確認ダイアログの対象。switch は特定アカウントへの切り替え、
- * login はこれから始める claude auth login の事前 sync-back で未登録ログインを検知したケース */
+ * login はこれから始める claude auth login の事前 sync-back で未登録ログインを検知したケース。
+ * targetName は「再ログイン」導線（登録済みカードからの起動）のときだけ入り、
+ * 確認後に同じ対象で startAddLogin を再開するために持ち回す */
 type PendingConfirm =
   | { kind: "switch"; name: string; liveEmail: string | null }
-  | { kind: "login"; liveEmail: string | null };
+  | { kind: "login"; liveEmail: string | null; targetName?: string };
 
 /** 「起動中セッションがあるが続行するか」の確認ダイアログの対象。
  * 続行を選ぶと同じ操作を force=true で再実行する */
 type SessionsConfirm =
   | { kind: "switch"; name: string; count: number }
-  | { kind: "login"; count: number };
+  | { kind: "login"; count: number; targetName?: string };
 
 /** 使用率の1行分のテキスト（例: "5h 9% ・ 週 52%"）。リセット時刻を過ぎている想定なら
  * 「5h リセット済み」に置き換える。値が無ければ null（呼び出し側は行ごと出さない） */
@@ -181,6 +187,7 @@ function AccountRow({
   onCancelRemove,
   onConfirmRemove,
   onSwitch,
+  onRelogin,
   switchButtonDisabled,
   busy,
   monitorBusy,
@@ -200,6 +207,8 @@ function AccountRow({
   onCancelRemove: () => void;
   onConfirmRemove: () => void;
   onSwitch: () => void;
+  /** 資格情報が使えないカード（has_credentials=false）の「再ログイン」導線 */
+  onRelogin: () => void;
   switchButtonDisabled: boolean;
   busy: boolean;
   monitorBusy: boolean;
@@ -265,20 +274,34 @@ function AccountRow({
           </>
         ) : (
           <>
-            <button
-              className="acct-btn acct-btn-primary"
-              disabled={switchButtonDisabled || account.is_live || !account.has_credentials}
-              title={
-                !account.has_credentials
-                  ? "追加ボタンからこのアカウントでログインすると資格情報が取り込まれます"
-                  : account.is_live
-                    ? "現在ログイン中です"
-                    : "このアカウントに切り替える"
-              }
-              onClick={onSwitch}
-            >
-              切り替える
-            </button>
+            {account.has_credentials ? (
+              <button
+                className="acct-btn acct-btn-primary"
+                disabled={switchButtonDisabled || account.is_live}
+                title={account.is_live ? "現在ログイン中です" : "このアカウントに切り替える"}
+                onClick={onSwitch}
+              >
+                切り替える
+              </button>
+            ) : (
+              <button
+                className="acct-btn acct-btn-primary"
+                disabled={switchButtonDisabled || account.is_live || !account.can_relogin}
+                title={
+                  account.is_live
+                    // 60秒ごとの自動更新（tray.rs）がライブと一致した登録済みアカウントの
+                    // 資格情報を自動で最新化するため、手動操作は不要（2026-07-26 レビュー L-12）
+                    ? "現在ログイン中のアカウントです。1分以内に自動で資格情報が更新されます"
+                    : !account.can_relogin
+                      // org_id・email のどちらも無い旧登録は照合しようがない（2026-07-26 レビュー M-7）
+                      ? "照合に使える情報（組織ID・メールアドレス）が無いため再ログインでは紐づけできません。「＋アカウントを追加」から新規登録してください"
+                      : "ブラウザで再ログインすると、このアカウントの資格情報を取り込み直します（別アカウントでログインした場合は取り込まずエラーになります）"
+                }
+                onClick={onRelogin}
+              >
+                再ログイン
+              </button>
+            )}
             <button
               className="acct-btn acct-btn-ghost"
               disabled={busy}
@@ -358,6 +381,17 @@ export function AccountsOverlay({
   // Flow B: claude auth login のログイン待ち
   const [loginPending, setLoginPending] = useState(false);
   const loginPollRef = useRef<number | null>(null);
+  // mismatch 再確認の setTimeout（pollForCompletion 内）。id を追跡してキャンセル・画面
+  // クローズ時に必ず clearTimeout する（2026-07-26 レビュー M-A1）。追跡しないと、
+  // ユーザーが画面を閉じた・キャンセルした後に書き込みAPIである pollAddAccountLogin が
+  // 勝手に発火し、取り込み・監視フローが始まってしまう
+  const mismatchRetryRef = useRef<number | null>(null);
+  // "polling" 中の pollForCompletion 呼び出しだけが応答を処理してよい、という一方向ガード。
+  // interval は前回 invoke の完了を待たず2秒ごとに発火するため複数の pollAddAccountLogin が
+  // 同時に in-flight になりうる。ガード無しだと複数の応答がばらばらの順で戻ってきて
+  // handleMismatch/settle が二重実行されうる（2026-07-26 レビュー M-A3）。cancelLogin が
+  // "idle" に戻すことで、キャンセル済み・画面クローズ後に届く在り来たりの応答も無視される
+  const loginPhaseRef = useRef<"idle" | "polling" | "retrying">("idle");
 
   // 使用量の常時監視（claude setup-token、任意機能）の紐づけ待ち。
   // 「＋アカウントを追加」の統合フロー・ステップ2（monitorFlowName）と、
@@ -377,6 +411,22 @@ export function AccountsOverlay({
 
   useEffect(() => {
     if (open) reload();
+  }, [open, reload]);
+
+  // 定期更新ループ（tray.rs）が自動取り込みを行ったら "accounts-updated" が飛んでくる。
+  // 開いている間だけ購読し、画面表示時にしか同期されなかった状態を解消する（2026-07-26）。
+  // warning はライブ乗っ取り検知時の案内。旧・手動「セッション更新」ボタン押下時は
+  // outcome.warning として見えていたが、自動化の過程で握り潰されていたため復元する
+  // （2026-07-26 レビュー High-2b）
+  useEffect(() => {
+    if (!open) return;
+    const unlisten = listen<AccountsUpdatedEvent>("accounts-updated", (e) => {
+      if (e.payload.warning) setNotice(e.payload.warning);
+      reload();
+    });
+    return () => {
+      unlisten.then((un) => un());
+    };
   }, [open, reload]);
 
   // 使用率は一覧表示をブロックしないよう別コマンドで取りに行く。取得できなくても
@@ -404,10 +454,18 @@ export function AccountsOverlay({
       loginPollRef.current = null;
     }
   }, []);
+  const clearMismatchRetry = useCallback(() => {
+    if (mismatchRetryRef.current !== null) {
+      window.clearTimeout(mismatchRetryRef.current);
+      mismatchRetryRef.current = null;
+    }
+  }, []);
   const cancelLogin = useCallback(() => {
     stopLoginPolling();
+    clearMismatchRetry();
+    loginPhaseRef.current = "idle";
     setLoginPending(false);
-  }, [stopLoginPolling]);
+  }, [stopLoginPolling, clearMismatchRetry]);
 
   const stopMonitorFlowPolling = useCallback(() => {
     if (monitorFlowPollRef.current !== null) {
@@ -434,6 +492,7 @@ export function AccountsOverlay({
     }
   }, [open, cancelLogin, stopMonitorFlowPolling, stopRowMonitorPolling]);
   useEffect(() => stopLoginPolling, [stopLoginPolling]);
+  useEffect(() => clearMismatchRetry, [clearMismatchRetry]);
   useEffect(() => stopMonitorFlowPolling, [stopMonitorFlowPolling]);
   useEffect(() => stopRowMonitorPolling, [stopRowMonitorPolling]);
 
@@ -526,62 +585,145 @@ export function AccountsOverlay({
       });
   };
 
-  const pollForCompletion = (baseline: string) => {
-    setLoginPending(true);
-    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
-    loginPollRef.current = window.setInterval(() => {
-      if (Date.now() > deadline) {
-        cancelLogin();
-        setError("ログインが5分以内に完了しなかったため中止しました。");
-        return;
-      }
-      api
-        .pollAddAccountLogin(baseline)
-        .then((result) => {
-          if (result.status === "waiting") return;
-          cancelLogin();
-          setNotice(
-            `「${result.account.email || accountLabel(result.account)}」を取り込みました。本人のアカウントか確認してください。`
-          );
-          reload();
-          // 統合フロー・ステップ2: 続けて使用量の常時監視（任意）を設定する。
-          // ここでの成否はアカウント追加の成否に一切影響しない
-          beginMonitorFlow(result.account.name);
-        })
-        .catch((e) => {
-          cancelLogin();
-          setError(String(e));
-        });
-    }, POLL_INTERVAL_MS);
+  /** 再ログイン導線での誤紐づけ検知メッセージ。setup-token 側の monitorMismatchMessage とは
+   * 文言を分ける（「承認された」ではなく「ログインした」。ブラウザ操作の主体が違うため）。
+   * email が取れていない旧登録向けにフォールバック文言も用意する（2026-07-26 レビュー L-9） */
+  const loginMismatchMessage = (label: string, email: string) =>
+    email
+      ? `ログインしたアカウントが「${label}」と一致しません。ブラウザで ${email} にログインしてからやり直してください。`
+      : `ログインしたアカウントが「${label}」と一致しません。正しいアカウントでログインしてからやり直してください。`;
+
+  /** 完了・成功時の通知＋後続処理（reload・常時監視ステップ2）をまとめる */
+  const settleLoginDone = (account: Account, targetName?: string) => {
+    setNotice(
+      targetName
+        ? `「${accountLabel(account)}」の再ログインが完了しました。`
+        : `「${account.email || accountLabel(account)}」を取り込みました。本人のアカウントか確認してください。`
+    );
+    reload();
+    // 統合フロー・ステップ2: 続けて使用量の常時監視（任意）を設定する。
+    // ここでの成否はアカウント追加の成否に一切影響しない
+    beginMonitorFlow(account.name);
   };
 
-  const startAddLogin = (force = false): Promise<void> => {
+  /** targetName があれば「再ログイン」導線（組織ID/email 照合あり）のポーリング。
+   *
+   * mismatch は「取り込みが行われていない」だけで、ライブの Keychain / ~/.claude.json
+   * 自体はすでに書き換わっている（誤ったアカウントで実際にログインしてしまっている）ため
+   * reload() は必要（2026-07-26 レビュー L-8。旧コメント「何も変わっていない」は誤り）。
+   *
+   * Keychain（完了検知）と ~/.claude.json（照合）は別々に書き込まれるため、その隙間に
+   * 2秒ポーリングが入ると正しいログインでも一時的に mismatch と判定されうる。即エラーに
+   * せず、3秒後に1回だけ再確認し、それでも不一致のときだけエラー表示する
+   * （2026-07-26 レビュー M-6b）。再確認が waiting のときは通常のインターバルポーリングへ
+   * 戻し、5分デッドラインの管理下に留める（2026-07-26 レビュー M-A2）。
+   * loginPhaseRef による二重実行防止・mismatchRetryRef の追跡は cancelLogin 側を参照
+   * （2026-07-26 レビュー M-A1/M-A3） */
+  const pollForCompletion = (baseline: string, targetName?: string) => {
+    setLoginPending(true);
+    loginPhaseRef.current = "polling";
+    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+
+    const startInterval = () => {
+      loginPollRef.current = window.setInterval(() => {
+        if (loginPhaseRef.current !== "polling") return;
+        if (Date.now() > deadline) {
+          cancelLogin();
+          setError("ログインが5分以内に完了しなかったため中止しました。");
+          return;
+        }
+        api
+          .pollAddAccountLogin(baseline)
+          .then((result) => {
+            // すでに確定済み・キャンセル済み（別の in-flight 応答が先に処理した、
+            // ユーザーが中止した、画面を閉じた等）なら、この応答は無視する
+            if (loginPhaseRef.current !== "polling") return;
+            if (result.status === "waiting") return;
+            if (result.status === "mismatch") {
+              loginPhaseRef.current = "retrying";
+              handleMismatch();
+              return;
+            }
+            cancelLogin();
+            settleLoginDone(result.account, targetName);
+          })
+          .catch((e) => {
+            if (loginPhaseRef.current !== "polling") return;
+            cancelLogin();
+            setError(String(e));
+          });
+      }, POLL_INTERVAL_MS);
+    };
+
+    // 最初の mismatch では確定させず、3秒後の再確認結果だけを見る。インターバルだけ止め、
+    // loginPending は維持したまま再確認を待つ（ユーザーには引き続き「ログインを待っています」
+    // の表示のままにする）
+    const handleMismatch = () => {
+      stopLoginPolling();
+      mismatchRetryRef.current = window.setTimeout(() => {
+        mismatchRetryRef.current = null;
+        if (loginPhaseRef.current !== "retrying") return; // cancelLogin 済み
+        api
+          .pollAddAccountLogin(baseline)
+          .then((retry) => {
+            if (loginPhaseRef.current !== "retrying") return;
+            if (retry.status === "waiting") {
+              loginPhaseRef.current = "polling";
+              startInterval();
+              return;
+            }
+            if (retry.status === "mismatch") {
+              cancelLogin();
+              reload();
+              setError(loginMismatchMessage(retry.expected_label, retry.expected_email));
+              return;
+            }
+            cancelLogin();
+            settleLoginDone(retry.account, targetName);
+          })
+          .catch((e) => {
+            if (loginPhaseRef.current !== "retrying") return;
+            cancelLogin();
+            setError(String(e));
+          });
+      }, MISMATCH_RETRY_DELAY_MS);
+    };
+
+    startInterval();
+  };
+
+  /** targetName 省略時は「＋アカウントを追加」の汎用フロー、指定時は登録済みカードの
+   * 「再ログイン」導線（ログイン結果の組織IDが targetName と一致しなければ取り込まない） */
+  const startAddLogin = (targetName?: string, force = false): Promise<void> => {
     setError(null);
     setNotice(null);
     setBusy(true);
     stopLoginPolling();
     return api
-      .startAddAccountLogin(force)
+      .startAddAccountLogin(force, targetName)
       .then((outcome) => {
         if (outcome.status === "needs_import") {
-          setPendingConfirm({ kind: "login", liveEmail: outcome.live_email });
+          setPendingConfirm({ kind: "login", liveEmail: outcome.live_email, targetName });
           return;
         }
         if (outcome.status === "sessions_running") {
           // 「今後表示しない」が有効なら確認を出さず自動で force=true 再試行する
           if (skipSessionsConfirmEnabled()) {
-            return startAddLogin(true);
+            return startAddLogin(targetName, true);
           }
-          setSessionsConfirm({ kind: "login", count: outcome.count });
+          setSessionsConfirm({ kind: "login", count: outcome.count, targetName });
           return;
         }
         setSessionsConfirm(null);
         if (outcome.warning) setNotice(outcome.warning);
-        pollForCompletion(outcome.baseline);
+        pollForCompletion(outcome.baseline, targetName);
       })
       .catch((e) => setError(String(e)))
       .finally(() => setBusy(false));
   };
+
+  /** 登録済みだが資格情報が使えないカード（has_credentials=false）の「再ログイン」導線 */
+  const startRelogin = (name: string) => startAddLogin(name);
 
   const importLive = () => {
     setError(null);
@@ -641,7 +783,7 @@ export function AccountsOverlay({
         if (confirm.kind === "switch") {
           doSwitch(confirm.name);
         } else {
-          startAddLogin();
+          startAddLogin(confirm.targetName);
         }
       })
       .catch(() => {
@@ -661,7 +803,7 @@ export function AccountsOverlay({
     if (confirm.kind === "switch") {
       doSwitch(confirm.name, true);
     } else {
-      startAddLogin(true);
+      startAddLogin(confirm.targetName, true);
     }
   };
 
@@ -750,26 +892,31 @@ export function AccountsOverlay({
 
           {hasLegacyAccounts && (
             <p className="muted">
-              「未取り込み」のアカウントは保存済みのログイン情報がありません。「＋
-              アカウントを追加」からこのアカウントでログインするとログイン情報が取り込まれます（ブラウザでは登録したいアカウントを選んでください。別アカウントでログインすると、別のアカウントとして新規に取り込まれます）。
+              「未取り込み」のアカウントは保存済みのログイン情報がありません。行の「再ログイン」からブラウザでログインすると資格情報を取り込み直せます（別アカウントでログインした場合は誤って紐づけず、エラーになります）。組織ID・メールアドレスのどちらも登録が無い旧アカウントは照合できないため「再ログイン」は使えません。別アカウントとして新規に登録したい場合は「＋
+              アカウントを追加」から行ってください。
             </p>
           )}
 
-          {state && (
+          {/* 登録済み・ライブ一致・整合済みの場合は60秒ごとの自動更新（tray.rs）が資格情報を
+              最新化するため、ここでの手動操作は不要（旧「セッション更新」ボタンは廃止・
+              自動化した。2026-07-26）。未登録のライブセッション、または直前のスワップが
+              中途半端な状態のまま（inconsistent）のときだけ、一覧の先頭に取り込み導線を出す。
+              inconsistent は live_registered=true でも起こりうる（switch_account のロール
+              バック失敗時等）ため、live_registered だけで出し分けると詰む（2026-07-26 レビュー
+              High-1） */}
+          {state && state.live_email && (!state.live_registered || state.inconsistent) && (
             <div className="acct-banner">
               <div>
-                <strong>現在のログイン: {state.live_email ?? "検出できません"}</strong>
-                {state.live_email && !state.live_registered && (
-                  <p className="muted">
-                    このアカウントはまだ登録されていません。取り込むと保存され、切り替え先として選べるようになります。
-                  </p>
-                )}
+                <strong>現在のログイン: {state.live_email}</strong>
+                <p className="muted">
+                  {state.inconsistent
+                    ? "直前の切り替えが中途半端な状態のままです。取り込むと解消し、以後の切り替え・追加・再ログインができるようになります。"
+                    : "このアカウントはまだ登録されていません。取り込むと保存され、切り替え先として選べるようになります。"}
+                </p>
               </div>
-              {state.live_email && (
-                <button className="acct-btn acct-btn-primary" disabled={busy} onClick={() => importLive()}>
-                  {state.live_registered ? "セッション更新" : "取り込む"}
-                </button>
-              )}
+              <button className="acct-btn acct-btn-primary" disabled={busy} onClick={() => importLive()}>
+                このセッションを取り込む
+              </button>
             </div>
           )}
 
@@ -811,6 +958,7 @@ export function AccountsOverlay({
                     onCancelRemove={() => setConfirmRemove(null)}
                     onConfirmRemove={() => remove(a.name)}
                     onSwitch={() => doSwitch(a.name)}
+                    onRelogin={() => startRelogin(a.name)}
                     switchButtonDisabled={switchBusy}
                     busy={busy}
                     monitorBusy={rowMonitorName === a.name || monitorFlowName === a.name}
@@ -852,7 +1000,11 @@ export function AccountsOverlay({
               </button>
             </div>
           ) : (
-            <button className="acct-btn acct-btn-primary" disabled={switchBusy} onClick={() => startAddLogin()}>
+            <button
+              className="acct-btn acct-btn-primary"
+              disabled={switchBusy}
+              onClick={() => startAddLogin(undefined)}
+            >
               ＋ アカウントを追加（ブラウザでログイン）
             </button>
           )}

@@ -17,6 +17,7 @@ pub struct Account {
     pub is_live: bool,
     pub has_credentials: bool,
     pub has_monitor_token: bool,
+    pub can_relogin: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -25,6 +26,7 @@ pub struct AccountsState {
     pub live_email: Option<String>,
     pub live_registered: bool,
     pub running_sessions: usize,
+    pub inconsistent: bool,
 }
 
 pub struct TrayAccount {
@@ -53,6 +55,23 @@ pub enum PollResult {
     Waiting,
     #[serde(rename = "done")]
     Done { account: Account },
+    #[serde(rename = "mismatch")]
+    Mismatch { expected_label: String, expected_email: String },
+}
+
+/// tray.rs の定期更新ループから呼ぶ自動取り込みの結果。macOS 限定機能のスタブなので
+/// 実質何もしない（NoLiveLogin 固定）。accounts.rs と型を合わせるだけの存在
+pub enum AutoSyncResult {
+    Unchanged,
+    Synced { warning: Option<String> },
+    Unregistered,
+    NoLiveLogin,
+}
+
+/// "accounts-updated" イベントのペイロード。accounts.rs と型を合わせるだけの存在
+#[derive(Serialize, Clone)]
+pub struct AccountsUpdatedEvent {
+    pub warning: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -95,6 +114,12 @@ pub fn registered_accounts() -> Vec<TrayAccount> {
     Vec::new()
 }
 
+/// 非 macOS では監視トークンの紐づけ自体が成立しないため常に None（tray.rs の
+/// ライブ使用量フォールバックが無条件で呼ぶため、型を合わせるだけの存在）
+pub fn live_account_monitor_token() -> Option<String> {
+    None
+}
+
 pub fn get_accounts() -> Result<AccountsState, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
@@ -107,8 +132,18 @@ pub fn import_live_account() -> Result<Account, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
-pub fn start_add_account_login(_app: &tauri::AppHandle, _force: bool) -> Result<StartLoginOutcome, String> {
+pub fn start_add_account_login(
+    _app: &tauri::AppHandle,
+    _force: bool,
+    _target_name: Option<&str>,
+) -> Result<StartLoginOutcome, String> {
     Err(crate::actions::MAC_ONLY.into())
+}
+
+/// 非 macOS では自動取り込み自体が成立しないため、常に「ライブログインなし」扱いにする
+/// （tray.rs の定期更新ループを毎分エラーで埋めないため。Err にすると eprintln が毎分出る）
+pub fn auto_sync_live() -> Result<AutoSyncResult, String> {
+    Ok(AutoSyncResult::NoLiveLogin)
 }
 
 pub fn start_monitor_setup(_app: &tauri::AppHandle, _name: &str) -> Result<(), String> {

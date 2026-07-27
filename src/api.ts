@@ -150,6 +150,9 @@ export interface Account {
   /** 使用量の常時監視用に claude setup-token の長期トークンが紐づいているか（任意機能）。
    * 切り替え機能とは完全に独立で、これが無くても切り替え・使用量取得は成立する */
   has_monitor_token: boolean;
+  /** 「再ログイン」導線が使えるか（org_id か email のどちらかが登録されているか）。
+   * false の旧登録は照合しようがなく、再ログインを開始しても拒否される */
+  can_relogin: boolean;
 }
 
 /** 表示名のフォールバック規則。Rust 側の resolve_display_name と同じ規則
@@ -166,6 +169,16 @@ export interface AccountsState {
   live_registered: boolean;
   /** 起動中の claude CLI セッション数。切り替えの反映には再起動が要る */
   running_sessions: number;
+  /** 直前のスワップが中途半端な状態のまま残っている。true の間は切り替え・追加・
+   * 再ログインがすべてエラーになり、「このセッションを取り込む」でしか解消できない。
+   * live_registered の値に関わらず起こりうる */
+  inconsistent: boolean;
+}
+
+/** "accounts-updated" イベント（tray.rs の定期更新ループから emit）のペイロード。
+ * warning はライブ乗っ取り検知時の案内（ある場合だけ表示する） */
+export interface AccountsUpdatedEvent {
+  warning: string | null;
 }
 
 /** アカウント1件分の使用率。監視用長期トークンは復活させず、保存済みスナップショットの
@@ -184,10 +197,13 @@ export interface AccountUsage {
   five_probably_reset: boolean;
 }
 
-/** Flow B: claude auth login の完了検知ポーリング結果 */
+/** Flow B: claude auth login の完了検知ポーリング結果。
+ * mismatch は「再ログイン」導線（target 指定あり）で、ログイン結果の組織IDが対象
+ * アカウントと一致しなかった場合。誤紐づけを避けるため取り込みは行われていない */
 export type PollResult =
   | { status: "waiting" }
-  | { status: "done"; account: Account };
+  | { status: "done"; account: Account }
+  | { status: "mismatch"; expected_label: string; expected_email: string };
 
 /** Flow C: Keychain スワップ切り替えの結果 */
 export type SwitchOutcome =
@@ -237,8 +253,11 @@ export const api = {
     invoke<void>("run_fixes_in_terminal", { prompts }),
   getAccounts: () => invoke<AccountsState>("get_accounts"),
   importLiveAccount: () => invoke<Account>("import_live_account"),
-  startAddAccountLogin: (force = false) =>
-    invoke<StartLoginOutcome>("start_add_account_login", { force }),
+  /** target が指定された場合は登録済みカードの「再ログイン」導線。ログイン結果の組織IDが
+   * target と一致しなければ取り込まず mismatch を返す（誤紐づけ防止）。省略時は従来どおり
+   * 「＋アカウントを追加」の汎用フロー（対象を問わず取り込む） */
+  startAddAccountLogin: (force = false, targetName?: string) =>
+    invoke<StartLoginOutcome>("start_add_account_login", { force, targetName: targetName ?? null }),
   pollAddAccountLogin: (baseline: string) =>
     invoke<PollResult>("poll_add_account_login", { baseline }),
   switchAccount: (name: string, force = false) =>

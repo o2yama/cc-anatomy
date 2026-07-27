@@ -136,12 +136,16 @@ fn import_live_account() -> Result<accounts::Account, String> {
 /// 事前 sync-back を含むので async。`force` は外部セッション確認済みの再実行フラグ。
 /// 2026-07-26、統合フロー（1/2 ログイン→2/2 監視の承認）のため同じ Terminal で
 /// 続けて setup-token も起動するようになり、スクリプトの書き出し先に AppHandle が要る
+/// `target_name` を指定すると登録済みカードの「再ログイン」導線になり、ログイン結果の
+/// org_id が対象と一致しない場合は取り込まず mismatch を返す（誤紐づけ防止）。
+/// 未指定なら従来どおり「＋アカウントを追加」の汎用フロー
 #[tauri::command(async)]
 fn start_add_account_login(
     app: tauri::AppHandle,
     force: bool,
+    target_name: Option<String>,
 ) -> Result<accounts::StartLoginOutcome, String> {
-    accounts::start_add_account_login(&app, force)
+    accounts::start_add_account_login(&app, force, target_name.as_deref())
 }
 
 /// フロントが2秒間隔で呼ぶ完了検知ポーリング（Flow B）

@@ -81,7 +81,21 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use tauri::Manager;
+
+/// accounts.json の read-modify-write 区間を直列化する（2026-07-26 レビュー指摘 M-5）。
+/// auto_sync_live（60秒ごとの背景スレッド）と switch_account/remove_account/rename_account/
+/// reorder_accounts/get_accounts_usage（ユーザー操作、フロントから async コマンド経由）が
+/// 並行に load_meta → 変更 → save_meta を行うと、後勝ちの save_meta が他方の変更を
+/// 巻き戻す（削除したはずのアカウントが復活する等）。ロック保持中に HTTP 呼び出しを含む
+/// 区間もあるため厳密には理想的ではないが、まずは正しさ（レース排除）を優先する。
+/// 万一パニックで poison しても機能停止しないよう、poison は無視して継続する
+static META_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_meta() -> std::sync::MutexGuard<'static, ()> {
+    META_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// 監視用長期トークン（`claude setup-token` 発行）のサービス名プレフィックス。
 /// 発行直後は Terminal 側のスクリプトが `PENDING_MONITOR_TOKEN_SVC`（アカウント名が
@@ -117,6 +131,10 @@ pub struct Account {
     /// 切り替え機能とは完全に独立で、これが無くても切り替え・使用量取得（スナップショット AT
     /// 経由）自体は成立する
     pub has_monitor_token: bool,
+    /// 「再ログイン」導線が使えるか（org_id か email のどちらかが登録されているか）。
+    /// 両方とも空の旧登録は照合しようがなく再ログインを開始しても拒否されるため、
+    /// フロント側で事前に案内・disabled を出し分けるために返す（2026-07-26 レビュー M-7）
+    pub can_relogin: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -128,6 +146,12 @@ pub struct AccountsState {
     pub live_registered: bool,
     /// 起動中の claude CLI セッション数。0 より大きい間は切り替え・追加をブロックする
     pub running_sessions: usize,
+    /// 直前のスワップが中途半端な状態のまま残っている（meta.inconsistent）。true の間は
+    /// sync-back が止まっており、「取り込む」（import_live_account）でしか解消できない。
+    /// live_registered の状態に関わらず起こりうるため、専用フラグとして公開する
+    /// （2026-07-26 レビュー High-1: 従来は live_registered=false のときしか
+    /// 取り込み導線を出しておらず、登録済みのまま不整合になったケースが詰んでいた）
+    pub inconsistent: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -152,6 +176,13 @@ struct Meta {
     /// 不整合が時間の問題で発生する）
     #[serde(default)]
     last_live_hash: Option<String>,
+    /// 「直近に確認済み」のライブハッシュ。last_live_hash は sync-back が実際に書き戻せた
+    /// （＝登録済みと一致した）ときしか更新されないため、未登録ライブが居座るケースでは
+    /// 毎サイクル resolve_live_owner（＝ profile API 呼び出し）が走ってしまう
+    /// （2026-07-26 レビュー M-3）。ハッシュが変わらない限り「もう確認済み」として
+    /// auto_sync_live を早期returnさせるためのフィールド
+    #[serde(default)]
+    last_checked_hash: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -451,6 +482,10 @@ pub struct TrayAccount {
     pub has_credentials: bool,
 }
 
+/// トレイ表示専用の読み取り（save_meta しない）。save_meta は tmp + atomic rename なので、
+/// ロック無しで読んでも「壊れた JSON」や書きかけの内容を拾うことはない（見えるのは常に
+/// 更新前・更新後のどちらか）。lost-update の対象になる RMW ではないため
+/// META_LOCK の対象外とする（2026-07-26 レビュー M-5 の対応範囲を検討した上での除外）
 pub fn registered_accounts() -> Vec<TrayAccount> {
     let meta = load_meta();
     let live = live_org_id();
@@ -463,6 +498,23 @@ pub fn registered_accounts() -> Vec<TrayAccount> {
             has_credentials: a.has_credentials,
         })
         .collect()
+}
+
+/// ライブアカウントに対応する登録アカウントの監視トークンを読む（無ければ None）。
+/// トレイのタイトル表示（`live_usage_summary` の失敗時）専用のフォールバック。
+/// ライブトークンはスナップショット由来で、久しぶりに切り替えたアカウントほど期限切れに
+/// なりやすく、リフレッシュは Claude Code 起動時にしか起きないため、切り替え直後は
+/// メニューバーの使用量が「-」のまま見えなくなっていた（2026-07-27）。
+/// HTTP は呼ばない（トークン文字列を返すだけ。実際の照会は呼び出し側で行う）。
+/// registered_accounts と同じ理由で save_meta しない純粋な読み取りなので META_LOCK 対象外
+pub fn live_account_monitor_token() -> Option<String> {
+    let live = live_org_id()?;
+    let meta = load_meta();
+    // 空の org_id 同士を一致させない（is_live_account / sync_active_pointer / find_match_idx
+    // と同じ同一性判定の規約。2026-07-27 レビュー M-2: live が空文字列のとき org_id 未設定の
+    // 旧登録に誤マッチし、別アカウントの監視トークンで照会・表示してしまっていた）
+    let name = meta.accounts.iter().find(|a| !a.org_id.is_empty() && a.org_id == live)?.name.clone();
+    keychain_read(&monitor_token_svc(&name))
 }
 
 /// 一括照会の連打防止。前回取得からこの秒数未満ならキャッシュをそのまま返す
@@ -544,82 +596,121 @@ fn stored_access_token(name: &str) -> Option<(String, i64)> {
     Some((token, expires_at))
 }
 
-/// 使用量取得の優先順位（実際の I/O から分離した純粋な判定。テスト容易性のため）。
-/// (1) ライブなら常にライブ OAuth /api/oauth/usage → (2) 監視用長期トークンがあれば
-/// /v1/messages のヘッダ（oauth/usage のスコープ外のため長期トークンではこの経路しかない）
-/// → (3) スナップショット access token が期限内ならそれで /api/oauth/usage →
-/// (4) どれも使えなければ usage_cache（stale 表示）にフォールバックする
+/// 使用量取得で実際に試行しうるソース。Cache はここには含めない
+/// （「試すソース」ではなく「全滅した後の最終フォールバック」という別の位置づけのため）
 #[derive(Debug, PartialEq, Eq)]
 enum UsageSource {
     LiveOauth,
     MonitorToken,
     SnapshotOauth,
-    Cache,
 }
 
-fn resolve_usage_source(is_live: bool, has_monitor_token: bool, has_valid_snapshot_token: bool) -> UsageSource {
+/// 使用量取得の優先順位（実際の I/O から分離した純粋な判定。テスト容易性のため）。
+/// 上から順に試し、最初に成功したものを使う「真のフォールバック連鎖」を返す
+/// （どれも成功しなければ呼び出し側が usage_cache へフォールバックする）。
+///
+/// ライブアカウント: (1) ライブ OAuth /api/oauth/usage →（期限切れ・失敗なら）
+/// (2) 監視用長期トークンがあれば /v1/messages のヘッダ →（無ければ/失敗なら）
+/// (3) スナップショット access token が期限内ならそれで /api/oauth/usage。
+/// 非ライブアカウントはライブ OAuth を試さず (2)→(3) の順（ライブの資格情報は
+/// 他アカウントが消費中のため使えない）。
+///
+/// 2026-07-27: 従来は is_live なら常にライブ OAuth 一本で、失敗時は他ソースを試さず
+/// 直接キャッシュへ落ちていた。ライブトークンはスナップショット由来で、久しぶりに
+/// 切り替えたアカウントほど期限切れになりやすく、リフレッシュは Claude Code 起動時にしか
+/// 起きないため、「切り替え直後なのにメニューバーの使用量が見えない」空白期間が生じていた。
+/// 単一ソースではなく優先順位リストにし、失敗したソースは飛ばして次を試すようにする
+fn resolve_usage_source_order(is_live: bool, has_monitor_token: bool, has_valid_snapshot_token: bool) -> Vec<UsageSource> {
+    let mut order = Vec::with_capacity(3);
     if is_live {
-        UsageSource::LiveOauth
-    } else if has_monitor_token {
-        UsageSource::MonitorToken
-    } else if has_valid_snapshot_token {
-        UsageSource::SnapshotOauth
-    } else {
-        UsageSource::Cache
+        order.push(UsageSource::LiveOauth);
     }
+    if has_monitor_token {
+        order.push(UsageSource::MonitorToken);
+    }
+    if has_valid_snapshot_token {
+        order.push(UsageSource::SnapshotOauth);
+    }
+    order
+}
+
+/// 使用率照会の対象1件分。ロックを取り直さずに済むよう、フェーズ1で必要な値だけを
+/// meta から取り出しておく（2026-07-26 レビュー M-B1）
+struct UsageTarget {
+    name: String,
+    is_live: bool,
+    cache: Option<UsageCache>,
 }
 
 /// 登録済み全アカウント（has_credentials のもの）の使用率をまとめて取得する。
-/// 取得元の優先順位は `resolve_usage_source` を参照。
+/// 取得元の優先順位は `resolve_usage_source_order` を参照。
 ///
 /// - 前回取得から USAGE_MIN_REFETCH_SECS 未満のアカウントも同様にキャッシュを返す（連打防止）
 /// - 照会に成功したら usage_cache へ保存する。切り替え後もこれが「最終既知値」として残る
 /// - refresh は一切行わない（access token 期限切れは正常な状態として静かにキャッシュへ委ねる）
 pub fn get_accounts_usage() -> Result<Vec<AccountUsage>, String> {
-    let mut meta = load_meta();
     let live = live_org_id();
     let now = now_epoch();
-    let mut changed = false;
-    let mut results = Vec::with_capacity(meta.accounts.len());
 
-    for idx in 0..meta.accounts.len() {
-        if !meta.accounts[idx].has_credentials {
+    // フェーズ1（ロック区間）: 照会対象のスナップショットを取るだけ。HTTP はここでは呼ばない
+    // （2026-07-26 レビュー M-B1: 「一覧表示は使用率取得にブロックされない」という設計を
+    // 復元するため、ロック中に外部 I/O を含めない）
+    let targets: Vec<UsageTarget> = {
+        let _guard = lock_meta();
+        let meta = load_meta();
+        meta.accounts
+            .iter()
+            .filter(|a| a.has_credentials)
+            .map(|a| UsageTarget {
+                name: a.name.clone(),
+                is_live: is_live_account(&a.org_id, live.as_deref()),
+                cache: a.usage_cache.clone(),
+            })
+            .collect()
+    };
+
+    // フェーズ2（ロック外）: アカウントごとに HTTP 照会する。他の meta 操作をブロックしない
+    let mut results = Vec::with_capacity(targets.len());
+    let mut updates: Vec<(String, UsageCache)> = Vec::new();
+    for t in &targets {
+        if t.cache.as_ref().is_some_and(|c| cache_is_fresh_enough(c.fetched_at, now)) {
+            results.push(to_account_usage(&t.name, t.cache.as_ref(), true, now));
             continue;
         }
-        let name = meta.accounts[idx].name.clone();
-        let is_live = is_live_account(&meta.accounts[idx].org_id, live.as_deref());
-        let cache = meta.accounts[idx].usage_cache.clone();
 
-        if cache.as_ref().is_some_and(|c| cache_is_fresh_enough(c.fetched_at, now)) {
-            results.push(to_account_usage(&name, cache.as_ref(), true, now));
-            continue;
-        }
+        let snapshot_token = stored_access_token(&t.name).filter(|(_, exp)| token_is_still_valid(*exp, now));
+        let source_order = resolve_usage_source_order(t.is_live, has_monitor_token(&t.name), snapshot_token.is_some());
 
-        let snapshot_token = stored_access_token(&name).filter(|(_, exp)| token_is_still_valid(*exp, now));
-        let source = resolve_usage_source(is_live, has_monitor_token(&name), snapshot_token.is_some());
-
-        let fetched = match source {
-            UsageSource::LiveOauth => {
-                // 期限切れなら照会せずキャッシュへフォールバックする（無駄な401リクエストを
-                // 避ける。expiresAt が取れない場合は「不明」として素通しし、実際の応答で判断する）
-                crate::credentials::live_token_with_expiry()
-                    .ok()
-                    .filter(|(_, expires_at)| expires_at.is_none_or(|exp| token_is_still_valid(exp, now)))
-                    .and_then(|(token, _)| {
-                        crate::actions::oauth_get_with_token(&token, crate::actions::USAGE_URL)
-                            .ok()
-                            .and_then(|body| crate::actions::parse_usage_body(&body).ok())
-                    })
+        // 優先順位どおりに試し、最初に成功したものを採用する（失敗・スキップしたソースは
+        // 次へ進む。2026-07-27: 従来は is_live のライブ OAuth 1本勝負で、期限切れのまま
+        // 直接キャッシュへ落ちていた）
+        let mut fetched = None;
+        for source in &source_order {
+            fetched = match source {
+                UsageSource::LiveOauth => {
+                    // 期限切れなら照会せず次のソースへ進む（無駄な401リクエストを避ける。
+                    // expiresAt が取れない場合は「不明」として素通しし、実際の応答で判断する）
+                    crate::credentials::live_token_with_expiry()
+                        .ok()
+                        .filter(|(_, expires_at)| expires_at.is_none_or(|exp| token_is_still_valid(exp, now)))
+                        .and_then(|(token, _)| {
+                            crate::actions::oauth_get_with_token(&token, crate::actions::USAGE_URL)
+                                .ok()
+                                .and_then(|body| crate::actions::parse_usage_body(&body).ok())
+                        })
+                }
+                UsageSource::MonitorToken => keychain_read(&monitor_token_svc(&t.name))
+                    .and_then(|token| crate::actions::usage_via_monitor_token(&token).ok()),
+                UsageSource::SnapshotOauth => snapshot_token.as_ref().and_then(|(token, _)| {
+                    crate::actions::oauth_get_with_token(token, crate::actions::USAGE_URL)
+                        .ok()
+                        .and_then(|body| crate::actions::parse_usage_body(&body).ok())
+                }),
+            };
+            if fetched.is_some() {
+                break;
             }
-            UsageSource::MonitorToken => keychain_read(&monitor_token_svc(&name))
-                .and_then(|token| crate::actions::usage_via_monitor_token(&token).ok()),
-            UsageSource::SnapshotOauth => snapshot_token.and_then(|(token, _)| {
-                crate::actions::oauth_get_with_token(&token, crate::actions::USAGE_URL)
-                    .ok()
-                    .and_then(|body| crate::actions::parse_usage_body(&body).ok())
-            }),
-            UsageSource::Cache => None,
-        };
+        }
 
         match fetched {
             Some(summary) => {
@@ -630,17 +721,31 @@ pub fn get_accounts_usage() -> Result<Vec<AccountUsage>, String> {
                     seven_reset: summary.seven_reset,
                     fetched_at: now,
                 };
-                meta.accounts[idx].usage_cache = Some(new_cache.clone());
-                changed = true;
-                results.push(to_account_usage(&name, Some(&new_cache), false, now));
+                results.push(to_account_usage(&t.name, Some(&new_cache), false, now));
+                updates.push((t.name.clone(), new_cache));
             }
-            None => results.push(to_account_usage(&name, cache.as_ref(), true, now)),
+            None => results.push(to_account_usage(&t.name, t.cache.as_ref(), true, now)),
         }
     }
 
-    if changed {
-        save_meta(&meta)?;
+    // フェーズ3（ロック区間）: 取得できた分だけ meta を読み直して書き戻す。フェーズ1〜2の間に
+    // 削除・改名された可能性があるため、対象は名前で引き直す（見つからなければ静かにスキップ。
+    // 消えたアカウントの使用率を書き戻しても実害は無い実質的な no-op）
+    if !updates.is_empty() {
+        let _guard = lock_meta();
+        let mut meta = load_meta();
+        let mut changed = false;
+        for (name, cache) in updates {
+            if let Some(a) = meta.accounts.iter_mut().find(|a| a.name == name) {
+                a.usage_cache = Some(cache);
+                changed = true;
+            }
+        }
+        if changed {
+            save_meta(&meta)?;
+        }
     }
+
     Ok(results)
 }
 
@@ -833,13 +938,19 @@ fn sync_active_pointer(meta: &mut Meta) {
 }
 
 pub fn get_accounts() -> Result<AccountsState, String> {
-    let mut meta = load_meta();
-
-    let active_before = meta.active.clone();
-    sync_active_pointer(&mut meta);
-    if meta.active != active_before {
-        let _ = save_meta(&meta);
-    }
+    let meta = {
+        // sync_active_pointer の条件付き save_meta だけが RMW。以降の読み取り専用処理
+        // （アカウント一覧の整形・running_sessions 等）は atomic rename 前提でロック不要
+        // （2026-07-26 レビュー M-B2: 「一覧表示は使用率取得にブロックされない」設計の維持）
+        let _guard = lock_meta();
+        let mut meta = load_meta();
+        let active_before = meta.active.clone();
+        sync_active_pointer(&mut meta);
+        if meta.active != active_before {
+            let _ = save_meta(&meta);
+        }
+        meta
+    };
 
     let live = live_org_id();
     let accounts = meta
@@ -853,6 +964,7 @@ pub fn get_accounts() -> Result<AccountsState, String> {
             is_live: is_live_account(&a.org_id, live.as_deref()),
             has_credentials: a.has_credentials,
             has_monitor_token: has_monitor_token(&a.name),
+            can_relogin: !a.org_id.is_empty() || !a.email.is_empty(),
         })
         .collect();
 
@@ -870,6 +982,7 @@ pub fn get_accounts() -> Result<AccountsState, String> {
         live_email,
         live_registered,
         running_sessions: running_sessions(),
+        inconsistent: meta.inconsistent,
     })
 }
 
@@ -887,12 +1000,23 @@ fn live_credentials_value() -> Result<serde_json::Value, String> {
         .map_err(|_| "ライブ資格情報の読み取りに失敗しました".to_string())
 }
 
-/// 現在ログイン中アカウントを登録に取り込む（Flow A）。
+/// 現在ログイン中アカウントを登録に取り込む（Flow A）。Tauri コマンドから直接呼ぶ公開版。
+/// meta の read-modify-write をロックで直列化する（2026-07-26 レビュー M-5）
+pub fn import_live_account() -> Result<Account, String> {
+    let _guard = lock_meta();
+    import_live_account_locked()
+}
+
+/// import_live_account の内部実装。**呼び出し側が既に META_LOCK を保持している前提**
+/// （std::sync::Mutex は再入不可のため、ここで改めてロックを取ると自分自身の呼び出し元と
+/// デッドロックする）。poll_add_account_login（再ログイン導線のポーリング）はロックを
+/// 保持したままこちらを直接呼ぶ。
+///
 /// org_id 一致（無ければ email 一致）で既存登録を探し、あれば更新、無ければ新規追加する。
 /// `has_credentials = true` の save_meta は Keychain へのスナップショット書き込みが
 /// 成功した後に行う（書き込みが失敗したのに「スナップショットあり」と記録するのを防ぐ）。
 /// 取り込みの成功は「取り込む/再ログインでの解消」条件の1つなので、混在状態フラグも解除する
-pub fn import_live_account() -> Result<Account, String> {
+fn import_live_account_locked() -> Result<Account, String> {
     let creds = live_credentials_value()?;
     let oauth_account = live_oauth_account().ok_or(
         "現在ログイン中のアカウント情報が見つかりません。Claude Code でログインしてください",
@@ -956,10 +1080,12 @@ pub fn import_live_account() -> Result<Account, String> {
         .iter()
         .find(|a| a.name == name)
         .and_then(|a| a.display_name.clone());
+    let final_email = email.unwrap_or_default();
     Ok(Account {
         name: name.clone(),
         display_name,
-        email: email.unwrap_or_default(),
+        can_relogin: !final_org_id.is_empty() || !final_email.is_empty(),
+        email: final_email,
         plan,
         is_live: is_live_account(&final_org_id, live.as_deref()),
         has_credentials: true,
@@ -972,6 +1098,7 @@ pub fn import_live_account() -> Result<Account, String> {
 /// `name` をそのまま表示する状態に戻す
 pub fn rename_account(name: &str, display_name: &str) -> Result<(), String> {
     validate_name(name)?;
+    let _guard = lock_meta();
     let mut meta = load_meta();
     let idx = meta
         .accounts
@@ -1004,6 +1131,7 @@ fn reorder_stored_accounts(accounts: &mut Vec<StoredAccount>, order: &[String]) 
 /// アカウント一覧の表示順（= accounts.json の accounts 配列の順序）を変更する。
 /// ドラッグ&ドロップでの並び替え確定時にフロントから呼ばれる
 pub fn reorder_accounts(names: &[String]) -> Result<(), String> {
+    let _guard = lock_meta();
     let mut meta = load_meta();
     reorder_stored_accounts(&mut meta.accounts, names);
     save_meta(&meta)
@@ -1043,6 +1171,12 @@ fn sha256_hex(s: &str) -> String {
 #[derive(Serialize, Deserialize)]
 struct LoginBaseline {
     hash: String,
+    /// 再ログイン（登録済みカードの「再ログイン」導線）の対象アカウント。
+    /// None なら「＋アカウントを追加」の汎用フロー（誰でログインしても取り込む）。
+    /// Some の場合、ポーリング側でログイン結果の org_id をこの対象と照合し、
+    /// 一致しなければ取り込まずに Mismatch を返す（誤紐づけ防止。2026-07-26 要件）
+    #[serde(default)]
+    target_name: Option<String>,
 }
 
 fn hash_changed(baseline: &LoginBaseline, current_hash: &str) -> bool {
@@ -1144,6 +1278,51 @@ where
 /// 実際の持ち主を確認してから進める（2026-07-25 実機観測: refresh は access token 期限の
 /// 数時間前でも発生し、oauthAccount 自体は変わらないため、切り替え後に旧セッションが
 /// 残っていると誤帰属が時間の問題で起きる）
+/// resolve_live_owner の結果を meta.accounts へ適用する（Keychain 書き込み・
+/// org_id/email/oauth_account の更新・last_live_hash 更新）。**呼び出し側が既に
+/// META_LOCK を保持している前提**の内部ヘルパー（2026-07-26 レビュー M-B3 で
+/// auto_sync_live 用に sync_back_live_login から切り出した。sync_back_live_login
+/// 自身の呼び出し元 [switch_account/start_add_account_login] の挙動は変えない）
+fn apply_live_owner(
+    meta: &mut Meta,
+    owner: &LiveOwner,
+    oauth_account: serde_json::Value,
+    creds_str: &str,
+    current_hash: &str,
+) -> Result<SyncBack, String> {
+    match find_match_idx(&meta.accounts, owner.org_id.as_deref(), owner.email.as_deref()) {
+        Some(idx) => {
+            keychain_write(&cred_svc(&meta.accounts[idx].name), creds_str)?;
+            let a = &mut meta.accounts[idx];
+            if let Some(org) = &owner.org_id {
+                if !org.is_empty() {
+                    a.org_id = org.clone();
+                }
+            }
+            if let Some(e) = &owner.email {
+                a.email = e.clone();
+            }
+            // mismatched（ライブ乗っ取り検知）のときは oauthAccount の記載自体が
+            // 信用できない（別セッションが書き戻した残留情報の可能性がある）ため、
+            // profile で確認できた org_id/email 以外は上書きしない
+            // （2026-07-26 レビュー High-2a: 無警告で汚染データが保存されていた）
+            if !owner.mismatched {
+                a.oauth_account = Some(oauth_account);
+            }
+            a.has_credentials = true;
+            meta.last_live_hash = Some(current_hash.to_string());
+            Ok(SyncBack::Synced {
+                warning: owner.mismatched.then(|| LIVE_HIJACKED_WARNING.to_string()),
+            })
+        }
+        None => Ok(SyncBack::Unregistered(owner.email.clone())),
+    }
+}
+
+/// sync-back 本体。switch_account / start_add_account_login の「事前 sync-back」から呼ばれる
+/// （呼び出し側がロックを保持したまま呼ぶ、ユーザー操作に伴う短時間の処理という位置づけ。
+/// profile API 呼び出しを含めロック内で完結させる方針は今回変更しない。ロック外に出したのは
+/// 60秒ごとに無人で走る auto_sync_live のみ。2026-07-26 レビュー M-B3 のスコープ）
 fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
     if meta.inconsistent {
         return Err(
@@ -1175,27 +1354,7 @@ fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
                 },
             )?;
 
-            match find_match_idx(&meta.accounts, owner.org_id.as_deref(), owner.email.as_deref()) {
-                Some(idx) => {
-                    keychain_write(&cred_svc(&meta.accounts[idx].name), &creds_str)?;
-                    let a = &mut meta.accounts[idx];
-                    if let Some(org) = &owner.org_id {
-                        if !org.is_empty() {
-                            a.org_id = org.clone();
-                        }
-                    }
-                    if let Some(e) = &owner.email {
-                        a.email = e.clone();
-                    }
-                    a.oauth_account = Some(oauth_account);
-                    a.has_credentials = true;
-                    meta.last_live_hash = Some(current_hash);
-                    Ok(SyncBack::Synced {
-                        warning: owner.mismatched.then(|| LIVE_HIJACKED_WARNING.to_string()),
-                    })
-                }
-                None => Ok(SyncBack::Unregistered(owner.email)),
-            }
+            apply_live_owner(meta, &owner, oauth_account, &creds_str, &current_hash)
         }
         // 片方だけ読めた（Keychain と ~/.claude.json が矛盾した状態）は不整合。
         // 黙って進めると sync-back のつもりで実は何もできていない事態になるため中断する
@@ -1203,6 +1362,132 @@ fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
             "現在ログイン中の資格情報を確認できませんでした。時間をおいて再試行してください"
                 .into(),
         ),
+    }
+}
+
+/// tray.rs の定期更新ループ（60秒ごと）からの自動取り込みの結果。
+/// UI へ知らせる価値がある（＝画面の再描画が要る）のは Synced と Unregistered だけなので、
+/// 呼び出し側はこの2つのときだけ "accounts-updated" を emit すればよい
+pub enum AutoSyncResult {
+    /// ハッシュが前回記録・前回確認済みから変わっていなかった。何もしなかった
+    Unchanged,
+    /// 登録済みアカウントに一致し、資格情報を最新化した（旧・手動「セッション更新」相当）。
+    /// warning はライブ乗っ取り検知時の案内（旧・手動操作時に表示していたものと同じ。
+    /// 2026-07-26 レビュー High-2b: 従来は自動化の過程でこの警告が握り潰されていた）
+    Synced { warning: Option<String> },
+    /// ライブセッションが未登録アカウントだった（取り込みはしない。UI に導線を出すだけ）
+    Unregistered,
+    NoLiveLogin,
+}
+
+/// "accounts-updated" イベントのペイロード（tray.rs の定期更新ループから emit）
+#[derive(Serialize, Clone)]
+pub struct AccountsUpdatedEvent {
+    pub warning: Option<String>,
+}
+
+/// auto_sync_live の早期return条件（テスト容易性のため I/O から分離する。
+/// 2026-07-26 レビュー L-10）。last_live_hash・last_checked_hash のどちらかが
+/// 現在のハッシュと一致すれば「確認済み・変化なし」としてスキップしてよい
+fn auto_sync_should_skip(last_live_hash: Option<&str>, last_checked_hash: Option<&str>, current_hash: &str) -> bool {
+    last_live_hash == Some(current_hash) || last_checked_hash == Some(current_hash)
+}
+
+/// auto_sync_live のフェーズ3（ロックを取り直した後）の TOCTOU 再検証（テスト容易性のため
+/// I/O から分離する。2026-07-26 レビュー M-B3）。フェーズ2（ロック外・profile API 呼び出し）
+/// の間に不整合状態になった、または last_live_hash が動いていたら、その間に確認した owner の
+/// 前提はもう崩れているため書き込まず bail すべき
+fn auto_sync_should_bail(inconsistent: bool, current_last_live_hash: Option<&str>, snapshot: Option<&str>) -> bool {
+    inconsistent || current_last_live_hash != snapshot
+}
+
+/// 手動の「セッション更新」ボタンを廃止し、その自動化として定期更新ループから呼ぶ（2026-07-26）。
+/// 要件は「登録済みアカウントと一致し、かつ前回取り込み時（last_live_hash）からスナップショットが
+/// 変わっていたら自動で取り込む」。sync_back_live_login はこれを内包するが、呼ぶたびに
+/// Keychain へ書き込み・（内容次第で）profile API 呼び出しを伴うため、60秒ごとに無条件で
+/// 呼ぶとコストが無視できない。ハッシュが「登録済みとして書き戻し済み」（last_live_hash）
+/// または「前回すでに確認済み」（last_checked_hash。未登録ライブの居座り等、
+/// last_live_hash が更新されないケースをカバーする。2026-07-26 レビュー M-3）のどちらかと
+/// 一致する間は、sync_back_live_login 自体を呼ばずに早期returnする（auto_sync_should_skip）。
+///
+/// meta の read-modify-write はロックで直列化する（2026-07-26 レビュー M-5:
+/// ユーザー操作 [switch/remove/rename/reorder] と競合すると save_meta の後勝ちで
+/// 互いの変更を巻き戻しうる）。
+///
+/// ただし profile API 呼び出し（resolve_live_owner が内部で行う。最大で数秒〜10秒程度）は
+/// ロックの外で行う（2026-07-26 レビュー M-B3）。60秒ごとに無人で走るこの関数がロックを
+/// 持ったまま HTTP を待つと、その間ユーザー操作（切り替え・削除・改名等）がブロックされ、
+/// 「一覧表示は使用率取得にブロックされない」という既存設計の趣旨に反する。
+///
+/// 3フェーズに分ける:
+/// 1. （ロック区間・短時間）変化なし早期return の判定だけ行い、判定に使った
+///    last_live_hash をスナップショットして手放す
+/// 2. （ロック外）スナップショットを基準に resolve_live_owner を呼ぶ（HTTP はここでだけ）
+/// 3. （ロック区間）meta を読み直し、フェーズ1のスナップショットが今も同じか再検証してから
+///    書き込む（TOCTOU 対策）。フェーズ2の間に switch_account 等が last_live_hash を
+///    進めていたら、フェーズ2の owner はもう古いので書き込まず Unchanged で bail し、
+///    次サイクルに委ねる
+pub fn auto_sync_live() -> Result<AutoSyncResult, String> {
+    let creds = match live_credentials_value() {
+        Ok(v) => v,
+        Err(_) => return Ok(AutoSyncResult::NoLiveLogin),
+    };
+    let creds_str = creds.to_string();
+    let current_hash = sha256_hex(&creds_str);
+
+    // フェーズ1
+    let last_live_hash_snapshot = {
+        let _guard = lock_meta();
+        let meta = load_meta();
+        if meta.inconsistent {
+            return Err(
+                "直前の切り替えが中途半端な状態のままです。「取り込む」または「再ログイン」で解消してから実行してください"
+                    .into(),
+            );
+        }
+        if auto_sync_should_skip(meta.last_live_hash.as_deref(), meta.last_checked_hash.as_deref(), &current_hash) {
+            return Ok(AutoSyncResult::Unchanged);
+        }
+        meta.last_live_hash.clone()
+    };
+
+    let Some(oauth_account) = live_oauth_account() else {
+        // Keychain にはあるが ~/.claude.json に無い＝矛盾した状態。sync_back_live_login と
+        // 同じ方針で中断する（黙って進めると「確認済み」を誤って記録しかねない）
+        return Err("現在ログイン中の資格情報を確認できませんでした。時間をおいて再試行してください".into());
+    };
+    let access_token = creds.pointer("/claudeAiOauth/accessToken").and_then(|v| v.as_str());
+
+    // フェーズ2（ロック外。最大で数秒〜10秒かかりうる profile API 呼び出しはここだけ）
+    let owner = resolve_live_owner(
+        last_live_hash_snapshot.as_deref(),
+        &current_hash,
+        &oauth_account,
+        access_token,
+        |token| crate::actions::oauth_get_with_token(token, "https://api.anthropic.com/api/oauth/profile"),
+    )?;
+
+    // フェーズ3
+    let _guard = lock_meta();
+    let mut meta = load_meta();
+    if auto_sync_should_bail(meta.inconsistent, meta.last_live_hash.as_deref(), last_live_hash_snapshot.as_deref()) {
+        // フェーズ2の間に状態が変わった（切り替え・別の取り込み等）。この owner 判定は
+        // もう前提が崩れているため書き込まず、次の60秒サイクルに新しい前提で委ねる
+        return Ok(AutoSyncResult::Unchanged);
+    }
+
+    let result = apply_live_owner(&mut meta, &owner, oauth_account, &creds_str, &current_hash)?;
+    meta.last_checked_hash = Some(current_hash);
+    match result {
+        SyncBack::Synced { warning } => {
+            save_meta(&meta)?;
+            Ok(AutoSyncResult::Synced { warning })
+        }
+        SyncBack::Unregistered(_) => {
+            save_meta(&meta)?;
+            Ok(AutoSyncResult::Unregistered)
+        }
+        SyncBack::NoLiveLogin => Ok(AutoSyncResult::NoLiveLogin),
     }
 }
 
@@ -1311,27 +1596,57 @@ fn run_script_in_terminal(script_path: &Path) -> Result<(), String> {
 /// 書かせ、フロントが Flow B 完了（import_live_account）後に `poll_monitor_setup` で
 /// 対象アカウント名に claim する。setup-token 側の失敗・キャンセルはアカウント追加の成否に
 /// 一切影響しない
-pub fn start_add_account_login(app: &tauri::AppHandle, force: bool) -> Result<StartLoginOutcome, String> {
+pub fn start_add_account_login(
+    app: &tauri::AppHandle,
+    force: bool,
+    target_name: Option<&str>,
+) -> Result<StartLoginOutcome, String> {
     ensure_app_not_busy()?;
     let sessions = count_running_sessions_unless_forced(force);
     if sessions > 0 {
         return Ok(StartLoginOutcome::SessionsRunning { count: sessions });
     }
 
-    let mut meta = load_meta();
-    let sync_warning = match sync_back_live_login(&mut meta)? {
-        SyncBack::Unregistered(live_email) => return Ok(StartLoginOutcome::NeedsImport { live_email }),
-        SyncBack::Synced { warning } => {
-            save_meta(&meta)?;
-            warning
+    // ロックが必要なのは sync-back（meta の read-modify-write。2026-07-26 レビュー M-5）と
+    // baseline 生成の区間だけ。この後の Terminal 起動（run_script_in_terminal は osascript
+    // 経由でオートメーション許可ダイアログが出ることがあり、ユーザーの応答待ちで
+    // 分単位ブロックしうる）はロック外で行う（2026-07-26 レビュー M-B5）
+    let (sync_warning, baseline_json) = {
+        let _guard = lock_meta();
+        let mut meta = load_meta();
+        // 再ログイン導線（target_name あり）は既存の登録カードを直すのが目的なので、
+        // 対象がすでに存在しないなら（削除済み等）ここで止める。汎用の「＋アカウントを追加」
+        // （target_name なし）は従来どおり対象を問わない
+        if let Some(name) = target_name {
+            let target = meta
+                .accounts
+                .iter()
+                .find(|a| a.name == name)
+                .ok_or_else(|| format!("アカウント「{name}」は登録されていません"))?;
+            // org_id・email のどちらも無い旧登録は、ログイン結果を対象と照合しようがない
+            // （2026-07-26 レビュー M-7）。誤って任意のログインを紐づけないよう、ここで拒否する
+            if target.org_id.is_empty() && target.email.is_empty() {
+                return Err(format!(
+                    "「{name}」は照合に使える情報（組織ID・メールアドレス）が無いため再ログインでは紐づけできません。「＋アカウントを追加」から新規登録してください"
+                ));
+            }
         }
-        SyncBack::NoLiveLogin => None,
-    };
+        let sync_warning = match sync_back_live_login(&mut meta)? {
+            SyncBack::Unregistered(live_email) => return Ok(StartLoginOutcome::NeedsImport { live_email }),
+            SyncBack::Synced { warning } => {
+                save_meta(&meta)?;
+                warning
+            }
+            SyncBack::NoLiveLogin => None,
+        };
 
-    let baseline = LoginBaseline {
-        hash: live_credentials_hash(),
+        let baseline = LoginBaseline {
+            hash: live_credentials_hash(),
+            target_name: target_name.map(String::from),
+        };
+        let baseline_json = serde_json::to_string(&baseline).map_err(|e| e.to_string())?;
+        (sync_warning, baseline_json)
     };
-    let baseline_json = serde_json::to_string(&baseline).map_err(|e| e.to_string())?;
 
     // 中断した過去の追加が孤児トークンを残していることがある。消さずに始めると、
     // poll_monitor_setup が古いトークンを今回のログインの成果と誤認して claim してしまう
@@ -1378,8 +1693,14 @@ pub fn start_add_account_login(app: &tauri::AppHandle, force: bool) -> Result<St
 /// ライブでなくても実行できる
 pub fn start_monitor_setup(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
     validate_name(name)?;
-    if !load_meta().accounts.iter().any(|a| a.name == name) {
-        return Err(format!("アカウント「{name}」は登録されていません"));
+    // meta の読み取りをロックで直列化する（2026-07-26 レビュー M-5）。ロックが要るのは
+    // 存在確認だけなので、osascript（Automation 許可ダイアログで分単位ブロックし得る）
+    // まで保持しないようブロックで即時解放する
+    {
+        let _guard = lock_meta();
+        if !load_meta().accounts.iter().any(|a| a.name == name) {
+            return Err(format!("アカウント「{name}」は登録されていません"));
+        }
     }
     // 追加フローと同じく、孤児の pending トークンを消してから始める
     keychain_delete(PENDING_MONITOR_TOKEN_SVC);
@@ -1444,16 +1765,36 @@ pub fn poll_monitor_setup(name: &str) -> Result<MonitorSetupPoll, String> {
         return Ok(MonitorSetupPoll::Waiting);
     };
 
-    let meta = load_meta();
-    let target = meta
-        .accounts
-        .iter()
-        .find(|a| a.name == name)
-        .ok_or_else(|| format!("アカウント「{name}」は登録されていません"))?;
+    // フェーズ1（ロック区間・短時間）: 対象アカウントの org_id をスナップショットするだけ。
+    // check_monitor_token（HTTP）はここでは呼ばない（2026-07-26 レビュー M-B4）
+    let target_org_id = {
+        let _guard = lock_meta();
+        let meta = load_meta();
+        let target = meta
+            .accounts
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or_else(|| format!("アカウント「{name}」は登録されていません"))?;
+        target.org_id.clone()
+    };
 
-    if !target.org_id.is_empty() {
+    if !target_org_id.is_empty() {
+        // フェーズ2（ロック外）: HTTP 呼び出しはここでだけ
         match crate::actions::check_monitor_token(&token) {
             crate::actions::TokenCheck::Valid(token_org_id) => {
+                // フェーズ3（ロック区間）: フェーズ2の間に対象の org_id が変わっていないか
+                // 再検証してから確定する（TOCTOU 対策）。変わっていたら判定の前提が崩れて
+                // いるため確定せず、pending トークンも消さず次回ポーリングへ委ねる
+                let _guard = lock_meta();
+                let meta = load_meta();
+                let target = meta
+                    .accounts
+                    .iter()
+                    .find(|a| a.name == name)
+                    .ok_or_else(|| format!("アカウント「{name}」は登録されていません"))?;
+                if target.org_id != target_org_id {
+                    return Ok(MonitorSetupPoll::Waiting);
+                }
                 if !org_id_matches(&target.org_id, &token_org_id) {
                     keychain_delete(PENDING_MONITOR_TOKEN_SVC);
                     return Ok(MonitorSetupPoll::Mismatch {
@@ -1489,10 +1830,67 @@ pub enum PollResult {
     Waiting,
     #[serde(rename = "done")]
     Done { account: Account },
+    /// 再ログイン導線（target_name あり）で、ログイン結果の org_id が対象アカウントと
+    /// 一致しなかった。poll_monitor_setup の Mismatch と同じ形（誤紐づけ防止）
+    #[serde(rename = "mismatch")]
+    Mismatch { expected_label: String, expected_email: String },
+}
+
+/// 再ログイン対象アカウントとライブの持ち主の照合結果。判定不能（ライブの持ち主がまだ
+/// 確認できない）と不一致を区別する。Keychain（完了検知）と ~/.claude.json（照合）は
+/// 別々に書き込まれるため、その間隙で2秒ポーリングが入ると org_id/email が一時的に
+/// 読めない・古いままのことがある。これを Mismatch にすると正しいログインでも誤って
+/// 弾いてしまうため、Undetermined として区別する（2026-07-26 レビュー M-6a）
+#[derive(Debug, PartialEq, Eq)]
+enum ReloginMatch {
+    Match,
+    Mismatch,
+    /// ライブの持ち主がまだ確認できない。不一致と決めつけず待ち続けるべき
+    Undetermined,
+}
+
+/// 対象アカウントの org_id（第一キー）・email（org_id が空の旧登録向けフォールバック）を
+/// ライブの持ち主と照合する純粋関数（org_id_matches の流儀を踏襲。2026-07-26 レビュー L-10）。
+/// 対象が org_id・email のどちらも持たない場合は照合しようがないため Mismatch で拒否する
+/// （2026-07-26 レビュー M-7。このケースは start_add_account_login 側の can_relogin
+/// チェックで事前に弾く想定だが、念のためここでも安全側に倒す）
+fn match_relogin_target(
+    target_org_id: &str,
+    target_email: &str,
+    live_org_id: Option<&str>,
+    live_email: Option<&str>,
+) -> ReloginMatch {
+    if !target_org_id.is_empty() {
+        return match live_org_id {
+            Some(o) if o == target_org_id => ReloginMatch::Match,
+            Some(_) => ReloginMatch::Mismatch,
+            None => ReloginMatch::Undetermined,
+        };
+    }
+    if !target_email.is_empty() {
+        return match live_email {
+            Some(e) if e == target_email => ReloginMatch::Match,
+            Some(_) => ReloginMatch::Mismatch,
+            None => ReloginMatch::Undetermined,
+        };
+    }
+    ReloginMatch::Mismatch
 }
 
 /// フロントが2秒間隔で呼ぶ。ハッシュが変われば完了とみなし、あとは import_live_account に
-/// 判定を委ねる（同一アカウントの再ログインなら更新、別アカウントなら新規取り込みになる）
+/// 判定を委ねる（同一アカウントの再ログインなら更新、別アカウントなら新規取り込みになる）。
+///
+/// target_name（再ログイン導線）がある場合だけ、import_live_account を呼ぶ前に
+/// ログイン結果を対象アカウントと照合する（match_relogin_target）。Undetermined
+/// （判定不能）なら Waiting を返して次のポーリングへ委ね、Mismatch のときだけ
+/// **何も書き込まず** Mismatch を返す（誤って別アカウントの登録を上書き・新規作成しない）。
+/// このときライブの Keychain / ~/.claude.json 自体はすでに書き換わってしまっているが、
+/// ここで sync-back 等の追加ケアは行わない。60秒ごとの自動同期ループ（tray.rs →
+/// auto_sync_live）が次サイクルで拾い、登録済みアカウントに一致すれば自動で取り込み、
+/// 未登録ならアカウント画面に取り込み導線を出す（2026-07-26 コーディネーター了承）。
+/// Mismatch 時は setup-token（常時監視・任意機能）の pending トークンが付随して残っている
+/// ことがあるため破棄する（放置すると次回の正しいやり直しが偽 Mismatch で失敗する。
+/// 2026-07-26 レビュー M-4）
 pub fn poll_add_account_login(baseline: &str) -> Result<PollResult, String> {
     let baseline: LoginBaseline = serde_json::from_str(baseline)
         .map_err(|_| "内部状態が壊れています。もう一度「アカウントを追加」からやり直してください".to_string())?;
@@ -1501,7 +1899,36 @@ pub fn poll_add_account_login(baseline: &str) -> Result<PollResult, String> {
         return Ok(PollResult::Waiting);
     }
 
-    let account = import_live_account()?;
+    // meta の read-modify-write をロックで直列化する（2026-07-26 レビュー M-5）。
+    // 対象アカウントの照合（読み取り）と、一致した場合の取り込み（書き込み）を
+    // 同じロック区間で行う必要がある（そうしないと、照合直後に別操作で対象が
+    // 削除・改名されて食い違う可能性がある）。ロックを保持したまま
+    // import_live_account_locked を直接呼ぶ（公開版 import_live_account を呼ぶと
+    // 二重ロックでデッドロックする）
+    let _guard = lock_meta();
+
+    if let Some(target_name) = &baseline.target_name {
+        let meta = load_meta();
+        if let Some(target) = meta.accounts.iter().find(|a| &a.name == target_name) {
+            let live_oauth = live_oauth_account();
+            let (live_org, live_email) = live_oauth.as_ref().map(identify).unwrap_or((None, None));
+            match match_relogin_target(&target.org_id, &target.email, live_org.as_deref(), live_email.as_deref()) {
+                ReloginMatch::Match => {}
+                ReloginMatch::Undetermined => return Ok(PollResult::Waiting),
+                ReloginMatch::Mismatch => {
+                    keychain_delete(PENDING_MONITOR_TOKEN_SVC);
+                    return Ok(PollResult::Mismatch {
+                        expected_label: resolve_display_name(&target.name, target.display_name.as_deref()),
+                        expected_email: target.email.clone(),
+                    });
+                }
+            }
+        }
+        // 対象アカウントが見つからない（ポーリング中に削除された等）場合は照合できないため、
+        // 保護対象が無いとみなして通常の取り込みへ進む
+    }
+
+    let account = import_live_account_locked()?;
     Ok(PollResult::Done { account })
 }
 
@@ -1580,6 +2007,7 @@ pub fn switch_account(name: &str, force: bool) -> Result<SwitchOutcome, String> 
         return Ok(SwitchOutcome::SessionsRunning { count: sessions });
     }
     validate_name(name)?;
+    let _guard = lock_meta();
     let mut meta = load_meta();
     let target_idx = meta
         .accounts
@@ -1666,6 +2094,7 @@ pub fn switch_account(name: &str, force: bool) -> Result<SwitchOutcome, String> 
 
 pub fn remove_account(name: &str) -> Result<(), String> {
     validate_name(name)?;
+    let _guard = lock_meta();
     let mut meta = load_meta();
     if meta.active.as_deref() == Some(name) {
         meta.active = None;
@@ -1886,7 +2315,7 @@ mod tests {
 
     #[test]
     fn hash_changed_detects_difference() {
-        let baseline = LoginBaseline { hash: "abc".to_string() };
+        let baseline = LoginBaseline { hash: "abc".to_string(), target_name: None };
         assert!(!hash_changed(&baseline, "abc"));
         assert!(hash_changed(&baseline, "xyz"));
     }
@@ -1996,23 +2425,44 @@ mod tests {
     }
 
     #[test]
-    fn resolve_usage_source_live_wins_regardless_of_monitor_token() {
-        // ライブなら監視トークン・スナップショットの有無に関わらず常にライブ OAuth を使う
-        assert_eq!(resolve_usage_source(true, true, true), UsageSource::LiveOauth);
-        assert_eq!(resolve_usage_source(true, false, false), UsageSource::LiveOauth);
+    fn resolve_usage_source_order_live_leads_when_available() {
+        // ライブなら先頭はライブ OAuth。ただし単一ソースではなく、失敗時に備えて
+        // 監視トークン・スナップショットも後続候補として並ぶ（2026-07-27: フォールバック連鎖化）
+        assert_eq!(
+            resolve_usage_source_order(true, true, true),
+            vec![UsageSource::LiveOauth, UsageSource::MonitorToken, UsageSource::SnapshotOauth]
+        );
+        assert_eq!(resolve_usage_source_order(true, false, false), vec![UsageSource::LiveOauth]);
     }
 
     #[test]
-    fn resolve_usage_source_monitor_token_beats_snapshot() {
-        // 非ライブで監視トークンがあれば、スナップショットが有効でも監視トークン優先
-        assert_eq!(resolve_usage_source(false, true, true), UsageSource::MonitorToken);
-        assert_eq!(resolve_usage_source(false, true, false), UsageSource::MonitorToken);
+    fn resolve_usage_source_order_live_falls_back_to_monitor_then_snapshot() {
+        // ライブ OAuth が失敗（期限切れ等）したときに実際に試される後続候補の並び。
+        // get_accounts_usage 側はこの順で1つずつ試し、最初に成功したものを採用する
+        let order = resolve_usage_source_order(true, true, true);
+        assert_eq!(order, vec![UsageSource::LiveOauth, UsageSource::MonitorToken, UsageSource::SnapshotOauth]);
     }
 
     #[test]
-    fn resolve_usage_source_falls_back_to_snapshot_then_cache() {
-        assert_eq!(resolve_usage_source(false, false, true), UsageSource::SnapshotOauth);
-        assert_eq!(resolve_usage_source(false, false, false), UsageSource::Cache);
+    fn resolve_usage_source_order_non_live_excludes_live_oauth() {
+        // 非ライブはライブの資格情報を使えない（他アカウントが消費中のため）ので
+        // ライブ OAuth はそもそも候補に入らない
+        assert_eq!(
+            resolve_usage_source_order(false, true, true),
+            vec![UsageSource::MonitorToken, UsageSource::SnapshotOauth]
+        );
+        assert_eq!(resolve_usage_source_order(false, true, false), vec![UsageSource::MonitorToken]);
+    }
+
+    #[test]
+    fn resolve_usage_source_order_non_live_falls_back_to_snapshot() {
+        assert_eq!(resolve_usage_source_order(false, false, true), vec![UsageSource::SnapshotOauth]);
+    }
+
+    #[test]
+    fn resolve_usage_source_order_empty_when_nothing_available() {
+        // 呼び出し側（get_accounts_usage）はここでキャッシュへフォールバックする
+        assert_eq!(resolve_usage_source_order(false, false, false), Vec::<UsageSource>::new());
     }
 
     #[test]
@@ -2027,6 +2477,98 @@ mod tests {
         // 照合しようがないため、従来どおり紐づけを許可する（トークン側の org_id は問わない）
         assert!(org_id_matches("", "org-anything"));
         assert!(org_id_matches("", ""));
+    }
+
+    #[test]
+    fn match_relogin_target_matches_by_org_id() {
+        assert_eq!(
+            match_relogin_target("org-1", "a@example.com", Some("org-1"), Some("b@example.com")),
+            ReloginMatch::Match
+        );
+    }
+
+    #[test]
+    fn match_relogin_target_mismatches_by_org_id() {
+        assert_eq!(
+            match_relogin_target("org-1", "a@example.com", Some("org-2"), Some("a@example.com")),
+            ReloginMatch::Mismatch
+        );
+    }
+
+    #[test]
+    fn match_relogin_target_undetermined_when_live_org_unknown() {
+        // Keychain 完了検知と ~/.claude.json 照合の書き込み順の隙間で、まだ live 側の
+        // org_id が読めないことがある。不一致と決めつけず待つ
+        assert_eq!(
+            match_relogin_target("org-1", "a@example.com", None, None),
+            ReloginMatch::Undetermined
+        );
+    }
+
+    #[test]
+    fn match_relogin_target_falls_back_to_email_when_org_id_empty() {
+        assert_eq!(
+            match_relogin_target("", "a@example.com", Some("org-anything"), Some("a@example.com")),
+            ReloginMatch::Match
+        );
+        assert_eq!(
+            match_relogin_target("", "a@example.com", Some("org-anything"), Some("b@example.com")),
+            ReloginMatch::Mismatch
+        );
+        assert_eq!(
+            match_relogin_target("", "a@example.com", Some("org-anything"), None),
+            ReloginMatch::Undetermined
+        );
+    }
+
+    #[test]
+    fn match_relogin_target_rejects_when_both_org_id_and_email_are_empty() {
+        // start_add_account_login 側の can_relogin チェックで通常は事前に弾かれるが、
+        // ここでも安全側に倒して拒否する
+        assert_eq!(
+            match_relogin_target("", "", Some("org-anything"), Some("a@example.com")),
+            ReloginMatch::Mismatch
+        );
+    }
+
+    #[test]
+    fn auto_sync_should_skip_when_hash_matches_last_live_hash() {
+        assert!(auto_sync_should_skip(Some("abc"), None, "abc"));
+    }
+
+    #[test]
+    fn auto_sync_should_skip_when_hash_matches_last_checked_hash() {
+        // last_live_hash は「登録済みとして書き戻し済み」の記録なので、未登録ライブの
+        // 居座り中は更新されない。last_checked_hash 側の一致でもスキップできる必要がある
+        assert!(auto_sync_should_skip(None, Some("xyz"), "xyz"));
+    }
+
+    #[test]
+    fn auto_sync_should_not_skip_when_hash_matches_neither() {
+        assert!(!auto_sync_should_skip(Some("abc"), Some("def"), "xyz"));
+        assert!(!auto_sync_should_skip(None, None, "xyz"));
+    }
+
+    #[test]
+    fn auto_sync_should_bail_when_became_inconsistent() {
+        // フェーズ2（ロック外の profile API 呼び出し）の間に switch_account のロールバック
+        // 失敗等で不整合状態になっていたら、last_live_hash が同じでも書き込んではいけない
+        assert!(auto_sync_should_bail(true, Some("abc"), Some("abc")));
+    }
+
+    #[test]
+    fn auto_sync_should_bail_when_last_live_hash_moved() {
+        // フェーズ2の間に switch_account / import_live_account 等が last_live_hash を
+        // 進めていたら、フェーズ2で確認した owner はもう前提が崩れている
+        assert!(auto_sync_should_bail(false, Some("new-hash"), Some("old-hash")));
+        assert!(auto_sync_should_bail(false, None, Some("old-hash")));
+        assert!(auto_sync_should_bail(false, Some("new-hash"), None));
+    }
+
+    #[test]
+    fn auto_sync_should_not_bail_when_nothing_changed() {
+        assert!(!auto_sync_should_bail(false, Some("abc"), Some("abc")));
+        assert!(!auto_sync_should_bail(false, None, None));
     }
 
     #[test]
