@@ -88,45 +88,120 @@ struct OtherAccountEntry {
 /// `IconMenuItem` の icon に渡す。ドットバーはライブ専用にして主従の階層をつけ、
 /// サブアカウントはテキスト1行に抑えてメニューが縦に長くなりすぎないようにする
 /// （2026-07-31 デザイン確定）
-fn compact_usage_segments(usage: Option<&crate::accounts::AccountUsage>) -> Vec<(String, (u8, u8, u8))> {
+fn compact_usage_segments(usage: Option<&crate::accounts::AccountUsage>, palette: &Palette) -> Vec<(String, (u8, u8, u8))> {
     let Some(u) = usage.filter(|u| u.five_pct.is_some()) else {
-        return vec![("未取得".to_string(), TEXT_COLOR_GRAY)];
+        return vec![("未取得".to_string(), palette.text_gray)];
     };
     // リセット時刻を過ぎている想定なら実質 0% とみなす
     let five_val = if u.five_probably_reset { 0 } else { u.five_pct.unwrap().round() as i64 };
     let seven_val = u.seven_pct.unwrap_or(0.0).round() as i64;
     vec![
-        (format!("5h: {five_val}%"), TEXT_COLOR_WHITE),
-        (reset_suffix(u.five_reset), TEXT_COLOR_GRAY),
-        (" / ".to_string(), TEXT_COLOR_GRAY),
-        (format!("週次: {seven_val}%"), TEXT_COLOR_WHITE),
-        (reset_suffix(u.seven_reset), TEXT_COLOR_GRAY),
+        (format!("5h: {five_val}%"), palette.text_white),
+        (reset_suffix(u.five_reset), palette.text_gray),
+        (" / ".to_string(), palette.text_gray),
+        (format!("週次: {seven_val}%"), palette.text_white),
+        (reset_suffix(u.seven_reset), palette.text_gray),
     ]
 }
 
 /// CoreText が使えない OS 向けのフォールバック。色は付けず全セグメントを連結した1文字列にする
 #[cfg(not(target_os = "macos"))]
 fn compact_usage_plain_text(usage: Option<&crate::accounts::AccountUsage>) -> String {
-    compact_usage_segments(usage).into_iter().map(|(text, _)| text).collect()
+    // 色を使わないプレーンテキストなので、どちらのパレットで分解しても結果は同じ
+    compact_usage_segments(usage, &Palette::dark()).into_iter().map(|(text, _)| text).collect()
 }
 
-/// バー画像のピクセルサイズ。論理サイズ 110×9px 相当を Retina（@2x）で描き、
-/// メニューでも滲まず自然な大きさに見えるようにする
+/// バー画像のピクセルサイズ。muda（tauri のメニュー実装）はメニュー画像を高さ18ptに
+/// 正規化して表示するため、220×18px（@2x 相当）で描くと 220×18pt 表示になり、
+/// メニュー本文の行高と釣り合う大きさに見える
 const BAR_WIDTH_PX: u32 = 220;
 const BAR_HEIGHT_PX: u32 = 18;
 
-/// トラック（背景）色は暗いグレー
-const TRACK_COLOR: (u8, u8, u8) = (0x3a, 0x3a, 0x3c);
+/// ダークモード配色（既存値のまま。2026-07-31 実機承認済みのため変更しない）。
+/// トラック（背景）は暗いグレー、ライブのドット色は使用率によらず白固定（モノクロ化）
+const TRACK_COLOR_DARK: (u8, u8, u8) = (0x3a, 0x3a, 0x3c);
+const LIVE_FILL_COLOR_DARK: (u8, u8, u8) = (0xff, 0xff, 0xff);
+const TEXT_COLOR_WHITE_DARK: (u8, u8, u8) = (0xff, 0xff, 0xff);
+const TEXT_COLOR_GRAY_DARK: (u8, u8, u8) = (0x8e, 0x8e, 0x93);
 
-/// ライブアカウントのドット色。2026-07-31 に色閾値（緑黄赤）を廃止し、使用率によらず
-/// 白固定にした（モノクロ化）
-const LIVE_FILL_COLOR: (u8, u8, u8) = (0xff, 0xff, 0xff);
+/// ライトモード配色（2026-07-31 新設）。ダーク用の白固定塗りをそのままライトの
+/// メニュー背景（ほぼ白）に出すと不可視化するため、明度を反転した組を別途持つ
+const TRACK_COLOR_LIGHT: (u8, u8, u8) = (0xd1, 0xd1, 0xd6);
+const LIVE_FILL_COLOR_LIGHT: (u8, u8, u8) = (0x33, 0x33, 0x36);
+const TEXT_COLOR_WHITE_LIGHT: (u8, u8, u8) = (0x1d, 0x1d, 0x1f);
+const TEXT_COLOR_GRAY_LIGHT: (u8, u8, u8) = (0x6e, 0x6e, 0x73);
 
-/// その他アカウント情報行の文字色。数値部分は白、カッコ内の復活時刻・区切りはグレーにして
-/// 主従を分ける（2026-07-31 デザイン確定。ネイティブメニューの部分色付けができないため
-/// CoreText 画像で実現する。`compact_usage_segments` 参照）
-const TEXT_COLOR_WHITE: (u8, u8, u8) = (0xff, 0xff, 0xff);
-const TEXT_COLOR_GRAY: (u8, u8, u8) = (0x8e, 0x8e, 0x93);
+/// 現在のメニュー外観に応じたゲージ・テキストの配色一式
+struct Palette {
+    track: (u8, u8, u8),
+    live_fill: (u8, u8, u8),
+    text_white: (u8, u8, u8),
+    text_gray: (u8, u8, u8),
+}
+
+impl Palette {
+    fn dark() -> Self {
+        Self {
+            track: TRACK_COLOR_DARK,
+            live_fill: LIVE_FILL_COLOR_DARK,
+            text_white: TEXT_COLOR_WHITE_DARK,
+            text_gray: TEXT_COLOR_GRAY_DARK,
+        }
+    }
+
+    fn light() -> Self {
+        Self {
+            track: TRACK_COLOR_LIGHT,
+            live_fill: LIVE_FILL_COLOR_LIGHT,
+            text_white: TEXT_COLOR_WHITE_LIGHT,
+            text_gray: TEXT_COLOR_GRAY_LIGHT,
+        }
+    }
+
+    /// メニューバーの現在の外観（ライト/ダーク）を判定して対応パレットを返す。
+    /// macOS 以外はダークモード相当の既存配色（実質メニューが常にダーク基調）に固定する
+    #[cfg(target_os = "macos")]
+    fn current() -> Self {
+        if appearance::is_dark_mode() {
+            Self::dark()
+        } else {
+            Self::light()
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn current() -> Self {
+        Self::dark()
+    }
+}
+
+/// メニューバーの実効外観（ライト/ダーク）判定。build_menu ごとに1回だけ呼ぶ
+#[cfg(target_os = "macos")]
+mod appearance {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSAppearanceNameAqua, NSAppearanceNameDarkAqua};
+    use objc2_foundation::NSArray;
+
+    /// メインスレッドの `NSApplication.effectiveAppearance` を aqua/darkAqua と
+    /// マッチングしてダーク判定する。`MainThreadMarker` が取れない場合
+    /// （呼び出し元の前提が崩れている異常系）はダーク扱いにフォールバックする
+    /// （2026-07-31 まで表示していた配色と同じになるため安全側）
+    pub fn is_dark_mode() -> bool {
+        let Some(mtm) = MainThreadMarker::new() else {
+            return true;
+        };
+        let app = NSApplication::sharedApplication(mtm);
+        let appearance = app.effectiveAppearance();
+        let candidates = NSArray::from_slice(&[
+            unsafe { NSAppearanceNameAqua },
+            unsafe { NSAppearanceNameDarkAqua },
+        ]);
+        let Some(best_match) = appearance.bestMatchFromAppearancesWithNames(&candidates) else {
+            return true;
+        };
+        best_match.to_string() == unsafe { NSAppearanceNameDarkAqua }.to_string()
+    }
+}
 
 /// ドット数・直径・ピッチ（@2x ピクセル単位）。ピッチは BAR_WIDTH_PX / DOT_COUNT で、
 /// 各ドットはピッチの中央に配置する。2026-07-31（デザイン確定版）に 20→32 個へ増やし
@@ -139,7 +214,16 @@ const DOT_DIAMETER_PX: f64 = 6.0;
 /// 円で、円の外は完全透明（alpha 0）にする。アンチエイリアスは付けない
 fn render_dots_pixels(pct: i64, fill: (u8, u8, u8), track: (u8, u8, u8)) -> Vec<u8> {
     let p = pct.clamp(0, 100);
-    let filled = ((p * i64::from(DOT_COUNT) + 50) / 100) as u32; // round(pct / 100 * DOT_COUNT)
+    let rounded = (p * i64::from(DOT_COUNT) + 50) / 100; // round(pct / 100 * DOT_COUNT)
+    // 四捨五入だけだと 1% が0個・99%が満杯（=100%と見分けがつかない）表示になるため、
+    // 0% と 100% 以外は必ず1個以上・DOT_COUNT-1個以下にクランプする（2026-07-31 レビュー）
+    let filled = if p == 0 {
+        0
+    } else if p == 100 {
+        DOT_COUNT as i64
+    } else {
+        rounded.clamp(1, i64::from(DOT_COUNT) - 1)
+    } as u32;
     let pitch = f64::from(BAR_WIDTH_PX) / f64::from(DOT_COUNT);
     let radius = DOT_DIAMETER_PX / 2.0;
     let cy = f64::from(BAR_HEIGHT_PX) / 2.0;
@@ -164,16 +248,16 @@ fn render_dots_pixels(pct: i64, fill: (u8, u8, u8), track: (u8, u8, u8)) -> Vec<
 }
 
 /// バー画像を組み立てる（IconMenuItem に渡す）。バーはライブアカウント専用
-fn gauge_image(pct: i64) -> Image<'static> {
-    let pixels = render_dots_pixels(pct, LIVE_FILL_COLOR, TRACK_COLOR);
+fn gauge_image(pct: i64, palette: &Palette) -> Image<'static> {
+    let pixels = render_dots_pixels(pct, palette.live_fill, palette.track);
     Image::new_owned(pixels, BAR_WIDTH_PX, BAR_HEIGHT_PX)
 }
 
 /// その他アカウント情報行の部分色付きテキストを CoreText でオフスクリーン描画し、
 /// `IconMenuItem` に渡せる画像にする（macOS 限定。`coretext_line` 参照）
 #[cfg(target_os = "macos")]
-fn compact_usage_image(usage: Option<&crate::accounts::AccountUsage>) -> Image<'static> {
-    let segments = compact_usage_segments(usage);
+fn compact_usage_image(usage: Option<&crate::accounts::AccountUsage>, palette: &Palette) -> Image<'static> {
+    let segments = compact_usage_segments(usage, palette);
     let refs: Vec<(&str, (u8, u8, u8))> = segments.iter().map(|(text, color)| (text.as_str(), *color)).collect();
     let (pixels, width, height) = coretext_line::render_colored_text_pixels(&refs);
     Image::new_owned(pixels, width, height)
@@ -257,7 +341,9 @@ mod coretext_line {
             if a == 0 {
                 straight.extend_from_slice(&[0, 0, 0, 0]);
             } else {
-                let unpremul = |c: u8| (u16::from(c) * 255 / u16::from(a)).min(255) as u8;
+                // 切り捨て除算だと半透明エッジの色が実際より暗く寄る（暗色バイアス）ため、
+                // 四捨五入にして誤差を打ち消す（2026-07-31 レビュー）
+                let unpremul = |c: u8| ((u16::from(c) * 255 + u16::from(a) / 2) / u16::from(a)).min(255) as u8;
                 straight.extend_from_slice(&[unpremul(r), unpremul(g), unpremul(b), a]);
             }
         }
@@ -382,15 +468,15 @@ fn fetch_status() -> StatusData {
     }
 }
 
-/// InfoLine 1件をメニューに追加する。ゲージは「ラベル行」と「バー画像だけの行」の
-/// 2段に分けて出す（同一行にアイコンとして押し込むとバーが小さく潰れて視認性が
-/// 落ちるため。2026-07-31 デザイン確定）。それ以外は通常の `MenuItem` にする
+/// InfoLine 1件をメニューに追加する。ゲージはバー画像＋テキストを1行の `IconMenuItem`
+/// に統合して出す（2026-07-31 デザイン確定）。それ以外は通常の `MenuItem` にする
 fn append_info_line<R: Runtime>(
     app: &AppHandle<R>,
     menu: &Menu<R>,
     id: String,
     line: &InfoLine,
     enabled: bool,
+    palette: &Palette,
 ) -> tauri::Result<()> {
     match line {
         InfoLine::Plain(text) => {
@@ -398,7 +484,7 @@ fn append_info_line<R: Runtime>(
         }
         InfoLine::Gauge { label, pct } => {
             let bar_item = IconMenuItemBuilder::with_id(id, label)
-                .icon(gauge_image(*pct))
+                .icon(gauge_image(*pct, palette))
                 .enabled(enabled)
                 .build(app)?;
             menu.append(&bar_item)?;
@@ -410,6 +496,9 @@ fn append_info_line<R: Runtime>(
 /// StatusData からメニューを組み立てる（メインスレッドで呼ぶこと）
 fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
+    // ライト/ダーク判定はメニュー再構築ごとに1回だけ行う（NSApplication 呼び出しのコスト・
+    // 判定タイミングのブレを避けるため。2026-07-31 ライトモード対応）
+    let palette = Palette::current();
 
     // 情報行。enabled=false だと macOS がグレー表示して読みづらいため、有効のままにして
     // 通常の文字色で出す（クリックしても何も起きない）
@@ -421,7 +510,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
         None::<&str>,
     )?)?;
     for (i, line) in data.usage_lines.iter().enumerate() {
-        append_info_line(app, &menu, format!("info-usage-{i}"), line, true)?;
+        append_info_line(app, &menu, format!("info-usage-{i}"), line, true, &palette)?;
     }
 
     // その他のアカウントは「名前 → コンパクト1行の使用率 → 切り替え」の3行構成。
@@ -442,7 +531,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
             #[cfg(target_os = "macos")]
             {
                 let stats_item = IconMenuItemBuilder::with_id(format!("info-other-stats-{}", a.name), "")
-                    .icon(compact_usage_image(a.usage.as_ref()))
+                    .icon(compact_usage_image(a.usage.as_ref(), &palette))
                     .enabled(false)
                     .build(app)?;
                 menu.append(&stats_item)?;
@@ -477,13 +566,21 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
         }
     }
 
-    // 下部は「アプリを開く / バージョンを確認する」の2項目に絞る（2026-07-31 ユーザー指示。
-    // 手動更新は60秒の自動更新があるため廃止。終了はアプリ画面側から行う）
+    // 下部の操作セクションは main の構成（ステータス更新・開く・バージョン確認・終了）を
+    // 維持する（0be6342 でステータス更新・終了が仕様外に削除されていたため復元。
+    // 「バージョンを確認する」は main の「バージョン確認」から改称済みのままにする）
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&MenuItem::with_id(
         app,
+        "refresh",
+        "ステータス更新 ♻️",
+        true,
+        None::<&str>,
+    )?)?;
+    menu.append(&MenuItem::with_id(
+        app,
         "open",
-        "アプリを開く",
+        "CC Anatomy を開く",
         true,
         None::<&str>,
     )?)?;
@@ -491,6 +588,14 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
         app,
         "check-update",
         "バージョンを確認する",
+        true,
+        None::<&str>,
+    )?)?;
+    menu.append(&PredefinedMenuItem::separator(app)?)?;
+    menu.append(&MenuItem::with_id(
+        app,
+        "quit",
+        "アプリを終了",
         true,
         None::<&str>,
     )?)?;
@@ -611,6 +716,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 return;
             }
             match id {
+                "refresh" => refresh(app.clone()),
                 "check-update" => crate::updater::check(app.clone(), true),
                 "open" => {
                     if let Some(win) = app.get_webview_window("main") {
@@ -618,6 +724,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                         let _ = win.set_focus();
                     }
                 }
+                "quit" => app.exit(0),
                 _ => {}
             }
         });
@@ -706,6 +813,32 @@ mod tests {
         assert_eq!(pixel_at(&under, x0, y0), (track.0, track.1, track.2, 255));
     }
 
+    /// pct% で塗られるドット数を、実際に描いたバッファから数え上げる
+    /// （render_dots_pixels の内部計算をそのまま再実装しないための検証手段）
+    fn filled_dot_count(pct: i64) -> u32 {
+        let fill = (1, 1, 1);
+        let track = (0, 0, 0);
+        let buf = render_dots_pixels(pct, fill, track);
+        (0..DOT_COUNT)
+            .filter(|&i| {
+                let (x, y) = dot_center(i);
+                pixel_at(&buf, x, y) == (fill.0, fill.1, fill.2, 255)
+            })
+            .count() as u32
+    }
+
+    #[test]
+    fn render_dots_pixels_rounding_is_clamped_at_boundaries() {
+        // 1%が0個・99%が満杯（=100%と見分けがつかない）になる四捨五入の問題を補正する
+        // （2026-07-31 レビュー）。0%だけ0個・100%だけ満杯で、それ以外は1〜DOT_COUNT-1個
+        assert_eq!(filled_dot_count(0), 0);
+        assert_eq!(filled_dot_count(1), 1);
+        assert_eq!(filled_dot_count(2), 1); // round(2%*32)=1 のまま（下限クランプの影響なし）
+        assert_eq!(filled_dot_count(98), DOT_COUNT - 1);
+        assert_eq!(filled_dot_count(99), DOT_COUNT - 1);
+        assert_eq!(filled_dot_count(100), DOT_COUNT);
+    }
+
     #[test]
     fn render_dots_pixels_gap_between_dots_is_transparent() {
         // ドット間の隙間（ピッチの境界付近）は完全透明になる
@@ -757,20 +890,25 @@ mod tests {
     #[test]
     fn compact_usage_segments_colors_numbers_white_and_parens_gray() {
         let u = account_usage(Some(12.0));
-        let segments = compact_usage_segments(Some(&u));
-        assert_eq!(segments[0], ("5h: 12%".to_string(), TEXT_COLOR_WHITE));
-        assert_eq!(segments[1].1, TEXT_COLOR_GRAY);
-        assert_eq!(segments[2], (" / ".to_string(), TEXT_COLOR_GRAY));
-        assert_eq!(segments[3], ("週次: 12%".to_string(), TEXT_COLOR_WHITE));
-        assert_eq!(segments[4].1, TEXT_COLOR_GRAY);
+        let palette = Palette::dark();
+        let segments = compact_usage_segments(Some(&u), &palette);
+        assert_eq!(segments[0], ("5h: 12%".to_string(), palette.text_white));
+        assert_eq!(segments[1].1, palette.text_gray);
+        assert_eq!(segments[2], (" / ".to_string(), palette.text_gray));
+        assert_eq!(segments[3], ("週次: 12%".to_string(), palette.text_white));
+        assert_eq!(segments[4].1, palette.text_gray);
     }
 
     #[test]
     fn compact_usage_segments_falls_back_to_未取得_without_data() {
-        assert_eq!(compact_usage_segments(None), vec![("未取得".to_string(), TEXT_COLOR_GRAY)]);
+        let palette = Palette::dark();
         assert_eq!(
-            compact_usage_segments(Some(&account_usage(None))),
-            vec![("未取得".to_string(), TEXT_COLOR_GRAY)]
+            compact_usage_segments(None, &palette),
+            vec![("未取得".to_string(), palette.text_gray)]
+        );
+        assert_eq!(
+            compact_usage_segments(Some(&account_usage(None)), &palette),
+            vec![("未取得".to_string(), palette.text_gray)]
         );
     }
 
@@ -779,7 +917,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn render_colored_text_pixels_returns_buffer_matching_its_own_dimensions() {
-        let segments = [("5h: 12%", TEXT_COLOR_WHITE), ("（14:00 復活）", TEXT_COLOR_GRAY)];
+        let palette = Palette::dark();
+        let segments = [("5h: 12%", palette.text_white), ("（14:00 復活）", palette.text_gray)];
         let (buf, width, height) = coretext_line::render_colored_text_pixels(&segments);
         assert!(width > 0 && height > 0);
         assert_eq!(buf.len(), (width * height * 4) as usize);

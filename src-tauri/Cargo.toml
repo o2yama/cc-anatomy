@@ -42,4 +42,9 @@ tauri-plugin-updater = "2"
 core-text = "22"
 core-graphics = "0.25"
 core-foundation = "0.10"
+# トレイメニューのライト/ダーク判定（NSApplication.effectiveAppearance）に使う。
+# tauri の依存ツリーに既にある 0.3.2 系（objc2 は 0.6 系）に合わせてバージョン競合を避ける
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSAppearance", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSArray", "NSString"] }
 
