@@ -12,8 +12,13 @@
 //!
 //! 使用率ゲージは当初ブロック文字（▓░ 等）で表現していたが、2026-07-26
 //! （さらに同日中）ユーザー承認により動的生成した RGBA バー画像
-//! （`tauri::menu::IconMenuItem`）に置き換えた。`render_bar_pixels` が新規クレート無しで
+//! （`tauri::menu::IconMenuItem`）に置き換えた。`render_dots_pixels` が新規クレート無しで
 //! 純 Rust に RGBA バッファを直接描く（アンチエイリアス・角丸なし）。
+//!
+//! 2026-07-31、「前のデザインの方がスタイリッシュ」というユーザー評価を受け、塗りつぶし矩形
+//! バーからモノクロの細いドットバー（等間隔の円の列）に変更した。色閾値（緑黄赤）は廃止し、
+//! 使用率によらずライブは白・その他アカウントはグレーの明度差のみで塗り分ける
+//! （詳細は仕様書の決定変更ログ参照）。
 
 use std::time::Duration;
 use tauri::{
@@ -105,27 +110,39 @@ const TRACK_COLOR: (u8, u8, u8) = (0x3a, 0x3a, 0x3c);
 /// 「その他のアカウント」の塗り色（ミディアムグレー。ライブとの階層を保つ）
 const OTHER_FILL_COLOR: (u8, u8, u8) = (0x8e, 0x8e, 0x93);
 
-/// ライブアカウントのバー色（<80% 緑・80〜95% 黄・>95% 赤）
-fn live_fill_color(pct: i64) -> (u8, u8, u8) {
-    if pct > 95 {
-        (0xff, 0x3b, 0x30)
-    } else if pct >= 80 {
-        (0xff, 0xcc, 0x00)
-    } else {
-        (0x34, 0xc7, 0x59)
-    }
-}
+/// ライブアカウントのドット色。2026-07-31 に色閾値（緑黄赤）を廃止し、使用率によらず
+/// 白固定にした（モノクロ化）
+const LIVE_FILL_COLOR: (u8, u8, u8) = (0xff, 0xff, 0xff);
 
-/// pct% ぶんを fill 色、残りを track 色で塗った単純な RGBA バーのピクセルバッファを作る
-/// （テスト容易性のため `Image` への変換とは分離する）。アンチエイリアス・角丸は付けない
-fn render_bar_pixels(pct: i64, fill: (u8, u8, u8), track: (u8, u8, u8)) -> Vec<u8> {
+/// ドット数・直径・ピッチ（@2x ピクセル単位）。ピッチは BAR_WIDTH_PX / DOT_COUNT で、
+/// 各ドットはピッチの中央に配置する
+const DOT_COUNT: u32 = 20;
+const DOT_DIAMETER_PX: f64 = 6.0;
+
+/// pct% ぶんのドットを fill 色、残りを track 色で塗った RGBA バッファを作る
+/// （テスト容易性のため `Image` への変換とは分離する）。ドットは水平等間隔・垂直中央揃えの
+/// 円で、円の外は完全透明（alpha 0）にする。アンチエイリアスは付けない
+fn render_dots_pixels(pct: i64, fill: (u8, u8, u8), track: (u8, u8, u8)) -> Vec<u8> {
     let p = pct.clamp(0, 100);
-    let fill_w = (i64::from(BAR_WIDTH_PX) * p / 100) as u32;
+    let filled = ((p * i64::from(DOT_COUNT) + 50) / 100) as u32; // round(pct / 100 * DOT_COUNT)
+    let pitch = f64::from(BAR_WIDTH_PX) / f64::from(DOT_COUNT);
+    let radius = DOT_DIAMETER_PX / 2.0;
+    let cy = f64::from(BAR_HEIGHT_PX) / 2.0;
+
     let mut buf = Vec::with_capacity((BAR_WIDTH_PX * BAR_HEIGHT_PX * 4) as usize);
-    for _y in 0..BAR_HEIGHT_PX {
+    for y in 0..BAR_HEIGHT_PX {
         for x in 0..BAR_WIDTH_PX {
-            let (r, g, b) = if x < fill_w { fill } else { track };
-            buf.extend_from_slice(&[r, g, b, 255]);
+            let dot_idx = (f64::from(x) / pitch) as u32;
+            let cx = (f64::from(dot_idx) + 0.5) * pitch;
+            let dx = f64::from(x) + 0.5 - cx;
+            let dy = f64::from(y) + 0.5 - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            if dist <= radius {
+                let (r, g, b) = if dot_idx < filled { fill } else { track };
+                buf.extend_from_slice(&[r, g, b, 255]);
+            } else {
+                buf.extend_from_slice(&[0, 0, 0, 0]);
+            }
         }
     }
     buf
@@ -133,8 +150,8 @@ fn render_bar_pixels(pct: i64, fill: (u8, u8, u8), track: (u8, u8, u8)) -> Vec<u
 
 /// バー画像を組み立てる（IconMenuItem に渡す）
 fn gauge_image(pct: i64, muted: bool) -> Image<'static> {
-    let fill = if muted { OTHER_FILL_COLOR } else { live_fill_color(pct) };
-    let pixels = render_bar_pixels(pct, fill, TRACK_COLOR);
+    let fill = if muted { OTHER_FILL_COLOR } else { LIVE_FILL_COLOR };
+    let pixels = render_dots_pixels(pct, fill, TRACK_COLOR);
     Image::new_owned(pixels, BAR_WIDTH_PX, BAR_HEIGHT_PX)
 }
 
@@ -523,57 +540,75 @@ mod tests {
         (buf[idx], buf[idx + 1], buf[idx + 2], buf[idx + 3])
     }
 
+    /// dot_idx 番目のドット中心にあたるピクセル座標（render_dots_pixels の計算と対応させる）
+    fn dot_center(dot_idx: u32) -> (u32, u32) {
+        let pitch = f64::from(BAR_WIDTH_PX) / f64::from(DOT_COUNT);
+        let cx = ((f64::from(dot_idx) + 0.5) * pitch - 0.5).round() as u32;
+        (cx, BAR_HEIGHT_PX / 2)
+    }
+
     #[test]
-    fn render_bar_pixels_has_expected_length() {
-        let buf = render_bar_pixels(50, (1, 2, 3), (4, 5, 6));
+    fn render_dots_pixels_has_expected_length() {
+        let buf = render_dots_pixels(50, (1, 2, 3), (4, 5, 6));
         assert_eq!(buf.len(), (BAR_WIDTH_PX * BAR_HEIGHT_PX * 4) as usize);
     }
 
     #[test]
-    fn render_bar_pixels_zero_percent_is_all_track() {
+    fn render_dots_pixels_zero_percent_is_all_track_dots() {
         let track = (10, 20, 30);
-        let buf = render_bar_pixels(0, (255, 0, 0), track);
-        assert_eq!(pixel_at(&buf, 0, 0), (track.0, track.1, track.2, 255));
-        assert_eq!(pixel_at(&buf, BAR_WIDTH_PX - 1, 0), (track.0, track.1, track.2, 255));
+        let buf = render_dots_pixels(0, (255, 0, 0), track);
+        for i in 0..DOT_COUNT {
+            let (x, y) = dot_center(i);
+            assert_eq!(pixel_at(&buf, x, y), (track.0, track.1, track.2, 255));
+        }
     }
 
     #[test]
-    fn render_bar_pixels_hundred_percent_is_all_fill() {
+    fn render_dots_pixels_hundred_percent_is_all_fill_dots() {
         let fill = (1, 2, 3);
-        let buf = render_bar_pixels(100, fill, (9, 9, 9));
-        assert_eq!(pixel_at(&buf, 0, 0), (fill.0, fill.1, fill.2, 255));
-        assert_eq!(pixel_at(&buf, BAR_WIDTH_PX - 1, 0), (fill.0, fill.1, fill.2, 255));
+        let buf = render_dots_pixels(100, fill, (9, 9, 9));
+        for i in 0..DOT_COUNT {
+            let (x, y) = dot_center(i);
+            assert_eq!(pixel_at(&buf, x, y), (fill.0, fill.1, fill.2, 255));
+        }
     }
 
     #[test]
-    fn render_bar_pixels_half_fills_left_half_only() {
-        // 50% は幅のちょうど半分だけ塗る（右端は track のまま残る）
-        let fill = (1, 2, 3);
-        let track = (9, 9, 9);
-        let buf = render_bar_pixels(50, fill, track);
-        assert_eq!(pixel_at(&buf, 0, 0), (fill.0, fill.1, fill.2, 255));
-        assert_eq!(pixel_at(&buf, BAR_WIDTH_PX - 1, 0), (track.0, track.1, track.2, 255));
-    }
-
-    #[test]
-    fn render_bar_pixels_clamps_out_of_range_percent() {
+    fn render_dots_pixels_half_fills_first_half_of_dots_only() {
+        // 50% は 20 個のうち先頭 10 個だけ fill、残りは track のまま
         let fill = (1, 2, 3);
         let track = (9, 9, 9);
-        let over = render_bar_pixels(150, fill, track);
-        assert_eq!(pixel_at(&over, BAR_WIDTH_PX - 1, 0), (fill.0, fill.1, fill.2, 255));
-        let under = render_bar_pixels(-10, fill, track);
-        assert_eq!(pixel_at(&under, 0, 0), (track.0, track.1, track.2, 255));
+        let buf = render_dots_pixels(50, fill, track);
+        for i in 0..10 {
+            let (x, y) = dot_center(i);
+            assert_eq!(pixel_at(&buf, x, y), (fill.0, fill.1, fill.2, 255));
+        }
+        for i in 10..DOT_COUNT {
+            let (x, y) = dot_center(i);
+            assert_eq!(pixel_at(&buf, x, y), (track.0, track.1, track.2, 255));
+        }
     }
 
     #[test]
-    fn live_fill_color_thresholds() {
-        // <80% 緑・80〜95% 黄・>95% 赤（境界値をそれぞれ確認する）
-        assert_eq!(live_fill_color(0), (0x34, 0xc7, 0x59));
-        assert_eq!(live_fill_color(79), (0x34, 0xc7, 0x59));
-        assert_eq!(live_fill_color(80), (0xff, 0xcc, 0x00));
-        assert_eq!(live_fill_color(95), (0xff, 0xcc, 0x00));
-        assert_eq!(live_fill_color(96), (0xff, 0x3b, 0x30));
-        assert_eq!(live_fill_color(100), (0xff, 0x3b, 0x30));
+    fn render_dots_pixels_clamps_out_of_range_percent() {
+        let fill = (1, 2, 3);
+        let track = (9, 9, 9);
+        let over = render_dots_pixels(150, fill, track);
+        let (x, y) = dot_center(DOT_COUNT - 1);
+        assert_eq!(pixel_at(&over, x, y), (fill.0, fill.1, fill.2, 255));
+        let under = render_dots_pixels(-10, fill, track);
+        let (x0, y0) = dot_center(0);
+        assert_eq!(pixel_at(&under, x0, y0), (track.0, track.1, track.2, 255));
+    }
+
+    #[test]
+    fn render_dots_pixels_gap_between_dots_is_transparent() {
+        // ドット間の隙間（ピッチの境界付近）は完全透明になる
+        let buf = render_dots_pixels(100, (255, 255, 255), (0, 0, 0));
+        let (c0, _) = dot_center(0);
+        let (c1, _) = dot_center(1);
+        let gap_x = (c0 + c1) / 2;
+        assert_eq!(pixel_at(&buf, gap_x, BAR_HEIGHT_PX / 2).3, 0);
     }
 
     fn account_usage(five_pct: Option<f64>) -> crate::accounts::AccountUsage {
