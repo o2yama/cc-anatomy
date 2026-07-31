@@ -731,6 +731,81 @@ main {
   height: 100%;
 }
 
+/* ---- doc editor: AIに分析・改善してもらう ---- */
+.doc-editor-ai-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+
+.doc-editor-ai-btn:hover:not(:disabled) {
+  color: var(--accent);
+}
+
+.doc-editor-ai-panel {
+  flex: 0 0 40%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--border);
+  background: var(--bg-panel);
+}
+
+.doc-editor-ai-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.doc-editor-ai-panel-head .doc-editor-status {
+  flex: 1;
+}
+
+.doc-editor-ai-log,
+.doc-editor-ai-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 20px;
+}
+
+.doc-editor-ai-log-line {
+  color: var(--text-dim);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.doc-editor-ai-log-line.doc-editor-ai-log-text {
+  color: var(--text);
+  white-space: normal;
+  margin: 4px 0;
+}
+
+.doc-editor-ai-result {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12.5px;
+  color: var(--text);
+  font-family: inherit;
+  margin: 0;
+}
+
+.doc-editor-ai-spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: diag-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
 /* ---- 未保存変更ガード（閉じる／別ファイルを開く操作の確認） ---- */
 .unsaved-guard-overlay {
   position: fixed;

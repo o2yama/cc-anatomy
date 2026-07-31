@@ -136,6 +136,13 @@ export interface DiagnosisProgress {
   label: string;
 }
 
+/** "doc-analysis-progress" イベント。diagnosis-progress と同型。
+ * Rust 側（doc_analysis.rs の emit_progress）が実際に emit するのは "tool" と "text" のみ */
+export interface DocAnalysisProgress {
+  kind: "tool" | "text";
+  label: string;
+}
+
 export interface Account {
   /** 内部識別子。Keychain サービス名・照合キーに使うため不変。表示には accountLabel() を使うこと */
   name: string;
@@ -257,6 +264,11 @@ export const api = {
   cancelDiagnosis: () => invoke<void>("cancel_diagnosis"),
   runFixesInTerminal: (prompts: string[]) =>
     invoke<void>("run_fixes_in_terminal", { prompts }),
+  analyzeDoc: (path: string, content: string, projectDir: string | null) =>
+    invoke<string>("analyze_doc", { path, content, projectDir }),
+  /** キャンセル可否に関わらず fire-and-forget で呼ばれることがある（unmount 時等）ので
+   * 呼び出し側は catch を省略しないこと。実行中の分析が無ければ Rust 側がエラーを返す */
+  cancelDocAnalysis: () => invoke<void>("cancel_doc_analysis"),
   getAccounts: () => invoke<AccountsState>("get_accounts"),
   importLiveAccount: () => invoke<Account>("import_live_account"),
   /** target が指定された場合は登録済みカードの「再ログイン」導線。ログイン結果の組織IDが
@@ -283,6 +295,18 @@ export const api = {
   getRateLimits: () => unwrapUsageFetch<RateLimits>("get_rate_limits"),
   getAccountProfile: () => unwrapUsageFetch<AccountProfile>("get_account_profile"),
 };
+
+/** analyzeDoc が「すでに実行中」で失敗したかどうかの判定。文字列マッチではなく
+ * Rust 側が付与する "ALREADY_RUNNING:" プレフィックスで判定し、表示用にはプレフィックスを
+ * 剥がしたメッセージを返す（doc_analysis.rs 参照） */
+export function parseAlreadyRunning(e: unknown): { alreadyRunning: boolean; message: string } {
+  const raw = String(e);
+  const prefix = "ALREADY_RUNNING:";
+  if (raw.startsWith(prefix)) {
+    return { alreadyRunning: true, message: raw.slice(prefix.length) };
+  }
+  return { alreadyRunning: false, message: raw };
+}
 
 /** get_rate_limits/get_account_profile の生の戻り値（Rust の UsageFetch と同じ形）。
  * "expired" は access token の期限切れ（Claude Code 側の自動 refresh 待ちの正常な状態）で、

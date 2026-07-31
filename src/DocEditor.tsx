@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { EditorState } from "@codemirror/state";
 import { EditorView, keymap } from "@codemirror/view";
 import { basicSetup } from "codemirror";
@@ -6,7 +7,8 @@ import { markdown } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { tags } from "@lezer/highlight";
-import { api } from "./api";
+import { api, DocAnalysisProgress, parseAlreadyRunning } from "./api";
+import { useIsMac } from "./platform";
 
 /** 見出しを太字・大きめに、強調(**text**)を太字にする。App.css のダーク配色に合わせる */
 const markdownHighlight = HighlightStyle.define([
@@ -71,9 +73,13 @@ export interface DocEditorProps {
   content: string;
   truncated?: boolean;
   modifiedEpoch?: number | null;
+  /** AI分析の実行 cwd。プロジェクトルート（null ならファイルの親ディレクトリを Rust 側で使う） */
+  projectDir?: string | null;
   /** 未保存変更の有無を親（ドロワーの離脱ガード）に伝える */
   onDirtyChange?: (dirty: boolean) => void;
 }
+
+type AnalysisPhase = "idle" | "running" | "done" | "error";
 
 /**
  * CLAUDE.md 等の設定ドキュメントをその場で編集・保存する CodeMirror 6 エディタ。
@@ -85,17 +91,121 @@ export function DocEditor({
   content,
   truncated = false,
   modifiedEpoch = null,
+  projectDir = null,
   onDirtyChange,
 }: DocEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const readOnly = path === null || truncated;
+  const isMac = useIsMac();
+  // AI分析は macOS 限定（claude CLI のヘッドレス実行に依存）かつ、非 truncated の
+  // 実ファイルのみ（切り詰められた内容を分析対象にしない）。readOnly（保存不可）とは独立の条件
+  const canAnalyze = isMac && path !== null && !truncated;
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
   const [epoch, setEpoch] = useState<number | null>(modifiedEpoch);
+
+  const [analysisPhase, setAnalysisPhase] = useState<AnalysisPhase>("idle");
+  const [analysisLog, setAnalysisLog] = useState<DocAnalysisProgress[]>([]);
+  const [analysisResult, setAnalysisResult] = useState<string | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analysisAlreadyRunning, setAnalysisAlreadyRunning] = useState(false);
+  const [copyLabel, setCopyLabel] = useState("コピー");
+  // ユーザー操作によるキャンセルかどうかを catch 側で判別するための参照。
+  // 「失敗」と「キャンセルしました」の表示を分けるために使う（catch はエラー理由を持たないため）
+  const cancelledRef = useRef(false);
+  // unmount 時、実行中の分析があれば孤児プロセスにしないよう中止する
+  const analysisPhaseRef = useRef(analysisPhase);
+  useEffect(() => {
+    analysisPhaseRef.current = analysisPhase;
+  });
+  const copyTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    const un = listen<DocAnalysisProgress>("doc-analysis-progress", (e) => {
+      // ログは直近5件だけ見せれば十分（実行状況が伝わればよく、全量は不要）
+      setAnalysisLog((l) => [...l.slice(-4), e.payload]);
+    });
+    return () => {
+      un.then((f) => f());
+      if (analysisPhaseRef.current === "running") {
+        api.cancelDocAnalysis().catch(() => {});
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimeoutRef.current !== null) {
+        window.clearTimeout(copyTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const runAnalysis = () => {
+    if (!path || !viewRef.current) return;
+    const value = viewRef.current.state.doc.toString();
+    cancelledRef.current = false;
+    setAnalysisPhase("running");
+    setAnalysisLog([]);
+    setAnalysisResult(null);
+    setAnalysisError(null);
+    setAnalysisAlreadyRunning(false);
+    api
+      .analyzeDoc(path, value, projectDir)
+      .then((result) => {
+        setAnalysisResult(result);
+        setAnalysisPhase("done");
+      })
+      .catch((e) => {
+        if (cancelledRef.current) {
+          setAnalysisError("キャンセルしました");
+          setAnalysisAlreadyRunning(false);
+        } else {
+          const { alreadyRunning, message } = parseAlreadyRunning(e);
+          setAnalysisError(message);
+          setAnalysisAlreadyRunning(alreadyRunning);
+        }
+        setAnalysisPhase("error");
+      });
+  };
+
+  const cancelAnalysis = () => {
+    cancelledRef.current = true;
+    api.cancelDocAnalysis().catch(() => {});
+  };
+
+  /** エラーパネルの「実行中の分析を中止」導線。すでに実行中の別の分析を止めるだけで、
+   * 自分自身の analysisPhase は動かさない（そもそも自分は error のまま） */
+  const cancelStuckAnalysis = () => {
+    api.cancelDocAnalysis().catch(() => {});
+    setAnalysisAlreadyRunning(false);
+    setAnalysisError("実行中だった分析を中止しました。もう一度お試しください。");
+  };
+
+  const closeAnalysis = () => {
+    setAnalysisPhase("idle");
+    setAnalysisResult(null);
+    setAnalysisError(null);
+    setAnalysisAlreadyRunning(false);
+  };
+
+  const copyAnalysis = () => {
+    if (!analysisResult) return;
+    navigator.clipboard
+      .writeText(analysisResult)
+      .then(() => {
+        setCopyLabel("コピーしました");
+        copyTimeoutRef.current = window.setTimeout(() => setCopyLabel("コピー"), 1500);
+      })
+      .catch(() => {
+        setCopyLabel("コピーに失敗しました");
+        copyTimeoutRef.current = window.setTimeout(() => setCopyLabel("コピー"), 1500);
+      });
+  };
 
   const save = async () => {
     if (!viewRef.current || !path || readOnly || saving) return;
@@ -227,6 +337,12 @@ export function DocEditor({
             >
               保存
             </button>
+            {canAnalyze && (
+              <AiAnalysisButton
+                analyzing={analysisPhase === "running"}
+                onClick={runAnalysis}
+              />
+            )}
           </div>
         </div>
       )}
@@ -234,7 +350,7 @@ export function DocEditor({
         <div className="doc-editor-toolbar doc-editor-toolbar-readonly">
           <span className="doc-editor-status">
             {truncated
-              ? "ファイルが大きいため読み取り専用です（切り詰められた内容のため保存不可）"
+              ? "ファイルが大きいため読み取り専用です（切り詰められた内容のため保存・AI分析ともに不可）"
               : "このコンテンツは編集できません"}
           </span>
         </div>
@@ -254,6 +370,97 @@ export function DocEditor({
       )}
       {saveError && !conflict && <p className="doc-editor-error">{saveError}</p>}
       <div ref={hostRef} className="doc-editor-host" />
+      {analysisPhase === "running" && (
+        <div className="doc-editor-ai-panel">
+          <div className="doc-editor-ai-panel-head">
+            <span className="doc-editor-ai-spinner" />
+            <span className="doc-editor-status">分析中…（数分かかることがあります）</span>
+            <button className="doc-editor-btn" onClick={cancelAnalysis}>
+              キャンセル
+            </button>
+          </div>
+          <div className="doc-editor-ai-log">
+            {analysisLog.map((l, i) => (
+              <p key={i} className={`doc-editor-ai-log-line doc-editor-ai-log-${l.kind}`}>
+                {l.label}
+              </p>
+            ))}
+          </div>
+        </div>
+      )}
+      {analysisPhase === "error" && (
+        <div className="doc-editor-ai-panel">
+          <div className="doc-editor-ai-panel-head">
+            <span className="doc-editor-status">
+              {cancelledRef.current ? "AI分析をキャンセルしました" : "AI分析に失敗しました"}
+            </span>
+            <div className="doc-editor-actions">
+              {analysisAlreadyRunning && (
+                <button className="doc-editor-btn" onClick={cancelStuckAnalysis}>
+                  実行中の分析を中止
+                </button>
+              )}
+              <button className="doc-editor-btn" onClick={closeAnalysis}>
+                閉じる
+              </button>
+            </div>
+          </div>
+          <div className="doc-editor-ai-body">
+            <p className="doc-editor-error">{analysisError}</p>
+          </div>
+        </div>
+      )}
+      {analysisPhase === "done" && analysisResult && (
+        <div className="doc-editor-ai-panel">
+          <div className="doc-editor-ai-panel-head">
+            <span className="doc-editor-status">AI改善提案</span>
+            <div className="doc-editor-actions">
+              <button className="doc-editor-btn" onClick={copyAnalysis}>
+                {copyLabel}
+              </button>
+              <button className="doc-editor-btn" onClick={closeAnalysis}>
+                ✕
+              </button>
+            </div>
+          </div>
+          <div className="doc-editor-ai-body">
+            <pre className="doc-editor-ai-result">{analysisResult}</pre>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+/** ツールバー右端に置く AI 分析トリガー。星型の✦アイコンで既存ボタンのトーンに合わせる */
+function AiAnalysisButton({
+  analyzing,
+  onClick,
+}: {
+  analyzing: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className="doc-editor-btn doc-editor-ai-btn"
+      title="AIに分析・改善してもらう"
+      onClick={onClick}
+      disabled={analyzing}
+    >
+      {analyzing ? (
+        <span className="doc-editor-ai-spinner" />
+      ) : (
+        <svg
+          width="13"
+          height="13"
+          viewBox="0 0 24 24"
+          fill="currentColor"
+          aria-hidden="true"
+        >
+          <path d="M12 2l1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8L12 2z" />
+          <path d="M19 14l0.7 2.3L22 17l-2.3 0.7L19 20l-0.7-2.3L16 17l2.3-0.7L19 14z" />
+        </svg>
+      )}
+    </button>
   );
 }

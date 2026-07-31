@@ -807,9 +807,12 @@ fn running_sessions() -> usize {
 /// こちらは「完了を待てば済む」短時間の処理であり、force での迂回を認めない
 /// （ユーザーのシェルセッションと違い、いつ終わるかアプリ自身が把握しているため待たせて問題ない）
 fn ensure_app_not_busy() -> Result<(), String> {
-    if crate::diagnostics::is_running() || crate::actions::is_agent_busy() {
+    if crate::diagnostics::is_running()
+        || crate::actions::is_agent_busy()
+        || crate::doc_analysis::is_running()
+    {
         return Err(
-            "本アプリの環境診断/タスク抽出の実行中は切り替え・追加ができません。完了してから実行してください。"
+            "本アプリの環境診断/タスク抽出/AI分析実行中は切り替え・追加ができません。完了してから実行してください。"
                 .into(),
         );
     }

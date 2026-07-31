@@ -10,6 +10,11 @@ mod diagnostics;
 #[cfg(not(target_os = "macos"))]
 #[path = "diagnostics_stub.rs"]
 mod diagnostics;
+#[cfg(target_os = "macos")]
+mod doc_analysis;
+#[cfg(not(target_os = "macos"))]
+#[path = "doc_analysis_stub.rs"]
+mod doc_analysis;
 
 mod actions;
 mod credentials;
@@ -127,6 +132,23 @@ fn cancel_diagnosis() -> Result<(), String> {
 #[tauri::command(async)]
 fn run_fixes_in_terminal(app: tauri::AppHandle, prompts: Vec<String>) -> Result<(), String> {
     diagnostics::run_fixes_in_terminal(&app, prompts)
+}
+
+/// ドキュメントエディタの「AIに分析・改善してもらう」。診断機能とは独立した多重実行ガードで
+/// claude -p を読み取り専用実行するので async
+#[tauri::command(async)]
+fn analyze_doc(
+    app: tauri::AppHandle,
+    path: String,
+    content: String,
+    project_dir: Option<String>,
+) -> Result<String, String> {
+    doc_analysis::analyze_doc(&app, path, content, project_dir)
+}
+
+#[tauri::command]
+fn cancel_doc_analysis() -> Result<(), String> {
+    doc_analysis::cancel_doc_analysis()
 }
 
 /// ps とファイル読みを伴うので async
@@ -263,6 +285,8 @@ pub fn run() {
             run_diagnosis,
             cancel_diagnosis,
             run_fixes_in_terminal,
+            analyze_doc,
+            cancel_doc_analysis,
             get_accounts,
             import_live_account,
             start_add_account_login,

@@ -66,6 +66,8 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 - **ドロワー内ドキュメント編集機能を実装・main マージ済み**: プロジェクト概要でファイル名クリック → 右ドロワー（`DetailDrawer`）内の `DocEditor.tsx`（CodeMirror 6）で CLAUDE.md 等を直接編集・Cmd+S 保存できる。保存は `write_doc`（`env.rs`）の楽観ロック（modified_epoch）で外部変更と競合検出し、conflict 時は専用 UI で再読込を促す。path が null / truncated のコンテンツは読み取り専用。日本語 IME はスパイク（SpikeEditor、削除済み）で CodeMirror 6 の問題なしを確認してから採用
 - **未検証事項**: 実機 UI での編集→保存、IME 入力、conflict 検出 UI、未保存離脱ガードの動作確認（ビルド・型チェック・cargo check は通過済み）
+- **ドキュメントAI分析機能を実装**（macOS 限定）: エディタ右上の ✨ ボタン（「AIに分析・改善してもらう」）→ `doc_analysis.rs` が `claude -p`（sonnet, stream-json, `--permission-mode dontAsk`, `--max-turns 40`, timeout 600s）を read-only 許可リスト `Read,Glob,Grep,WebFetch(domain:code.claude.com|docs.anthropic.com)` で起動し、ファイル種別に応じた Anthropic 公式ドキュメント（memory/skills/sub-agents/settings）を実行時に WebFetch して照合した改善提案をドロワー内パネルに表示。認証は claude CLI の優先順位そのまま（= ログイン中アカウント。サブスク/API 両対応。`--bare` は OAuth を読まないため不採用）。エディタの未保存バッファを正として分析（上限10万字）。`--setting-sources user --strict-mcp-config` で cwd プロジェクトの settings/hooks/MCP を遮断。stdin 書き込みは専用スレッド（20万字級でのパイプ相互デッドロック防止）。`doc_analysis::is_running()` をアカウント切替の `ensure_app_not_busy()` に登録済み（本アプリ自身のプロセスは常時ハードブロックの不変条件を維持）。グローバルスコープ文書（rules 等）は projectDir を渡さず文書単体+公式照合モードで分析。Opus レビュー1巡（ブロッカー1+要修正4+軽微10）対応済み
+- **AI分析の未検証事項**: 実機での `claude -p` 実起動・WebFetch ドメイン許可の実効・進捗ストリーミング表示・キャンセル・分析中アカウント切替のブロック動作
 
 ### 2026-07-25 の決定
 

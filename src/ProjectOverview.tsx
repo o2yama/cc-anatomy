@@ -30,6 +30,10 @@ interface Detail {
   /** 実ファイルに紐づく場合のみ設定。無ければ DocEditor は編集不可（閲覧のみ）で開く */
   path?: string;
   modifiedEpoch?: number;
+  /** false の場合、AI分析にプロジェクトルートを渡さない（rules・auto-memory等の
+   * プロジェクトに紐づかないグローバル文書）。未指定は true 扱い（従来どおりプロジェクトと
+   * 突き合わせる） */
+  projectScoped?: boolean;
 }
 
 /**
@@ -102,7 +106,11 @@ export function ProjectOverview({
       .catch((e) => setError(String(e)));
   }, [project, path]);
 
-  const openFile = (title: string, filePath: string) => {
+  const openFile = (
+    title: string,
+    filePath: string,
+    scope: "project" | "global" = "project"
+  ) => {
     api
       .readDoc(filePath)
       .then((doc: FileDoc) =>
@@ -113,6 +121,7 @@ export function ProjectOverview({
           truncated: doc.truncated,
           path: doc.path,
           modifiedEpoch: doc.modified_epoch,
+          projectScoped: scope === "project",
         })
       )
       .catch((e) =>
@@ -272,7 +281,7 @@ export function ProjectOverview({
                         <li
                           key={f.path}
                           className="clickable"
-                          onClick={() => openFile(`メモリ: ${f.name}`, f.path)}
+                          onClick={() => openFile(`メモリ: ${f.name}`, f.path, "global")}
                         >
                           <span className="item-name">{f.name}</span>
                         </li>
@@ -377,7 +386,7 @@ export function ProjectOverview({
                         <li
                           key={r.path}
                           className="clickable"
-                          onClick={() => openFile(`Rule: ${r.name}`, r.path)}
+                          onClick={() => openFile(`Rule: ${r.name}`, r.path, "global")}
                         >
                           <span className="item-name">{r.name}</span>
                         </li>
@@ -409,6 +418,7 @@ export function ProjectOverview({
       {detail && (
         <DetailDrawer
           detail={detail}
+          projectDir={env.path}
           onClose={() => setDetail(null)}
           onDirtyChange={setDetailDirty}
         />
@@ -609,7 +619,7 @@ function ItemsCard({
 }: {
   title: string;
   items: ScopedItem[];
-  onOpen: (title: string, path: string) => void;
+  onOpen: (title: string, path: string, scope: "project" | "global") => void;
 }) {
   const projectItems = items.filter((i) => i.scope === "project");
   const globalItems = items.filter((i) => i.scope === "global");
@@ -633,7 +643,11 @@ function ItemsCard({
                 key={item.path}
                 item={item}
                 onClick={() =>
-                  onOpen(`${title.replace(/s$/, "")}: ${item.name}`, item.path)
+                  onOpen(
+                    `${title.replace(/s$/, "")}: ${item.name}`,
+                    item.path,
+                    item.scope
+                  )
                 }
               />
             ))}
@@ -689,15 +703,20 @@ function ScopeBadge({ scope }: { scope: "project" | "global" }) {
 
 function DetailDrawer({
   detail,
+  projectDir,
   onClose,
   onDirtyChange,
 }: {
   detail: Detail;
+  projectDir: string | null;
   onClose: () => void;
   onDirtyChange: (dirty: boolean) => void;
 }) {
   // ドキュメントが変わるたびに DocEditor を作り直したいので、識別子を key にする
   const editorKey = detail.path ?? `${detail.title}::${detail.subtitle ?? ""}`;
+  // グローバルスコープの文書（rules・auto-memory等）はプロジェクトに紐づかないため、
+  // AI分析にプロジェクトルートを渡さない（Rust 側がプロンプトを文書単体の分析に出し分ける）
+  const analysisProjectDir = detail.projectScoped === false ? null : projectDir;
   return (
     <div className="drawer-overlay" onClick={onClose}>
       <div className="drawer" onClick={(e) => e.stopPropagation()}>
@@ -717,6 +736,7 @@ function DetailDrawer({
             content={detail.content}
             truncated={detail.truncated}
             modifiedEpoch={detail.modifiedEpoch ?? null}
+            projectDir={analysisProjectDir}
             onDirtyChange={onDirtyChange}
           />
         </div>
