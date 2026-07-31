@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import { listen } from "@tauri-apps/api/event";
 import {
   api,
-  accountLabel,
+  AccountUsage,
+  AccountsUpdatedEvent,
   formatEpoch,
-  UsageExpiredError,
-  AccountProfile,
-  LimitEntry,
+  OtherAccountOverview,
   ProjectInfo,
-  RateLimits,
   SearchHit,
   Transcript,
+  UsageOverview,
 } from "./api";
 import {
   ProjectTree,
@@ -20,7 +21,7 @@ import {
 } from "./ProjectTree";
 import { ProjectOverview } from "./ProjectOverview";
 import { DiagnosisOverlay } from "./Diagnosis";
-import { AccountsOverlay } from "./Accounts";
+import { AccountsOverlay, SKIP_SESSIONS_CONFIRM_KEY, skipSessionsConfirmEnabled } from "./Accounts";
 import { useIsMac } from "./platform";
 import "./App.css";
 
@@ -122,133 +123,178 @@ export default function App() {
   );
 }
 
-/** limits 配列の kind をユーザー向けラベルに変換 */
-function limitLabel(l: LimitEntry): string {
-  const model = l.scope?.model?.display_name;
-  if (l.kind === "session") return "セッション（5時間枠）";
-  if (l.kind === "weekly_all") return "週間（全体）";
-  if (l.kind === "weekly_scoped") return model ? `週間（${model}）` : "週間（モデル別）";
-  return model ? `${l.kind}（${model}）` : l.kind;
+/** ドットゲージのドット数・丸め規則は tray.rs の render_dots_pixels と同一にする
+ * （0%→0個、100%→32個、それ以外は round 後 1〜31 個にクランプ）。
+ * pct は事前に整数（Math.round 済み）で渡すこと */
+const DOT_COUNT = 32;
+
+function filledDotCount(pct: number): number {
+  const p = Math.min(100, Math.max(0, pct));
+  if (p === 0) return 0;
+  if (p === 100) return DOT_COUNT;
+  const rounded = Math.round((p * DOT_COUNT) / 100);
+  return Math.min(DOT_COUNT - 1, Math.max(1, rounded));
 }
 
-/** "default_claude_max_20x" → "Max 20x" のようにプラン名に整形 */
-function planLabel(p: AccountProfile): string {
-  const tier = p.organization?.rate_limit_tier ?? "";
-  const m = tier.match(/claude_(\w+?)_(\d+x)/);
-  if (m) return `${m[1][0].toUpperCase()}${m[1].slice(1)} ${m[2]}`;
-  if (p.account?.has_claude_max) return "Max";
-  if (p.account?.has_claude_pro) return "Pro";
-  return p.organization?.organization_type ?? "不明";
-}
-
-function formatReset(iso: string | null): string {
-  if (!iso) return "";
-  return new Date(iso).toLocaleString("ja-JP", {
-    month: "numeric",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-/** 使用量ポップオーバーに渡す統一形。常にライブ（現在ログイン中）アカウント1枚だけを表示する
- * （2026-07-25 ユーザー決定で複数アカウントの使用量並列表示は全廃した） */
-interface UsageCard {
-  name: string;
-  email: string;
-  planLabel: string;
-  isLive: boolean;
-  usage: RateLimits | null;
-  error: string | null;
-}
-
-/** 1アカウント分の使用量（枠ごとのゲージ）を描画する */
-function UsageCardView({ card }: { card: UsageCard }) {
-  if (card.error) return <p className="error-box">{card.error}</p>;
-  if (!card.usage) return <p className="muted">取得中…</p>;
-  const limits = card.usage.limits ?? [];
+function DotGauge({ pct }: { pct: number }) {
+  const filled = filledDotCount(pct);
   return (
-    <>
-      <div className="usage-account">
-        <p className="usage-name">
-          {card.name}
-          {card.isLive && <span className="acct-live">ログイン中</span>}
-        </p>
-        <p className="muted">{card.email}</p>
-        <p className="usage-plan">
-          <span className="count-badge">{card.planLabel}</span>
-        </p>
-      </div>
-      <hr />
-      <div className="usage-limits">
-        {limits.map((l, i) => {
-          const pct = Math.min(100, Math.round(l.percent ?? 0));
-          const level = pct >= 85 ? "high" : pct >= 60 ? "mid" : "low";
-          return (
-            <div key={i} className={`usage-limit level-${level}`}>
-              <div className="usage-limit-head">
-                <span>{limitLabel(l)}</span>
-                <span className="gauge-pct">{pct}%</span>
-              </div>
-              <span className="gauge-bar wide">
-                <span className="gauge-fill" style={{ width: `${pct}%` }} />
-              </span>
-              <p className="muted usage-reset">
-                {formatReset(l.resets_at)} にリセット
-                {l.severity && l.severity !== "normal"
-                  ? ` · ${l.severity}`
-                  : ""}
-              </p>
-            </div>
-          );
-        })}
-      </div>
-    </>
+    <span className="dot-gauge">
+      {Array.from({ length: DOT_COUNT }, (_, i) => (
+        <span key={i} className={`dot-gauge-dot${i < filled ? " filled" : ""}`} />
+      ))}
+    </span>
   );
 }
 
-/** 現在ログイン中（ライブ）アカウントの使用状況を表示するポップオーバー。
- * 2026-07-25 ユーザー決定で複数アカウントの並列表示（カルーセル）は全廃し、
- * ライブアカウント1枚だけを常に表示する */
+/** epoch 秒をローカル時刻表示に変換する。tray.rs の reset_local と同じ規則
+ * （今日中なら時刻だけ、それ以外は日付つき） */
+function resetLocal(epochSec: number): string {
+  const d = new Date(epochSec * 1000);
+  const now = new Date();
+  const time = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  return sameDay ? time : `${d.getMonth() + 1}/${d.getDate()} ${time}`;
+}
+
+/** tray.rs の reset_suffix と同じ規則（「（14:00 復活）」の形） */
+function resetSuffix(epoch: number | null): string {
+  if (epoch == null) return "";
+  return `（${resetLocal(epoch)} 復活）`;
+}
+
+/** その他アカウント1件分の使用率テキスト。tray.rs の compact_usage_segments と同じ内容
+ * （白=数値、グレー=リセット時刻）を span の色分けで再現する */
+function OtherAccountStats({ usage }: { usage: AccountUsage | null }) {
+  if (!usage || usage.five_pct == null) {
+    return <p className="other-acct-stats muted">未取得</p>;
+  }
+  // リセット時刻を過ぎている想定なら実質 0% とみなす（tray.rs と同じ規則）
+  const fiveVal = usage.five_probably_reset ? 0 : Math.round(usage.five_pct);
+  const sevenVal = Math.round(usage.seven_pct ?? 0);
+  return (
+    <p className="other-acct-stats">
+      <span className="stat-value">5h: {fiveVal}%</span>
+      <span className="muted">{resetSuffix(usage.five_reset)}</span>
+      <span className="muted"> / </span>
+      <span className="stat-value">週次: {sevenVal}%</span>
+      <span className="muted">{resetSuffix(usage.seven_reset)}</span>
+    </p>
+  );
+}
+
+/** その他アカウント1行分（名前・使用率・切り替えボタン）。has_credentials=false は
+ * 資格情報スナップショットが無く切り替え不可（tray.rs の「未取り込み（切り替え不可）」と同じ） */
+function OtherAccountRow({
+  account,
+  busy,
+  onSwitch,
+}: {
+  account: OtherAccountOverview;
+  busy: boolean;
+  onSwitch: (name: string) => void;
+}) {
+  return (
+    <div className="other-acct-row">
+      <p className="other-acct-name">{account.display_name}</p>
+      {account.has_credentials ? (
+        <>
+          <OtherAccountStats usage={account.usage} />
+          <button
+            className="acct-btn acct-btn-ghost switch-btn"
+            disabled={busy}
+            onClick={() => onSwitch(account.name)}
+          >
+            ⇄ このアカウントへ切り替え
+          </button>
+        </>
+      ) : (
+        <p className="muted">未取り込み（切り替え不可）</p>
+      )}
+    </div>
+  );
+}
+
+/** 起動中セッションがある場合の続行確認。Accounts.tsx の sessionsConfirm と同じ文言・
+ * 「今後表示しない」設定（localStorage キー共有）を踏襲する。
+ * ポップオーバー（`.usage-anchor`、31×27px）の内側に描画すると
+ * `.acct-modal-overlay` の `position: absolute; inset: 0` がその小さな箱に潰れてしまうため、
+ * body 直下へ createPortal し、専用クラスで position: fixed 化する */
+function SessionsConfirmModal({
+  name,
+  count,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  name: string;
+  count: number;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: (skipFuture: boolean) => void;
+}) {
+  const [skipFuture, setSkipFuture] = useState(false);
+  return createPortal(
+    <div className="acct-modal-overlay usage-sessions-modal-overlay" onClick={onCancel}>
+      <div className="acct-modal-card" onClick={(e) => e.stopPropagation()}>
+        <strong>「{name}」に切り替えます</strong>
+        <p className="muted">
+          起動中の Claude Code セッションがあります。続行すると、実行中セッションが古いトークンを
+          書き戻して切り替えが巻き戻ったり、保存済みアカウントが後で「＋
+          アカウントを追加」から改めてログインし直す必要になる可能性があります（{count}件）。
+          全セッション終了を推奨しますが、続行しますか？
+        </p>
+        <label className="acct-modal-checkbox">
+          <input
+            type="checkbox"
+            checked={skipFuture}
+            onChange={(e) => setSkipFuture(e.target.checked)}
+          />
+          今後この確認を表示しない
+        </label>
+        <div className="acct-modal-actions">
+          <button className="acct-btn acct-btn-ghost" onClick={onCancel}>
+            やめる
+          </button>
+          <button
+            className="acct-btn acct-btn-primary"
+            disabled={busy}
+            onClick={() => onConfirm(skipFuture)}
+          >
+            続行する
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+/** メニューバートレイパネルと同一の表示内容・数値・フォーマットを再現する使用量ポップオーバー
+ * （2026-07-31 UsageCard/UsageCardView ベースの独自表示から作り替え）。
+ * データは get_usage_overview（tray::fetch_raw_status 共有）から取得するため、
+ * トレイのメニューと数値・優先順位が完全に一致する */
 function UsagePopover() {
   const [open, setOpen] = useState(false);
-  const [card, setCard] = useState<UsageCard | null>(null);
+  const [overview, setOverview] = useState<UsageOverview | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // access token 期限切れ（Claude Code を一度使うと自動更新される正常な待ち状態）。
-  // エラーではないので error とは別に持ち、error-box ではなく薄字の案内を出す
-  const [expired, setExpired] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
+  // 切り替え失敗は取得エラー（error、全置換）とは別枠で目立たせる（M-2）
+  const [switchError, setSwitchError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [sessionsConfirm, setSessionsConfirm] = useState<
+    { name: string; label: string; count: number } | null
+  >(null);
 
   const load = useCallback(() => {
     setError(null);
-    setExpired(false);
-    setCard(null);
-    Promise.all([
-      api.getRateLimits(),
-      api.getAccountProfile(),
-      // 登録済みアカウントに表示名（display_name）が設定されていればそちらを優先する。
-      // 非 macOS や未登録では失敗するので、Anthropic 側の profile 名にフォールバックする
-      api.getAccounts().catch(() => null),
-    ])
-      .then(([u, p, accountsState]) => {
-        const live = accountsState?.accounts.find((a) => a.is_live);
-        setCard({
-          name: live
-            ? accountLabel(live)
-            : (p.account?.display_name ?? p.account?.full_name ?? "(名前不明)"),
-          email: p.account?.email ?? "",
-          planLabel: planLabel(p),
-          isLive: true,
-          usage: u,
-          error: null,
-        });
-      })
-      .catch((e) => {
-        if (e instanceof UsageExpiredError) {
-          setExpired(true);
-        } else {
-          setError(String(e));
-        }
-      });
+    api
+      .getUsageOverview()
+      .then(setOverview)
+      .catch((e) => setError(String(e)));
   }, []);
 
   useEffect(() => {
@@ -258,18 +304,86 @@ function UsagePopover() {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        setSessionsConfirm(null);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
+
+  // 定期更新ループ（tray.rs）が自動取り込みを行った場合、表示中のポップオーバーも
+  // 追随させる（Accounts.tsx の同名 listen と同じイベント）
+  useEffect(() => {
+    if (!open) return;
+    const unlisten = listen<AccountsUpdatedEvent>("accounts-updated", () => {
+      load();
+    });
+    return () => {
+      unlisten.then((un) => un());
+    };
+  }, [open, load]);
+
+  /** トレイの switch_from_tray と同じ確認フロー（needs_import は案内のみ、
+   * sessions_running は確認モーダル＋「今後表示しない」設定を踏襲） */
+  const doSwitch = (name: string, force = false): Promise<void> => {
+    setNotice(null);
+    setSwitchError(null);
+    setBusy(true);
+    return api
+      .switchAccount(name, force)
+      .then((outcome) => {
+        if (outcome.status === "needs_import") {
+          setNotice(
+            "現在ログイン中のアカウントが未登録のため切り替えられません。アカウント画面から操作してください。"
+          );
+          return;
+        }
+        if (outcome.status === "sessions_running") {
+          if (skipSessionsConfirmEnabled()) {
+            return doSwitch(name, true);
+          }
+          const label = overview?.others.find((a) => a.name === name)?.display_name ?? name;
+          setSessionsConfirm({ name, label, count: outcome.count });
+          return;
+        }
+        setSessionsConfirm(null);
+        setNotice(
+          outcome.warning ??
+            "切り替えました。実行中の Claude Code セッションには反映されません。"
+        );
+        load();
+      })
+      .catch((e) => setSwitchError(String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  const confirmSessionsAndContinue = (skipFuture: boolean) => {
+    if (!sessionsConfirm) return;
+    if (skipFuture) localStorage.setItem(SKIP_SESSIONS_CONFIRM_KEY, "1");
+    const target = sessionsConfirm;
+    setSessionsConfirm(null);
+    doSwitch(target.name, true);
+  };
+
+  // tray.rs の live_header と同じ規則：使用量取得が失敗（live_error）した場合は
+  // live_name の有無によらず固定文言にする
+  const liveHeader = overview
+    ? overview.live && overview.live_name
+      ? `ログイン中: ${overview.live_name}`
+      : "ログイン中アカウント"
+    : "取得中…";
 
   return (
     <div className="usage-anchor">
       <button
         className="icon-btn"
         title="アカウントとリソース使用状況"
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => {
+          setOpen((v) => !v);
+          setSessionsConfirm(null);
+        }}
       >
         <svg
           width="15"
@@ -289,29 +403,80 @@ function UsagePopover() {
       </button>
       {open && (
         <>
-          <div className="menu-backdrop" onMouseDown={() => setOpen(false)} />
+          <div
+            className="menu-backdrop"
+            onMouseDown={() => {
+              setOpen(false);
+              setSessionsConfirm(null);
+            }}
+          />
           <div className="usage-popover">
             {error ? (
               <p className="error-box">{error}</p>
-            ) : expired ? (
-              <p className="muted usage-note">
-                最新の使用量は Claude Code を一度使うと取得できます。
-              </p>
-            ) : !card ? (
-              <p className="muted">取得中…</p>
             ) : (
               <>
-                <UsageCardView card={card} />
-                <hr />
-                <p className="usage-extra muted">
-                  追加クレジット:{" "}
-                  {card.usage?.extra_usage?.is_enabled
-                    ? `有効（使用 ${card.usage.extra_usage.used_credits ?? 0}）`
-                    : "無効"}
-                </p>
+                <p className="usage-live-header">{liveHeader}</p>
+                {overview?.live ? (
+                  <div className="usage-gauges">
+                    <div className="usage-gauge-row">
+                      <DotGauge pct={Math.round(overview.live.five_pct)} />
+                      <span>
+                        5H {Math.round(overview.live.five_pct)}%
+                        {resetSuffix(overview.live.five_reset)}
+                      </span>
+                    </div>
+                    <div className="usage-gauge-row">
+                      <DotGauge pct={Math.round(overview.live.seven_pct)} />
+                      <span>
+                        週次 {Math.round(overview.live.seven_pct)}%
+                        {resetSuffix(overview.live.seven_reset)}
+                      </span>
+                    </div>
+                  </div>
+                ) : overview?.live_error ? (
+                  overview.live_error
+                    .split("\n")
+                    .map((line, i) => (
+                      <p key={i} className="muted">
+                        {line}
+                      </p>
+                    ))
+                ) : (
+                  <p className="muted">取得中…</p>
+                )}
+
+                {overview && overview.others.length > 0 && (
+                  <>
+                    <hr />
+                    {overview.others.map((a) => (
+                      <OtherAccountRow
+                        key={a.name}
+                        account={a}
+                        busy={busy}
+                        onSwitch={doSwitch}
+                      />
+                    ))}
+                  </>
+                )}
+
+                {notice && <p className="usage-note muted">{notice}</p>}
               </>
             )}
+            {switchError && <p className="error-box">{switchError}</p>}
+            <hr />
+            <button className="acct-btn acct-btn-ghost usage-refresh-btn" onClick={load}>
+              ステータス更新
+            </button>
           </div>
+          {sessionsConfirm && (
+            <SessionsConfirmModal
+              name={sessionsConfirm.label}
+              count={sessionsConfirm.count}
+              busy={busy}
+              onCancel={() => setSessionsConfirm(null)}
+              onConfirm={confirmSessionsAndContinue}
+            />
+          )}
         </>
       )}
     </div>

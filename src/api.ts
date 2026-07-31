@@ -292,9 +292,36 @@ export const api = {
    * Terminal を開いて setup-token を実行するだけで、完了は pollMonitorSetup で検知する */
   startMonitorSetup: (name: string) => invoke<void>("start_monitor_setup", { name }),
   pollMonitorSetup: (name: string) => invoke<MonitorSetupPoll>("poll_monitor_setup", { name }),
-  getRateLimits: () => unwrapUsageFetch<RateLimits>("get_rate_limits"),
-  getAccountProfile: () => unwrapUsageFetch<AccountProfile>("get_account_profile"),
+  /** 右上の使用量ポップオーバー用。トレイと同じ土台（tray::fetch_raw_status）から
+   * 組み立てられるため、数値・フォーマットはトレイのメニュー表示と一致する */
+  getUsageOverview: () => invoke<UsageOverview>("get_usage_overview"),
 };
+
+/** アプリ内使用量ポップオーバー（トレイと共有する `tray::UsageOverview`）向け。
+ * ライブアカウントの使用率。トレイの `LiveUsage` と同じ形 */
+export interface LiveUsage {
+  five_pct: number;
+  seven_pct: number;
+  five_reset: number | null;
+  seven_reset: number | null;
+}
+
+/** その他アカウント1件分（トレイの `OtherAccountEntry` と同じ形）。
+ * usage が null、または usage.five_pct が null なら「未取得」表示にする */
+export interface OtherAccountOverview {
+  name: string;
+  display_name: string;
+  has_credentials: boolean;
+  usage: AccountUsage | null;
+}
+
+/** get_usage_overview の戻り値。live_error はトレイの案内2行を改行区切りで持つ */
+export interface UsageOverview {
+  live_name: string | null;
+  live: LiveUsage | null;
+  live_error: string | null;
+  others: OtherAccountOverview[];
+}
 
 /** analyzeDoc が「すでに実行中」で失敗したかどうかの判定。文字列マッチではなく
  * Rust 側が付与する "ALREADY_RUNNING:" プレフィックスで判定し、表示用にはプレフィックスを
@@ -306,86 +333,6 @@ export function parseAlreadyRunning(e: unknown): { alreadyRunning: boolean; mess
     return { alreadyRunning: true, message: raw.slice(prefix.length) };
   }
   return { alreadyRunning: false, message: raw };
-}
-
-/** get_rate_limits/get_account_profile の生の戻り値（Rust の UsageFetch と同じ形）。
- * "expired" は access token の期限切れ（Claude Code 側の自動 refresh 待ちの正常な状態）で、
- * エラーではない */
-type UsageFetchRaw =
-  | { status: "ok"; body: string }
-  | { status: "expired" }
-  | { status: "error"; message: string };
-
-/** ライブ access token が期限切れであることを示す（2026-07-26 追加）。
- * 「再ログインが必要かもしれません」という誤誘導なエラー文言を廃止し、代わりにこの型で
- * 呼び出し側が「エラーではなく待ち状態」と判別できるようにする。
- * 呼び出し側は catch した値が `instanceof UsageExpiredError` かで分岐し、
- * エラーボックスではなく薄字の案内（例:「最新の使用量は Claude Code を一度使うと取得できます」）
- * を出すこと */
-export class UsageExpiredError extends Error {
-  constructor() {
-    super("ライブの access token が期限切れです（Claude Code を一度使うと更新されます）");
-    this.name = "UsageExpiredError";
-  }
-}
-
-/** get_rate_limits/get_account_profile 共通の unwrap。呼び出し側の型（Promise<RateLimits> /
- * Promise<AccountProfile>）は変えず、期限切れだけ UsageExpiredError として投げ分ける */
-async function unwrapUsageFetch<T>(command: string): Promise<T> {
-  const raw = await invoke<UsageFetchRaw>(command);
-  if (raw.status === "ok") return JSON.parse(raw.body) as T;
-  if (raw.status === "expired") throw new UsageExpiredError();
-  throw new Error(raw.message);
-}
-
-export interface RateLimitWindow {
-  utilization: number | null;
-  resets_at: string | null;
-}
-
-/** usage API の limits 配列の1エントリ（モデル別枠は scope.model に入る） */
-export interface LimitEntry {
-  kind: string;
-  group: string | null;
-  percent: number | null;
-  severity: string | null;
-  resets_at: string | null;
-  scope: { model?: { display_name?: string | null } | null } | null;
-  is_active: boolean;
-}
-
-export interface RateLimits {
-  five_hour: RateLimitWindow | null;
-  seven_day: RateLimitWindow | null;
-  limits?: LimitEntry[];
-  extra_usage?: {
-    is_enabled: boolean;
-    monthly_limit: number | null;
-    used_credits: number | null;
-    utilization: number | null;
-  } | null;
-  spend?: {
-    used: { amount_minor: number; currency: string; exponent: number } | null;
-    limit: unknown;
-    percent: number | null;
-    enabled: boolean;
-  } | null;
-}
-
-export interface AccountProfile {
-  account?: {
-    full_name?: string | null;
-    display_name?: string | null;
-    email?: string | null;
-    has_claude_max?: boolean;
-    has_claude_pro?: boolean;
-  } | null;
-  organization?: {
-    name?: string | null;
-    organization_type?: string | null;
-    rate_limit_tier?: string | null;
-    subscription_status?: string | null;
-  } | null;
 }
 
 export function formatEpoch(epochMs: number): string {

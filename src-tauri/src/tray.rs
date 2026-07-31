@@ -73,12 +73,39 @@ enum InfoLine {
 }
 
 /// 「その他のアカウント」1件分。クリックで切り替えるメニュー項目に使用率も添える
-/// （2026-07-26: 切り替え前にどのアカウントが空いているか見えるようにする要望）
-struct OtherAccountEntry {
-    name: String,
-    display_name: String,
-    has_credentials: bool,
-    usage: Option<crate::accounts::AccountUsage>,
+/// （2026-07-26: 切り替え前にどのアカウントが空いているか見えるようにする要望）。
+/// アプリ内使用量ポップオーバー（`get_usage_overview`）とも共有するため Serialize を持つ
+#[derive(serde::Serialize, Clone)]
+pub struct OtherAccountEntry {
+    pub name: String,
+    pub display_name: String,
+    pub has_credentials: bool,
+    pub usage: Option<crate::accounts::AccountUsage>,
+}
+
+/// ライブアカウントの使用率（アプリ内ポップオーバー向け）。トレイの `InfoLine::Gauge` と
+/// 同じ数値をそのまま渡す（フォーマットはフロント側で `reset_suffix` 相当を再現する）
+#[derive(serde::Serialize, Clone)]
+pub struct LiveUsage {
+    pub five_pct: f64,
+    pub seven_pct: f64,
+    pub five_reset: Option<i64>,
+    pub seven_reset: Option<i64>,
+}
+
+/// アプリ内使用量ポップオーバー（`get_usage_overview` コマンド）向けの表示専用データ。
+/// トレイと同じ `fetch_raw_status` を土台にすることで、数値・優先順位（ライブOAuth→
+/// バッチ結果→監視トークン）をトレイと完全に一致させる（2026-07-31）
+#[derive(serde::Serialize, Clone)]
+pub struct UsageOverview {
+    /// ログイン中アカウントの表示名（取得できなければ None。フロントは
+    /// 「ログイン中アカウント」にフォールバックする＝トレイの `live_header` と同じ規則）
+    pub live_name: Option<String>,
+    pub live: Option<LiveUsage>,
+    /// 取得失敗時の案内。トレイの2行分（"使用量を取得できません" / "Claude Code で
+    /// ログインしてください"）を改行区切りの1文字列にまとめて渡す
+    pub live_error: Option<String>,
+    pub others: Vec<OtherAccountEntry>,
 }
 
 /// 「その他のアカウント」1件分の使用率テキストを白/グレーの色付きセグメント列に分解する
@@ -384,7 +411,18 @@ fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>)
     })
 }
 
-fn fetch_status() -> StatusData {
+/// トレイ・アプリ内ポップオーバー（`get_usage_overview`）の両方が土台にする生データ。
+/// 表示専用の整形（メニュー文字列・ゲージ描画）は呼び出し側でそれぞれ行う
+struct RawStatus {
+    live_name: Option<String>,
+    other_accounts: Vec<OtherAccountEntry>,
+    usage_result: Result<crate::actions::UsageSummary, String>,
+}
+
+/// 登録アカウント一覧・使用率一括照会・ライブ使用率の取得元フォールバックをまとめて行う
+/// （2026-07-31: `fetch_status`/`usage_overview` の共有ロジックとして抽出。
+/// 元は `fetch_status` に直接書かれていたトレイ専用ロジックで、ロジック自体は変更していない）
+fn fetch_raw_status() -> RawStatus {
     // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す
     let registered = crate::accounts::registered_accounts();
     let live_name = registered.iter().find(|a| a.is_live).map(|a| a.display_name.clone());
@@ -415,7 +453,6 @@ fn fetch_status() -> StatusData {
         })
         .collect();
 
-    let mut usage_lines = Vec::new();
     // ライブ OAuth を最優先で試す。失敗したら（典型的には切り替え直後で、スナップショット
     // 由来のライブトークンが期限切れ。リフレッシュは Claude Code 起動時にしか起きない）、
     // まず上の get_accounts_usage() がこのライブアカウント分について既に試行済みの結果
@@ -435,7 +472,15 @@ fn fetch_status() -> StatusData {
                 .ok_or_else(|| "監視トークンなし".to_string())
                 .and_then(|token| crate::actions::usage_via_monitor_token(&token))
         });
-    let (live_header, title) = match usage_result {
+
+    RawStatus { live_name, other_accounts, usage_result }
+}
+
+fn fetch_status() -> StatusData {
+    let raw = fetch_raw_status();
+    let live_name = raw.live_name;
+    let mut usage_lines = Vec::new();
+    let (live_header, title) = match raw.usage_result {
         Ok(u) => {
             let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
@@ -464,7 +509,35 @@ fn fetch_status() -> StatusData {
         title,
         live_header,
         usage_lines,
-        other_accounts,
+        other_accounts: raw.other_accounts,
+    }
+}
+
+/// アプリ内使用量ポップオーバー（`get_usage_overview` コマンド）向け。トレイと同じ
+/// `fetch_raw_status` を使うため、数値・フォールバック優先順位はトレイと完全に一致する
+pub fn usage_overview() -> UsageOverview {
+    let raw = fetch_raw_status();
+    let (live, live_error) = match raw.usage_result {
+        Ok(u) => (
+            Some(LiveUsage {
+                five_pct: u.five_pct,
+                seven_pct: u.seven_pct,
+                five_reset: u.five_reset,
+                seven_reset: u.seven_reset,
+            }),
+            None,
+        ),
+        // トレイの2行分の案内文言（InfoLine::Plain）と同じ内容を改行区切りで渡す
+        Err(_) => (
+            None,
+            Some("使用量を取得できません\nClaude Code でログインしてください".to_string()),
+        ),
+    };
+    UsageOverview {
+        live_name: raw.live_name,
+        live,
+        live_error,
+        others: raw.other_accounts,
     }
 }
 

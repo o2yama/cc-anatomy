@@ -109,57 +109,19 @@ body {
   margin-top: -4px;
 }
 
-/* ---- usage gauges (popover内で使用) ---- */
-.gauge-bar {
-  width: 72px;
-  height: 6px;
-  border-radius: 3px;
-  background: var(--bg-hover);
-  overflow: hidden;
-}
-
-.gauge-fill {
-  display: block;
-  height: 100%;
-  border-radius: 3px;
-  transition: width 0.3s ease;
-}
-
-.level-low .gauge-fill {
-  background: #34c759;
-}
-
-.level-mid .gauge-fill {
-  background: #ffb020;
-}
-
-.level-high .gauge-fill {
-  background: #ff5d5d;
-}
-
-.gauge-pct {
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  color: var(--text-dim);
-  min-width: 32px;
-}
-
-.level-high .gauge-pct {
-  color: #ff5d5d;
-  font-weight: 700;
-}
-
 /* ---- usage popover ---- */
 .usage-anchor {
   position: relative;
 }
 
+/* トレイ同様「ラベル+パーセント+リセット括弧」を1行に収めるため 340px→380px に拡大
+   （M-3。最長ケース「週次 100%（12/31 23:59 復活）」+ ドットゲージ159pxで概算検証済み） */
 .usage-popover {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
   z-index: 21;
-  width: 300px;
+  width: 380px;
   padding: 14px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
@@ -173,41 +135,79 @@ body {
   margin: 12px 0;
 }
 
-.usage-name {
-  font-size: 14px;
+/* ---- usage popover: トレイパネルと同一内容の表示（2026-07-31 作り替え） ---- */
+.usage-live-header {
+  font-size: 13px;
   font-weight: 700;
 }
 
-.usage-plan {
-  margin-top: 6px;
-  font-size: 12px;
-}
-
-.usage-limits {
+.usage-gauges {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
+  margin-top: 10px;
 }
 
-.usage-limit-head {
+.usage-gauge-row {
   display: flex;
-  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
   font-size: 12.5px;
-  margin-bottom: 4px;
+  font-variant-numeric: tabular-nums;
+  /* 380px 幅でも最長ケースで折り返さないよう明示的に1行固定（M-3） */
+  white-space: nowrap;
 }
 
-.gauge-bar.wide {
-  display: block;
-  width: 100%;
+/* ドット32個。直径4px/gap1pxでゲージ幅を159pxに抑え、380pxポップオーバーで
+   ラベル行が1行に収まるようにする（tray.rs のドットバーと同じ丸め規則、M-3で調整） */
+.dot-gauge {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  flex-shrink: 0;
 }
 
-.usage-reset {
-  margin-top: 3px;
-  font-size: 11px;
+.dot-gauge-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--border);
+  flex-shrink: 0;
 }
 
-.usage-extra {
+.dot-gauge-dot.filled {
+  background: var(--text);
+}
+
+.other-acct-row {
+  padding: 8px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.other-acct-name {
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.other-acct-stats {
   font-size: 11.5px;
+  color: var(--text);
+}
+
+.other-acct-stats .stat-value {
+  color: var(--text);
+}
+
+.switch-btn {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+.usage-refresh-btn {
+  width: 100%;
+  justify-content: center;
 }
 
 .topbar h1 {
@@ -1659,6 +1659,14 @@ main {
   align-items: center;
   justify-content: center;
   z-index: 20;
+}
+
+/* usage-anchor（31×27px程度）の内側で `.acct-modal-overlay` の position:absolute を
+   使うと親サイズに潰れるため、body 直下へ createPortal した SessionsConfirmModal 用に
+   position:fixed へ上書きし、.usage-popover（z-index:21）より前面に出す（B-1） */
+.usage-sessions-modal-overlay {
+  position: fixed;
+  z-index: 30;
 }
 
 .acct-modal-card {

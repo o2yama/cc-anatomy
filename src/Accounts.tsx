@@ -43,8 +43,8 @@ const MONITOR_TIMEOUT_MS = 90 * 1000;
  * sync-back + 同一性検証の防御があるため毎回の確認は過剰と判断）。
  * リセットしたい場合はブラウザの devtools 等で該当キーを削除する（専用 UI は用意していない）
  */
-const SKIP_SESSIONS_CONFIRM_KEY = "cc-anatomy.skipSessionsConfirm";
-const skipSessionsConfirmEnabled = () =>
+export const SKIP_SESSIONS_CONFIRM_KEY = "cc-anatomy.skipSessionsConfirm";
+export const skipSessionsConfirmEnabled = () =>
   localStorage.getItem(SKIP_SESSIONS_CONFIRM_KEY) === "1";
 
 /** 「取り込みますか？」確認ダイアログの対象。switch は特定アカウントへの切り替え、

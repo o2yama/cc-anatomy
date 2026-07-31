@@ -106,18 +106,6 @@ fn extract_tasks(project: String) -> Result<String, String> {
     actions::extract_tasks(&project)
 }
 
-/// ネットワーク呼び出しなので async。期限切れ（expired）はエラーではなく
-/// 正常な待ち状態として区別してフロントへ返す（UsageFetch 参照）
-#[tauri::command(async)]
-fn get_rate_limits() -> actions::UsageFetch {
-    actions::get_rate_limits()
-}
-
-#[tauri::command(async)]
-fn get_account_profile() -> actions::UsageFetch {
-    actions::get_account_profile()
-}
-
 /// 環境スキャンは数分かかるので async で UI スレッドを塞がない
 #[tauri::command(async)]
 fn run_diagnosis(app: tauri::AppHandle) -> Result<diagnostics::DiagnosisReport, String> {
@@ -238,6 +226,14 @@ fn get_accounts_usage() -> Result<Vec<accounts::AccountUsage>, String> {
     accounts::get_accounts_usage()
 }
 
+/// アプリ内右上の使用量ポップオーバー向け。トレイと同じ土台（`tray::fetch_raw_status`）から
+/// 組み立てるため、表示内容・数値の優先順位はトレイと完全に一致する。
+/// ライブ OAuth への HTTP を含むため async にする
+#[tauri::command(async)]
+fn get_usage_overview() -> tray::UsageOverview {
+    tray::usage_overview()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -280,8 +276,6 @@ pub fn run() {
             open_in_cmux,
             open_in_terminal,
             extract_tasks,
-            get_rate_limits,
-            get_account_profile,
             run_diagnosis,
             cancel_diagnosis,
             run_fixes_in_terminal,
@@ -296,6 +290,7 @@ pub fn run() {
             rename_account,
             reorder_accounts,
             get_accounts_usage,
+            get_usage_overview,
             start_monitor_setup,
             poll_monitor_setup
         ])

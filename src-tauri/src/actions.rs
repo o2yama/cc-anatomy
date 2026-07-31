@@ -2,9 +2,9 @@
 //! 外部アプリ起動（Finder / cmux / Ghostty）とタスク抽出は macOS 限定機能。
 //! 使用量取得は全プラットフォーム共通。
 //!
-//! ライブアカウント（現在ログイン中）の使用量・プロフィールは常にライブ資格情報の
-//! access token で `/api/oauth/usage` `/api/oauth/profile` を直接叩く（`get_rate_limits`/
-//! `get_account_profile`/`live_usage_summary`）。2026-07-26 に任意機能として復活した
+//! ライブアカウント（現在ログイン中）の使用量は常にライブ資格情報の access token で
+//! `/api/oauth/usage` を直接叩く（`live_usage_summary`。トレイ・アプリ内ポップオーバー
+//! （`tray::usage_overview`）が共有する）。2026-07-26 に任意機能として復活した
 //! 監視用長期トークン（`claude setup-token` 発行）は `oauth/usage` のスコープ外のため、
 //! `usage_via_monitor_token` が `/v1/messages` へ最小リクエストを投げてレスポンスヘッダ
 //! （`anthropic-ratelimit-unified-*`）から使用率を読む別経路を使う
@@ -152,7 +152,6 @@ fn oauth_get_with_token_blocking(token: &str, url: &str) -> Result<String, Strin
 /// `/api/oauth/usage` のエンドポイント。ライブアカウントの使用量表示（actions.rs）と
 /// 登録済み全アカウントの使用率一括取得（accounts::get_accounts_usage）の両方から使うため公開する
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
-pub const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// ライブ access token の取得状態。`expired` は Claude Code 側の自動 refresh 待ちの
 /// 正常な状態であり、エラー扱いしない（2026-07-26 ユーザー報告: 期限切れ時の応答が
@@ -390,16 +389,6 @@ pub fn live_usage_summary() -> Result<UsageSummary, String> {
         UsageFetch::Expired => Err("access token が期限切れです".to_string()),
         UsageFetch::Error { message } => Err(message),
     }
-}
-
-/// 表示対象アカウントのレートリミットを取得する（常にライブアカウント）
-pub fn get_rate_limits() -> UsageFetch {
-    fetch_live_usage_status(USAGE_URL)
-}
-
-/// アカウント・組織・プラン情報を取得する（常にライブアカウント）
-pub fn get_account_profile() -> UsageFetch {
-    fetch_live_usage_status(PROFILE_URL)
 }
 
 #[cfg(test)]
