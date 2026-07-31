@@ -7,6 +7,7 @@ import {
   ProjectEnv,
   ScopedItem,
 } from "./api";
+import { DocEditor } from "./DocEditor";
 
 const OBS_TYPES: Record<string, { icon: string; label: string }> = {
   feature: { icon: "🟣", label: "機能" },
@@ -26,6 +27,9 @@ interface Detail {
   subtitle?: string;
   content: string;
   truncated?: boolean;
+  /** 実ファイルに紐づく場合のみ設定。無ければ DocEditor は編集不可（閲覧のみ）で開く */
+  path?: string;
+  modifiedEpoch?: number;
 }
 
 /**
@@ -48,7 +52,31 @@ export function ProjectOverview({
 }) {
   const [env, setEnv] = useState<ProjectEnv | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [detail, setDetail] = useState<Detail | null>(null);
+  const [detail, setDetailRaw] = useState<Detail | null>(null);
+  // ドロワーで編集中（DocEditor から報告される）かどうか。閉じる／別ファイルを開く
+  // 操作をガードするために使う
+  const [detailDirty, setDetailDirty] = useState(false);
+  // ガード対象の遷移先。null は「閉じる」を意味する
+  const [pendingDetail, setPendingDetail] = useState<{ next: Detail | null } | null>(
+    null
+  );
+
+  /** detail の切替は原則これ経由にし、未保存変更があれば確認を挟む */
+  const setDetail = (next: Detail | null) => {
+    if (detailDirty) {
+      setPendingDetail({ next });
+      return;
+    }
+    setDetailRaw(next);
+    setDetailDirty(false);
+  };
+  const confirmDiscardAndProceed = () => {
+    if (!pendingDetail) return;
+    setDetailRaw(pendingDetail.next);
+    setDetailDirty(false);
+    setPendingDetail(null);
+  };
+  const cancelPendingSwitch = () => setPendingDetail(null);
   // グローバル設定（~/.claude 由来の skills/MCP等）は量が多いのでデフォルト非表示。
   // 選択はプロジェクト切替をまたいで保持したいので localStorage に持つ
   const [showGlobal, setShowGlobal] = useState(
@@ -64,7 +92,10 @@ export function ProjectOverview({
 
   useEffect(() => {
     setEnv(null);
-    setDetail(null);
+    // プロジェクト切替は未保存変更ガードの対象外にする（トップレベルの画面遷移のため）
+    setDetailRaw(null);
+    setDetailDirty(false);
+    setPendingDetail(null);
     api
       .getProjectEnv(project, path)
       .then(setEnv)
@@ -80,6 +111,8 @@ export function ProjectOverview({
           subtitle: doc.path,
           content: doc.content,
           truncated: doc.truncated,
+          path: doc.path,
+          modifiedEpoch: doc.modified_epoch,
         })
       )
       .catch((e) =>
@@ -127,6 +160,8 @@ export function ProjectOverview({
                           subtitle: doc.path,
                           content: doc.content,
                           truncated: doc.truncated,
+                          path: doc.path,
+                          modifiedEpoch: doc.modified_epoch,
                         })
                       }
                     >
@@ -222,6 +257,8 @@ export function ProjectOverview({
                               subtitle: memoryMd.path,
                               content: memoryMd.content,
                               truncated: memoryMd.truncated,
+                              path: memoryMd.path,
+                              modifiedEpoch: memoryMd.modified_epoch,
                             })
                           }
                         >
@@ -370,7 +407,29 @@ export function ProjectOverview({
         />
       </div>
       {detail && (
-        <DetailDrawer detail={detail} onClose={() => setDetail(null)} />
+        <DetailDrawer
+          detail={detail}
+          onClose={() => setDetail(null)}
+          onDirtyChange={setDetailDirty}
+        />
+      )}
+      {pendingDetail && (
+        <div className="unsaved-guard-overlay">
+          <div className="unsaved-guard-box">
+            <p>未保存の変更があります。破棄して続けますか？</p>
+            <div className="unsaved-guard-actions">
+              <button className="doc-editor-btn" onClick={cancelPendingSwitch}>
+                キャンセル
+              </button>
+              <button
+                className="doc-editor-btn doc-editor-btn-primary"
+                onClick={confirmDiscardAndProceed}
+              >
+                破棄して続ける
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -631,10 +690,14 @@ function ScopeBadge({ scope }: { scope: "project" | "global" }) {
 function DetailDrawer({
   detail,
   onClose,
+  onDirtyChange,
 }: {
   detail: Detail;
   onClose: () => void;
+  onDirtyChange: (dirty: boolean) => void;
 }) {
+  // ドキュメントが変わるたびに DocEditor を作り直したいので、識別子を key にする
+  const editorKey = detail.path ?? `${detail.title}::${detail.subtitle ?? ""}`;
   return (
     <div className="drawer-overlay" onClick={onClose}>
       <div className="drawer" onClick={(e) => e.stopPropagation()}>
@@ -647,11 +710,15 @@ function DetailDrawer({
             ✕
           </button>
         </div>
-        <div className="drawer-body">
-          <pre className="doc-content detail-content">
-            {detail.content}
-            {detail.truncated && "\n…（以降省略）"}
-          </pre>
+        <div className="drawer-body drawer-body-editor">
+          <DocEditor
+            key={editorKey}
+            path={detail.path ?? null}
+            content={detail.content}
+            truncated={detail.truncated}
+            modifiedEpoch={detail.modifiedEpoch ?? null}
+            onDirtyChange={onDirtyChange}
+          />
         </div>
       </div>
     </div>

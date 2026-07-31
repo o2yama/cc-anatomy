@@ -47,6 +47,15 @@ fn read_doc(path: String) -> Result<env::FileDoc, String> {
 }
 
 #[tauri::command]
+fn write_doc(
+    path: String,
+    content: String,
+    expected_modified_epoch: Option<i64>,
+) -> Result<env::FileDoc, String> {
+    env::write_doc_checked(&path, &content, expected_modified_epoch)
+}
+
+#[tauri::command]
 fn list_sessions(project: String) -> Result<Vec<db::SessionInfo>, String> {
     db::list_sessions(&project)
 }
@@ -239,6 +248,7 @@ pub fn run() {
             get_platform,
             get_project_env,
             read_doc,
+            write_doc,
             list_sessions,
             search_summaries,
             get_transcript,

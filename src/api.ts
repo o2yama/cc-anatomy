@@ -232,6 +232,12 @@ export const api = {
   getProjectEnv: (project: string, path: string | null) =>
     invoke<ProjectEnv>("get_project_env", { project, path }),
   readDoc: (path: string) => invoke<FileDoc>("read_doc", { path }),
+  writeDoc: (path: string, content: string, expectedModifiedEpoch: number | null) =>
+    invoke<FileDoc>("write_doc", {
+      path,
+      content,
+      expectedModifiedEpoch,
+    }),
   listSessions: (project: string) =>
     invoke<SessionInfo[]>("list_sessions", { project }),
   searchSummaries: (query: string, project?: string) =>
