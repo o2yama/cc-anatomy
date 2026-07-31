@@ -452,6 +452,9 @@ name = "cc-dashboard"
 version = "0.4.5"
 dependencies = [
  "chrono",
+ "core-foundation",
+ "core-graphics",
+ "core-text",
  "reqwest",
  "rusqlite",
  "rustls",
@@ -577,6 +580,17 @@ dependencies = [
  "bitflags 2.13.0",
  "core-foundation",
  "libc",
+]
+
+[[package]]
+name = "core-text"
+version = "22.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "333dab512ce710ca2d08574c373d246dbeac8b22769e47da4c0e72730ce442b7"
+dependencies = [
+ "core-foundation",
+ "core-graphics",
+ "foreign-types",
 ]
 
 [[package]]

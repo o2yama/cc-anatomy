@@ -19,6 +19,16 @@
 //! バーからモノクロの細いドットバー（等間隔の円の列）に変更した。色閾値（緑黄赤）は廃止し、
 //! 使用率によらずライブは白・その他アカウントはグレーの明度差のみで塗り分ける
 //! （詳細は仕様書の決定変更ログ参照）。
+//!
+//! 2026-07-31（同日中、デザイン確定版）で以下を追加調整した:
+//! - ドットの間隔を詰めるため DOT_COUNT を 20→32 に変更（ピッチ 220/32≒6.9px）
+//! - ライブアカウントの行を「ラベル行＋バー行」の2段から `IconMenuItem` 1行
+//!   （バー画像＋「5H 42%（…復活）」テキスト）に統合した
+//! - その他アカウントのドットバーを廃止し、「5h: 12%（…復活） / 週次: 8%（…復活）」の
+//!   数値・カッコ内で色を出し分けたテキスト1行に変更した。ネイティブメニューは部分色付け
+//!   ができないため、この行は CoreText（`coretext_line` サブモジュール）でオフスクリーン
+//!   描画した RGBA 画像を `IconMenuItem` の icon として渡す（macOS のみ。他 OS は色無しの
+//!   プレーンテキストにフォールバック）
 
 use std::time::Duration;
 use tauri::{
@@ -49,17 +59,16 @@ struct StatusData {
     other_accounts: Vec<OtherAccountEntry>,
 }
 
-/// メニューの情報行1つ分。ゲージ行は画像バー付きの `IconMenuItem`、それ以外は
-/// 通常のテキスト `MenuItem` として描画する（`build_menu` 側で分岐する）
+/// メニューの情報行1つ分。ゲージ行はバー画像をアイコンにした `IconMenuItem` 1行で描画し
+/// （アイコンは項目の先頭に付くため、2行分のバーの左右端が自動的に揃う）、
+/// それ以外は通常のテキスト `MenuItem` として描画する（`append_info_line` 側で分岐する）
 enum InfoLine {
     Plain(String),
     Gauge {
-        /// バー画像の左に出すラベル（例: "5h 67%（19:00 復活）"）。バー自体はもう
-        /// テキストに含めない（画像アイコンで描く）
+        /// バー画像と同じ行に出すテキスト（例: "5H 42%（14:00 復活）"）。
+        /// 2026-07-31（デザイン確定版）でラベル行とバー行の2段構成から1行に統合した
         label: String,
         pct: i64,
-        /// true なら「その他のアカウント」用のグレー配色、false ならライブ用の使用率配色
-        muted: bool,
     },
 }
 
@@ -72,32 +81,33 @@ struct OtherAccountEntry {
     usage: Option<crate::accounts::AccountUsage>,
 }
 
-/// 「その他のアカウント」1件分の使用率行。ログイン中セクションと同じ2行構成
-/// （`5h <バー> x%（リセット時刻）` / `週次 <バー> y%（リセット時刻）`）で揃える
-/// （2026-07-26 ユーザー要望: サフィックス方式では見づらいため統一した）。
-/// usage 自体が無い（キャッシュも無い）ときは縦に長くなりすぎないよう「未取得」1行
-/// （画像なし）にまとめる。
-///
-/// バーはグレー配色（`muted: true`）にして、ライブが主・その他アカウントが従という
-/// 視覚的階層をつける（2026-07-26 追加要望）
-fn usage_info_lines(usage: Option<&crate::accounts::AccountUsage>) -> Vec<InfoLine> {
-    let Some(u) = usage else { return vec![InfoLine::Plain("未取得".to_string())] };
-    let Some(five_pct) = u.five_pct else { return vec![InfoLine::Plain("未取得".to_string())] };
+/// 「その他のアカウント」1件分の使用率テキストを白/グレーの色付きセグメント列に分解する
+/// （例: `5h: 12%`＝白 → `（14:00 復活）`＝グレー → ` / `＝グレー → `週次: 8%`＝白 →
+/// `（8/2 14:00 復活）`＝グレー）。ネイティブメニューは部分色付けができないため、
+/// 呼び出し側（macOS）がこれを CoreText でオフスクリーン画像にレンダリングして
+/// `IconMenuItem` の icon に渡す。ドットバーはライブ専用にして主従の階層をつけ、
+/// サブアカウントはテキスト1行に抑えてメニューが縦に長くなりすぎないようにする
+/// （2026-07-31 デザイン確定）
+fn compact_usage_segments(usage: Option<&crate::accounts::AccountUsage>) -> Vec<(String, (u8, u8, u8))> {
+    let Some(u) = usage.filter(|u| u.five_pct.is_some()) else {
+        return vec![("未取得".to_string(), TEXT_COLOR_GRAY)];
+    };
     // リセット時刻を過ぎている想定なら実質 0% とみなす
-    let five_val = if u.five_probably_reset { 0 } else { five_pct.round() as i64 };
+    let five_val = if u.five_probably_reset { 0 } else { u.five_pct.unwrap().round() as i64 };
     let seven_val = u.seven_pct.unwrap_or(0.0).round() as i64;
     vec![
-        InfoLine::Gauge {
-            label: format!("5h {five_val}%{}", reset_suffix(u.five_reset)),
-            pct: five_val,
-            muted: true,
-        },
-        InfoLine::Gauge {
-            label: format!("週次 {seven_val}%{}", reset_suffix(u.seven_reset)),
-            pct: seven_val,
-            muted: true,
-        },
+        (format!("5h: {five_val}%"), TEXT_COLOR_WHITE),
+        (reset_suffix(u.five_reset), TEXT_COLOR_GRAY),
+        (" / ".to_string(), TEXT_COLOR_GRAY),
+        (format!("週次: {seven_val}%"), TEXT_COLOR_WHITE),
+        (reset_suffix(u.seven_reset), TEXT_COLOR_GRAY),
     ]
+}
+
+/// CoreText が使えない OS 向けのフォールバック。色は付けず全セグメントを連結した1文字列にする
+#[cfg(not(target_os = "macos"))]
+fn compact_usage_plain_text(usage: Option<&crate::accounts::AccountUsage>) -> String {
+    compact_usage_segments(usage).into_iter().map(|(text, _)| text).collect()
 }
 
 /// バー画像のピクセルサイズ。論理サイズ 110×9px 相当を Retina（@2x）で描き、
@@ -105,18 +115,23 @@ fn usage_info_lines(usage: Option<&crate::accounts::AccountUsage>) -> Vec<InfoLi
 const BAR_WIDTH_PX: u32 = 220;
 const BAR_HEIGHT_PX: u32 = 18;
 
-/// トラック（背景）色は共通の暗いグレー
+/// トラック（背景）色は暗いグレー
 const TRACK_COLOR: (u8, u8, u8) = (0x3a, 0x3a, 0x3c);
-/// 「その他のアカウント」の塗り色（ミディアムグレー。ライブとの階層を保つ）
-const OTHER_FILL_COLOR: (u8, u8, u8) = (0x8e, 0x8e, 0x93);
 
 /// ライブアカウントのドット色。2026-07-31 に色閾値（緑黄赤）を廃止し、使用率によらず
 /// 白固定にした（モノクロ化）
 const LIVE_FILL_COLOR: (u8, u8, u8) = (0xff, 0xff, 0xff);
 
+/// その他アカウント情報行の文字色。数値部分は白、カッコ内の復活時刻・区切りはグレーにして
+/// 主従を分ける（2026-07-31 デザイン確定。ネイティブメニューの部分色付けができないため
+/// CoreText 画像で実現する。`compact_usage_segments` 参照）
+const TEXT_COLOR_WHITE: (u8, u8, u8) = (0xff, 0xff, 0xff);
+const TEXT_COLOR_GRAY: (u8, u8, u8) = (0x8e, 0x8e, 0x93);
+
 /// ドット数・直径・ピッチ（@2x ピクセル単位）。ピッチは BAR_WIDTH_PX / DOT_COUNT で、
-/// 各ドットはピッチの中央に配置する
-const DOT_COUNT: u32 = 20;
+/// 各ドットはピッチの中央に配置する。2026-07-31（デザイン確定版）に 20→32 個へ増やし
+/// 間隔を詰めた（ピッチ 220/32≒6.9px、直径6pxとの隙間は約0.9px@2x）
+const DOT_COUNT: u32 = 32;
 const DOT_DIAMETER_PX: f64 = 6.0;
 
 /// pct% ぶんのドットを fill 色、残りを track 色で塗った RGBA バッファを作る
@@ -148,11 +163,106 @@ fn render_dots_pixels(pct: i64, fill: (u8, u8, u8), track: (u8, u8, u8)) -> Vec<
     buf
 }
 
-/// バー画像を組み立てる（IconMenuItem に渡す）
-fn gauge_image(pct: i64, muted: bool) -> Image<'static> {
-    let fill = if muted { OTHER_FILL_COLOR } else { LIVE_FILL_COLOR };
-    let pixels = render_dots_pixels(pct, fill, TRACK_COLOR);
+/// バー画像を組み立てる（IconMenuItem に渡す）。バーはライブアカウント専用
+fn gauge_image(pct: i64) -> Image<'static> {
+    let pixels = render_dots_pixels(pct, LIVE_FILL_COLOR, TRACK_COLOR);
     Image::new_owned(pixels, BAR_WIDTH_PX, BAR_HEIGHT_PX)
+}
+
+/// その他アカウント情報行の部分色付きテキストを CoreText でオフスクリーン描画し、
+/// `IconMenuItem` に渡せる画像にする（macOS 限定。`coretext_line` 参照）
+#[cfg(target_os = "macos")]
+fn compact_usage_image(usage: Option<&crate::accounts::AccountUsage>) -> Image<'static> {
+    let segments = compact_usage_segments(usage);
+    let refs: Vec<(&str, (u8, u8, u8))> = segments.iter().map(|(text, color)| (text.as_str(), *color)).collect();
+    let (pixels, width, height) = coretext_line::render_colored_text_pixels(&refs);
+    Image::new_owned(pixels, width, height)
+}
+
+/// 複数色のテキストランを1行の透過 RGBA 画像に描画する。ネイティブメニュー項目は
+/// 部分的な文字色指定ができないため、その他アカウントの使用率行だけ画像化して回避する
+/// （2026-07-31 デザイン確定）。日本語（週次・復活）を含むため、システム UI フォント +
+/// CTLine 描画によるフォントフォールバックに任せる
+#[cfg(target_os = "macos")]
+mod coretext_line {
+    use core_foundation::attributed_string::CFMutableAttributedString;
+    use core_foundation::base::{CFRange, TCFType};
+    use core_foundation::string::CFString;
+    use core_graphics::base::kCGImageAlphaPremultipliedLast;
+    use core_graphics::color::CGColor;
+    use core_graphics::color_space::CGColorSpace;
+    use core_graphics::context::CGContext;
+    use core_text::font::new_ui_font_for_language;
+    use core_text::line::CTLine;
+    use core_text::string_attributes::{kCTFontAttributeName, kCTForegroundColorAttributeName};
+
+    /// Apple の `CTFontUIFontType` 定義における `kCTFontUIFontSystem`。
+    /// core-text クレートはこの列挙値を公開していないため、CoreText.h の値をそのまま持つ
+    const CT_FONT_UI_TYPE_SYSTEM: u32 = 2;
+
+    /// メニュー本文と釣り合う実測フォントサイズ（論理13pt相当）。バー画像と同じ @2x で描く
+    const TEXT_LOGICAL_PT: f64 = 13.0;
+    const TEXT_SCALE: f64 = 2.0;
+
+    /// 余白を付けない実測ぴったりのサイズだと縁のアンチエイリアスが欠けることがあるため、
+    /// 四辺にわずかな余白（物理px）を足す
+    const PADDING_PX: f64 = 2.0;
+
+    /// `(テキスト, RGB色)` のセグメント列を1行に連結して CoreText で描画し、透明背景の
+    /// RGBA バッファ（straight alpha, row-major 上から下）と幅・高さ（物理px）を返す
+    pub fn render_colored_text_pixels(segments: &[(&str, (u8, u8, u8))]) -> (Vec<u8>, u32, u32) {
+        let font = new_ui_font_for_language(CT_FONT_UI_TYPE_SYSTEM, TEXT_LOGICAL_PT * TEXT_SCALE, None);
+
+        let mut attr = CFMutableAttributedString::new();
+        for (text, (r, g, b)) in segments {
+            let cf_text = CFString::new(text);
+            let start = attr.char_len();
+            attr.replace_str(&cf_text, CFRange::init(start, 0));
+            let range = CFRange::init(start, cf_text.char_len());
+            // SAFETY: CoreText の extern static を読むだけ（副作用なし）
+            attr.set_attribute(range, unsafe { kCTFontAttributeName }, &font);
+            let color = CGColor::rgb(f64::from(*r) / 255.0, f64::from(*g) / 255.0, f64::from(*b) / 255.0, 1.0);
+            attr.set_attribute(range, unsafe { kCTForegroundColorAttributeName }, &color);
+        }
+
+        let line = CTLine::new_with_attributed_string(attr.as_concrete_TypeRef() as *const _);
+        let bounds = line.get_typographic_bounds();
+
+        let width = (bounds.width.ceil() + PADDING_PX * 2.0).max(1.0) as u32;
+        let height = ((bounds.ascent + bounds.descent + bounds.leading).ceil() + PADDING_PX * 2.0).max(1.0) as u32;
+
+        let colorspace = CGColorSpace::create_device_rgb();
+        let mut ctx = CGContext::create_bitmap_context(
+            None,
+            width as usize,
+            height as usize,
+            8,
+            (width * 4) as usize,
+            &colorspace,
+            kCGImageAlphaPremultipliedLast,
+        );
+        // 透過背景に載せるテキストなので、不透明背景を前提とするサブピクセルのフォント
+        // スムージングは切る（縁に黒っぽい縁取りが出るのを防ぐ）。アンチエイリアスは残す
+        ctx.set_should_smooth_fonts(false);
+        ctx.set_should_antialias(true);
+        ctx.set_text_position(PADDING_PX, bounds.descent + PADDING_PX);
+        line.draw(&ctx);
+
+        // CGBitmapContext は premultiplied alpha で埋まるため、Image::new_owned が期待する
+        // straight alpha（render_dots_pixels と同じ規約）へ変換してから返す
+        let premultiplied = ctx.data();
+        let mut straight = Vec::with_capacity(premultiplied.len());
+        for px in premultiplied.chunks_exact(4) {
+            let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
+            if a == 0 {
+                straight.extend_from_slice(&[0, 0, 0, 0]);
+            } else {
+                let unpremul = |c: u8| (u16::from(c) * 255 / u16::from(a)).min(255) as u8;
+                straight.extend_from_slice(&[unpremul(r), unpremul(g), unpremul(b), a]);
+            }
+        }
+        (straight, width, height)
+    }
 }
 
 /// epoch 秒をローカル時刻の表示に変換する。今日中なら時刻だけ、それ以外は日付つき
@@ -244,14 +354,12 @@ fn fetch_status() -> StatusData {
             let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
             usage_lines.push(InfoLine::Gauge {
-                label: format!("5h {f}%{}", reset_suffix(u.five_reset)),
+                label: format!("5H {f}%{}", reset_suffix(u.five_reset)),
                 pct: f,
-                muted: false,
             });
             usage_lines.push(InfoLine::Gauge {
                 label: format!("週次 {s}%{}", reset_suffix(u.seven_reset)),
                 pct: s,
-                muted: false,
             });
             let header = match &live_name {
                 Some(name) => format!("ログイン中: {name}"),
@@ -274,8 +382,9 @@ fn fetch_status() -> StatusData {
     }
 }
 
-/// InfoLine 1件をメニューに追加する。ゲージ行はバー画像付きの `IconMenuItem`、
-/// それ以外は通常の `MenuItem` にする
+/// InfoLine 1件をメニューに追加する。ゲージは「ラベル行」と「バー画像だけの行」の
+/// 2段に分けて出す（同一行にアイコンとして押し込むとバーが小さく潰れて視認性が
+/// 落ちるため。2026-07-31 デザイン確定）。それ以外は通常の `MenuItem` にする
 fn append_info_line<R: Runtime>(
     app: &AppHandle<R>,
     menu: &Menu<R>,
@@ -287,12 +396,12 @@ fn append_info_line<R: Runtime>(
         InfoLine::Plain(text) => {
             menu.append(&MenuItem::with_id(app, id, text, enabled, None::<&str>)?)?;
         }
-        InfoLine::Gauge { label, pct, muted } => {
-            let item = IconMenuItemBuilder::with_id(id, label)
-                .icon(gauge_image(*pct, *muted))
+        InfoLine::Gauge { label, pct } => {
+            let bar_item = IconMenuItemBuilder::with_id(id, label)
+                .icon(gauge_image(*pct))
                 .enabled(enabled)
                 .build(app)?;
-            menu.append(&item)?;
+            menu.append(&bar_item)?;
         }
     }
     Ok(())
@@ -315,57 +424,62 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
         append_info_line(app, &menu, format!("info-usage-{i}"), line, true)?;
     }
 
-    if !data.other_accounts.is_empty() {
+    // その他のアカウントは「名前 → コンパクト1行の使用率 → 切り替え」の3行構成。
+    // ライブだけにバーを出して主従を分け、サブは縦の長さを抑える（2026-07-31 デザイン確定）
+    for a in data.other_accounts.iter() {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
         menu.append(&MenuItem::with_id(
             app,
-            "info-others-header",
-            "その他のアカウント",
+            format!("info-other-name-{}", a.name),
+            &a.display_name,
             true,
             None::<&str>,
         )?)?;
-        for (idx, a) in data.other_accounts.iter().enumerate() {
-            // 縦に長くなりすぎないバランスを取りつつ、アカウント間の境目が分かるよう
-            // 2件目以降は直前のアカウントとの間に区切り線を入れる
-            if idx > 0 {
-                menu.append(&PredefinedMenuItem::separator(app)?)?;
+        if a.has_credentials {
+            // 使用率行は enabled=false にして、名前・切り替え行より一段落とした階層に見せる。
+            // 部分色付け（白=数値、グレー=カッコ内）はネイティブメニューでは表現できないため、
+            // macOS では CoreText でレンダリングした画像を icon として渡す（2026-07-31）
+            #[cfg(target_os = "macos")]
+            {
+                let stats_item = IconMenuItemBuilder::with_id(format!("info-other-stats-{}", a.name), "")
+                    .icon(compact_usage_image(a.usage.as_ref()))
+                    .enabled(false)
+                    .build(app)?;
+                menu.append(&stats_item)?;
             }
-            if a.has_credentials {
+            #[cfg(not(target_os = "macos"))]
+            {
                 menu.append(&MenuItem::with_id(
                     app,
-                    format!("{SWITCH_ID_PREFIX}{}", a.name),
-                    format!("「{}」に切り替え", a.display_name),
-                    true,
-                    None::<&str>,
-                )?)?;
-                for (line_idx, line) in usage_info_lines(a.usage.as_ref()).into_iter().enumerate() {
-                    // ここだけ enabled=false にして macOS の自動グレー描画を使う
-                    // （グレー配色のバーと合わせて、ライブが主・その他アカウントが従という
-                    // 視覚的階層をつける。ログイン中セクションの情報行は true のまま据え置き）
-                    append_info_line(app, &menu, format!("info-other-{}-{line_idx}", a.name), &line, false)?;
-                }
-            } else {
-                // 資格情報スナップショットが無いアカウントは切り替え不可（disabled）。
-                // 使用率も取得しようがないのでゲージ行は出さない
-                menu.append(&MenuItem::with_id(
-                    app,
-                    format!("noop-{}", a.name),
-                    format!("「{}」（未取り込み）", a.display_name),
+                    format!("info-other-stats-{}", a.name),
+                    compact_usage_plain_text(a.usage.as_ref()),
                     false,
                     None::<&str>,
                 )?)?;
             }
+            menu.append(&MenuItem::with_id(
+                app,
+                format!("{SWITCH_ID_PREFIX}{}", a.name),
+                "⇄ このアカウントへ切り替え",
+                true,
+                None::<&str>,
+            )?)?;
+        } else {
+            // 資格情報スナップショットが無いアカウントは切り替え不可。
+            // 使用率も取得しようがないので案内1行だけ出す
+            menu.append(&MenuItem::with_id(
+                app,
+                format!("noop-{}", a.name),
+                "未取り込み（切り替え不可）",
+                false,
+                None::<&str>,
+            )?)?;
         }
     }
 
+    // 下部は「アプリを開く / バージョンを確認する」の2項目に絞る（2026-07-31 ユーザー指示。
+    // 手動更新は60秒の自動更新があるため廃止。終了はアプリ画面側から行う）
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "refresh",
-        "ステータス更新 ♻️",
-        true,
-        None::<&str>,
-    )?)?;
     menu.append(&MenuItem::with_id(
         app,
         "open",
@@ -376,15 +490,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
     menu.append(&MenuItem::with_id(
         app,
         "check-update",
-        "バージョン確認",
-        true,
-        None::<&str>,
-    )?)?;
-    menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItem::with_id(
-        app,
-        "quit",
-        "アプリを終了",
+        "バージョンを確認する",
         true,
         None::<&str>,
     )?)?;
@@ -505,7 +611,6 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 return;
             }
             match id {
-                "refresh" => refresh(app.clone()),
                 "check-update" => crate::updater::check(app.clone(), true),
                 "open" => {
                     if let Some(win) = app.get_webview_window("main") {
@@ -513,7 +618,6 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                         let _ = win.set_focus();
                     }
                 }
-                "quit" => app.exit(0),
                 _ => {}
             }
         });
@@ -575,15 +679,16 @@ mod tests {
 
     #[test]
     fn render_dots_pixels_half_fills_first_half_of_dots_only() {
-        // 50% は 20 個のうち先頭 10 個だけ fill、残りは track のまま
+        // 50% は DOT_COUNT 個のうち先頭半分だけ fill、残りは track のまま
         let fill = (1, 2, 3);
         let track = (9, 9, 9);
         let buf = render_dots_pixels(50, fill, track);
-        for i in 0..10 {
+        let half = DOT_COUNT / 2;
+        for i in 0..half {
             let (x, y) = dot_center(i);
             assert_eq!(pixel_at(&buf, x, y), (fill.0, fill.1, fill.2, 255));
         }
-        for i in 10..DOT_COUNT {
+        for i in half..DOT_COUNT {
             let (x, y) = dot_center(i);
             assert_eq!(pixel_at(&buf, x, y), (track.0, track.1, track.2, 255));
         }
@@ -647,5 +752,36 @@ mod tests {
         // キャッシュ自体が存在しない（five_pct が None）なら「使える値なし」として
         // 呼び出し側（fetch_status）を最後の手段（監視トークン直接照会）へ進ませる
         assert!(usage_summary_from_batch(Some(&account_usage(None))).is_none());
+    }
+
+    #[test]
+    fn compact_usage_segments_colors_numbers_white_and_parens_gray() {
+        let u = account_usage(Some(12.0));
+        let segments = compact_usage_segments(Some(&u));
+        assert_eq!(segments[0], ("5h: 12%".to_string(), TEXT_COLOR_WHITE));
+        assert_eq!(segments[1].1, TEXT_COLOR_GRAY);
+        assert_eq!(segments[2], (" / ".to_string(), TEXT_COLOR_GRAY));
+        assert_eq!(segments[3], ("週次: 12%".to_string(), TEXT_COLOR_WHITE));
+        assert_eq!(segments[4].1, TEXT_COLOR_GRAY);
+    }
+
+    #[test]
+    fn compact_usage_segments_falls_back_to_未取得_without_data() {
+        assert_eq!(compact_usage_segments(None), vec![("未取得".to_string(), TEXT_COLOR_GRAY)]);
+        assert_eq!(
+            compact_usage_segments(Some(&account_usage(None))),
+            vec![("未取得".to_string(), TEXT_COLOR_GRAY)]
+        );
+    }
+
+    // CoreText でのオフスクリーン描画は実機のフォント解決に依存するため、ここでは
+    // 「バッファ長が幅×高さ×4 と一致し、サイズが正である」ことだけを確認する煙テストに留める
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn render_colored_text_pixels_returns_buffer_matching_its_own_dimensions() {
+        let segments = [("5h: 12%", TEXT_COLOR_WHITE), ("（14:00 復活）", TEXT_COLOR_GRAY)];
+        let (buf, width, height) = coretext_line::render_colored_text_pixels(&segments);
+        assert!(width > 0 && height > 0);
+        assert_eq!(buf.len(), (width * height * 4) as usize);
     }
 }
