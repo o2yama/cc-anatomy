@@ -68,6 +68,8 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 - **未検証事項**: 実機 UI での編集→保存、IME 入力、conflict 検出 UI、未保存離脱ガードの動作確認（ビルド・型チェック・cargo check は通過済み）
 - **ドキュメントAI分析機能を実装**（macOS 限定）: エディタ右上の ✨ ボタン（「AIに分析・改善してもらう」）→ `doc_analysis.rs` が `claude -p`（sonnet, stream-json, `--permission-mode dontAsk`, `--max-turns 40`, timeout 600s）を read-only 許可リスト `Read,Glob,Grep,WebFetch(domain:code.claude.com|docs.anthropic.com)` で起動し、ファイル種別に応じた Anthropic 公式ドキュメント（memory/skills/sub-agents/settings）を実行時に WebFetch して照合した改善提案をドロワー内パネルに表示。認証は claude CLI の優先順位そのまま（= ログイン中アカウント。サブスク/API 両対応。`--bare` は OAuth を読まないため不採用）。エディタの未保存バッファを正として分析（上限10万字）。`--setting-sources user --strict-mcp-config` で cwd プロジェクトの settings/hooks/MCP を遮断。stdin 書き込みは専用スレッド（20万字級でのパイプ相互デッドロック防止）。`doc_analysis::is_running()` をアカウント切替の `ensure_app_not_busy()` に登録済み（本アプリ自身のプロセスは常時ハードブロックの不変条件を維持）。グローバルスコープ文書（rules 等）は projectDir を渡さず文書単体+公式照合モードで分析。Opus レビュー1巡（ブロッカー1+要修正4+軽微10）対応済み
 - **AI分析の未検証事項**: 実機での `claude -p` 実起動・WebFetch ドメイン許可の実効・進捗ストリーミング表示・キャンセル・分析中アカウント切替のブロック動作
+- **セッションタブ廃止**: プロジェクト選択ペインは概要ビューのみに一本化（SessionList/SessionCard 撤去。全体検索と TranscriptDrawer は残存）
+- **使用量ポップオーバーをトレイと同一表示に**: トレイの取得ロジックを `tray.rs::fetch_raw_status()` に抽出共有し、新コマンド `get_usage_overview` で同一データをフロントへ供給（数値のズレを構造的に排除）。表示はトレイの行構成・32ドットゲージ（丸め規則同一、JS/Rust 全数比較で一致確認済み）・「（HH:MM 復活）」フォーマット・他アカウント行+切替（confirm+force フロー共有）・ステータス更新を DOM で再現。`get_rate_limits`/`get_account_profile` コマンドと RateLimits/AccountProfile ベースの旧表示は撤去。expired の区別文言もトレイと同一化（旧「Claude Code を一度使うと取得できます」案内は消滅）。Opus レビュー1巡（ブロッカー1+要修正3+軽微8）対応済み。未検証: 実機でのポップオーバー表示（1行に収まるかは概算のみ）・切替フロー・accounts-updated 購読の実効
 
 ### 2026-07-25 の決定
 
