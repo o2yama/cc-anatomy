@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   api,
   accountLabel,
@@ -9,7 +9,6 @@ import {
   ProjectInfo,
   RateLimits,
   SearchHit,
-  SessionInfo,
   Transcript,
 } from "./api";
 import {
@@ -323,7 +322,6 @@ function SessionsView() {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [home, setHome] = useState<string | null>(null);
   const [selected, setSelected] = useState<TreeSelection | null>(null);
-  const [paneTab, setPaneTab] = useState<"overview" | "sessions">("overview");
   const [error, setError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -426,36 +424,15 @@ function SessionsView() {
         {selected && (
           <>
             <div className="pane-header">
-              <div className="pane-tabs">
-                <button
-                  className={paneTab === "overview" ? "active" : ""}
-                  onClick={() => setPaneTab("overview")}
-                >
-                  概要
-                </button>
-                <button
-                  className={paneTab === "sessions" ? "active" : ""}
-                  onClick={() => setPaneTab("sessions")}
-                >
-                  セッション
-                </button>
-              </div>
               <span className="pane-path">
                 {selected.path ?? selected.project}
               </span>
             </div>
-            {paneTab === "overview" ? (
-              <ProjectOverview
-                key={`${selectionKey(selected)}-${reloadKey}`}
-                project={selected.project}
-                path={selected.path}
-              />
-            ) : (
-              <SessionList
-                key={`${selectionKey(selected)}-${reloadKey}`}
-                project={selected.project}
-              />
-            )}
+            <ProjectOverview
+              key={`${selectionKey(selected)}-${reloadKey}`}
+              project={selected.project}
+              path={selected.path}
+            />
           </>
         )}
       </section>
@@ -514,109 +491,6 @@ function TaskExtractDrawer({
   );
 }
 
-function SessionList({ project }: { project: string }) {
-  const [sessions, setSessions] = useState<SessionInfo[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [openTranscript, setOpenTranscript] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[] | null>(null);
-
-  useEffect(() => {
-    setSessions(null);
-    setQuery("");
-    setHits(null);
-    api
-      .listSessions(project)
-      .then(setSessions)
-      .catch((e) => setError(String(e)));
-  }, [project]);
-
-  const runSearch = () => {
-    if (!query.trim()) {
-      setHits(null);
-      return;
-    }
-    api
-      .searchSummaries(query, project)
-      .then(setHits)
-      .catch((e) => setError(String(e)));
-  };
-
-  const withContent = useMemo(
-    () =>
-      (sessions ?? []).filter(
-        (s) => s.summaries.length > 0 || (s.user_prompt ?? "").trim() !== ""
-      ),
-    [sessions]
-  );
-
-  if (error) return <ErrorBox message={error} />;
-  if (!sessions) return <p className="muted">読み込み中…</p>;
-
-  return (
-    <div className="session-list">
-      <div className="search-bar">
-        <input
-          value={query}
-          onChange={(e) => {
-            setQuery(e.target.value);
-            if (e.target.value.trim() === "") setHits(null);
-          }}
-          onKeyDown={(e) => e.key === "Enter" && runSearch()}
-          placeholder={`${project} 内のサマリーを検索`}
-        />
-        {hits !== null && (
-          <button
-            className="clear-btn"
-            onClick={() => {
-              setQuery("");
-              setHits(null);
-            }}
-          >
-            クリア
-          </button>
-        )}
-      </div>
-      {hits !== null ? (
-        <>
-          <p className="muted">{hits.length}件ヒット</p>
-          {hits.map((h, i) => (
-            <SearchHitCard
-              key={i}
-              hit={h}
-              showProject={false}
-              onOpen={
-                h.content_session_id
-                  ? () => setOpenTranscript(h.content_session_id)
-                  : undefined
-              }
-            />
-          ))}
-        </>
-      ) : (
-        <>
-          {withContent.map((s) => (
-            <SessionCard
-              key={s.content_session_id}
-              session={s}
-              onOpen={() => setOpenTranscript(s.content_session_id)}
-            />
-          ))}
-          {withContent.length === 0 && (
-            <p className="muted">表示できるセッションがありません</p>
-          )}
-        </>
-      )}
-      {openTranscript && (
-        <TranscriptDrawer
-          sessionId={openTranscript}
-          onClose={() => setOpenTranscript(null)}
-        />
-      )}
-    </div>
-  );
-}
-
 function SearchHitCard({
   hit,
   showProject,
@@ -649,78 +523,6 @@ function SearchHitCard({
         )}
       </div>
     </article>
-  );
-}
-
-function SessionCard({
-  session,
-  onOpen,
-}: {
-  session: SessionInfo;
-  onOpen: () => void;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  const latest = session.summaries[session.summaries.length - 1];
-  const title =
-    latest?.request ?? session.user_prompt ?? "(依頼内容の記録なし)";
-
-  return (
-    <article className="session-card">
-      <div className="session-head" onClick={() => setExpanded(!expanded)}>
-        <div>
-          <p className="session-title">{title}</p>
-          <p className="session-meta">
-            {formatEpoch(session.started_at_epoch)}
-            {session.summaries.length > 1 &&
-              ` · サマリー${session.summaries.length}件`}
-          </p>
-        </div>
-        <button
-          className="open-btn"
-          onClick={(e) => {
-            e.stopPropagation();
-            onOpen();
-          }}
-        >
-          会話を開く
-        </button>
-      </div>
-      {expanded && (
-        <div className="summary-detail">
-          {session.summaries.length === 0 && (
-            <p className="muted">
-              このセッションの claude-mem サマリーはありません
-            </p>
-          )}
-          {session.summaries.map((sum, i) => (
-            <div key={i} className="summary-block">
-              <SummaryField label="依頼" value={sum.request} />
-              <SummaryField label="調査" value={sum.investigated} />
-              <SummaryField label="学び" value={sum.learned} />
-              <SummaryField label="完了" value={sum.completed} />
-              <SummaryField label="次の一手" value={sum.next_steps} />
-              <SummaryField label="編集ファイル" value={sum.files_edited} />
-            </div>
-          ))}
-        </div>
-      )}
-    </article>
-  );
-}
-
-function SummaryField({
-  label,
-  value,
-}: {
-  label: string;
-  value: string | null;
-}) {
-  if (!value || value.trim() === "") return null;
-  return (
-    <p className="summary-field">
-      <span className="field-label">{label}</span>
-      {value}
-    </p>
   );
 }
 
