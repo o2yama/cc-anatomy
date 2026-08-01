@@ -185,10 +185,19 @@ fn write_doc_impl(
         .unwrap_or("doc");
     let tmp_path = dir.join(format!(".{file_name}.tmp-{pid}-{nanos}"));
 
+    // 元ファイルの mode（0600 等）を引き継ぐ。tmp→rename 方式は既定で 0644 になり
+    // パーミッションを落としてしまうため。元ファイルが無い（新規作成扱い）場合はそのまま
+    #[cfg(unix)]
+    let original_permissions = fs::metadata(&canon).ok().map(|m| m.permissions());
+
     let write_result = (|| -> Result<(), String> {
         let mut f = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
         f.write_all(content.as_bytes()).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if let Some(perms) = &original_permissions {
+            fs::set_permissions(&tmp_path, perms.clone()).map_err(|e| e.to_string())?;
+        }
         Ok(())
     })();
     if let Err(e) = write_result {
@@ -203,12 +212,15 @@ fn write_doc_impl(
     read_doc(&canon).ok_or_else(|| format!("書き込み後の読み込みに失敗: {path}"))
 }
 
+/// ミリ秒精度の mtime。秒精度だと同一秒内の外部変更を楽観ロックが見逃すため、
+/// 保存の衝突検知はこの精度で行う（表示側の relativeTime/formatEpoch は秒・ミリ秒どちらの
+/// 桁でも自動判定するため、この単位変更に追従の必要はない）
 fn modified_epoch_of(path: &Path) -> Option<i64> {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_millis() as i64)
 }
 
 fn read_doc(path: &Path) -> Option<FileDoc> {

@@ -40,7 +40,9 @@ const ALLOWED_TOOLS: &[&str] = &[
     "WebFetch(domain:docs.anthropic.com)",
 ];
 
-/// 変更系・任意実行系は全面禁止する
+/// 変更系・任意実行系は全面禁止する。加えて、許可された Read/Glob/Grep 経由でも
+/// 秘匿情報のパスには到達できないよう明示的に拒否する
+/// （https://code.claude.com/docs/en/permissions のパスルール構文）
 const DISALLOWED_TOOLS: &[&str] = &[
     "Write",
     "Edit",
@@ -49,6 +51,11 @@ const DISALLOWED_TOOLS: &[&str] = &[
     "Bash",
     "Task",
     "WebSearch",
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.claude/.credentials.json)",
+    "Read(**/.env)",
+    "Read(**/.env.*)",
 ];
 
 /// path の種別から、提案前に必ず参照させる公式ドキュメント URL を決める
@@ -150,6 +157,11 @@ pub fn analyze_doc(
     if content.chars().count() > MAX_CONTENT_CHARS {
         return Err("ドキュメントが大きすぎるため分析できません".into());
     }
+    // accounts.rs 側のガードとの TOCTOU 対策: アカウント切替・ログイン処理が進行中は
+    // spawn しない（アカウント操作側は ensure_app_not_busy でこちらの is_running を見ている）
+    if crate::accounts::ACCOUNT_OP_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("アカウント操作中のため実行できません".into());
+    }
 
     let claude = crate::actions::resolve_claude_bin()?;
     // has_project は「呼び出し側が明示的にプロジェクトルートを渡したか」をプロンプト側の
@@ -182,6 +194,10 @@ pub fn analyze_doc(
             "--setting-sources",
             "user",
             "--strict-mcp-config",
+            // ツール面自体を絞る（--allowedTools は許可リストだが、こちらは
+            // ビルトインツール群からそもそも利用可能な集合を制限する）
+            "--tools",
+            "Read,Glob,Grep,WebFetch",
         ])
         .arg("--allowedTools")
         .args(ALLOWED_TOOLS)
@@ -391,5 +407,13 @@ pub fn cancel_doc_analysis() -> Result<(), String> {
             Ok(())
         }
         None => Err("実行中のAI分析はありません".into()),
+    }
+}
+
+/// アプリ終了時、実行中の claude 子プロセスを孤児化させないための best-effort kill。
+/// cancel_doc_analysis と異なり「実行中でなければ何もしない」だけで、失敗もエラーにしない
+pub fn kill_running() {
+    if let Some(pid) = RUNNING_PID.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
     }
 }

@@ -21,3 +21,5 @@ pub fn cancel_doc_analysis() -> Result<(), String> {
 pub fn is_running() -> bool {
     false
 }
+
+pub fn kill_running() {}

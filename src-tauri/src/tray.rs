@@ -797,7 +797,13 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                         let _ = win.set_focus();
                     }
                 }
-                "quit" => app.exit(0),
+                "quit" => {
+                    // 実行中の doc_analysis / diagnostics 子プロセスを孤児化させないため、
+                    // exit 前に best-effort で kill する
+                    crate::doc_analysis::kill_running();
+                    crate::diagnostics::kill_running();
+                    app.exit(0);
+                }
                 _ => {}
             }
         });

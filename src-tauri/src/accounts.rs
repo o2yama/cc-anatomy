@@ -81,6 +81,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::Manager;
 
@@ -817,6 +818,42 @@ fn ensure_app_not_busy() -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// アカウント操作（切替・ログイン系）が進行中かどうか。doc_analysis / diagnostics の
+/// spawn 直前チェックに使う。ensure_app_not_busy 単体だと「チェック時点では非busy」を
+/// 見るだけで、直後にアカウント操作が始まる TOCTOU が残るため、逆方向（アカウント操作側が
+/// 分析の開始をブロックする）のガードとして用意する
+pub static ACCOUNT_OP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// switch_account / start_add_account_login の全区間で保持するガード。
+/// 早期 return・`?` によるエラー経路でも Drop で必ずクリアされる
+struct AccountOpGuard;
+
+impl AccountOpGuard {
+    fn acquire() -> Result<Self, String> {
+        ensure_app_not_busy()?;
+        ACCOUNT_OP_IN_PROGRESS.store(true, Ordering::SeqCst);
+        // セットした直後にもう一度確認する。ensure_app_not_busy の判定とこのセットの間に
+        // 分析/診断が spawn されていたら、busy 状態のままアカウント操作を進めないよう戻す
+        if crate::diagnostics::is_running()
+            || crate::actions::is_agent_busy()
+            || crate::doc_analysis::is_running()
+        {
+            ACCOUNT_OP_IN_PROGRESS.store(false, Ordering::SeqCst);
+            return Err(
+                "本アプリの環境診断/タスク抽出/AI分析実行中は切り替え・追加ができません。完了してから実行してください。"
+                    .into(),
+            );
+        }
+        Ok(AccountOpGuard)
+    }
+}
+
+impl Drop for AccountOpGuard {
+    fn drop(&mut self) {
+        ACCOUNT_OP_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 起動中の Claude Code セッションが自分のトークンをライブへ書き戻すと切り替えを
@@ -1604,7 +1641,8 @@ pub fn start_add_account_login(
     force: bool,
     target_name: Option<&str>,
 ) -> Result<StartLoginOutcome, String> {
-    ensure_app_not_busy()?;
+    // switch_account と同じ理由でガードを関数全体に保持する
+    let _op_guard = AccountOpGuard::acquire()?;
     let sessions = count_running_sessions_unless_forced(force);
     if sessions > 0 {
         return Ok(StartLoginOutcome::SessionsRunning { count: sessions });
@@ -2004,7 +2042,10 @@ fn verify_swap(expected_cred: &str, expected_oauth: &serde_json::Value) -> Resul
 /// 外部セッションが1件以上あると、そのセッションが自分のトークンをライブへ書き戻して
 /// 結果を踏み潰しうる。force=false の間は `SessionsRunning` を返して確認を挟む
 pub fn switch_account(name: &str, force: bool) -> Result<SwitchOutcome, String> {
-    ensure_app_not_busy()?;
+    // 関数全体（return地点すべて）で保持し、doc_analysis/diagnostics の spawn 直前チェックと
+    // 突き合わせる。ensure_app_not_busy 単体のチェックだけでは通過直後に分析が
+    // spawn される TOCTOU が残るため
+    let _op_guard = AccountOpGuard::acquire()?;
     let sessions = count_running_sessions_unless_forced(force);
     if sessions > 0 {
         return Ok(SwitchOutcome::SessionsRunning { count: sessions });

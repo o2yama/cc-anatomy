@@ -71,7 +71,21 @@ const ALLOWED_TOOLS: &[&str] = &[
     // ホーム配下のファイルを読む以上プロンプトインジェクションの余地があり、診断用途でも不要
 ];
 
-const DISALLOWED_TOOLS: &[&str] = &["Write", "Edit", "NotebookEdit", "Task", "WebFetch", "WebSearch"];
+// Read(...) の拒否は doc_analysis.rs と同じ秘匿パス方針
+// （https://code.claude.com/docs/en/permissions のパスルール構文）
+const DISALLOWED_TOOLS: &[&str] = &[
+    "Write",
+    "Edit",
+    "NotebookEdit",
+    "Task",
+    "WebFetch",
+    "WebSearch",
+    "Read(~/.ssh/**)",
+    "Read(~/.aws/**)",
+    "Read(~/.claude/.credentials.json)",
+    "Read(**/.env)",
+    "Read(**/.env.*)",
+];
 
 fn diagnosis_prompt(home: &str) -> String {
     format!(
@@ -117,6 +131,10 @@ fn diagnosis_prompt(home: &str) -> String {
 
 /// GUI アプリのイベントループを塞がないよう、呼び出し側で #[tauri::command(async)] にする
 pub fn run_diagnosis(app: &tauri::AppHandle) -> Result<DiagnosisReport, String> {
+    // accounts.rs 側のガードとの TOCTOU 対策: アカウント切替・ログイン処理が進行中は spawn しない
+    if crate::accounts::ACCOUNT_OP_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("アカウント操作中のため実行できません".into());
+    }
     let claude = crate::actions::resolve_claude_bin()?;
     let home = crate::db::home_dir();
 
@@ -331,6 +349,14 @@ pub fn cancel_diagnosis() -> Result<(), String> {
             Ok(())
         }
         None => Err("実行中の診断はありません".into()),
+    }
+}
+
+/// アプリ終了時、実行中の claude 子プロセスを孤児化させないための best-effort kill。
+/// cancel_diagnosis と異なり「実行中でなければ何もしない」だけで、失敗もエラーにしない
+pub fn kill_running() {
+    if let Some(pid) = RUNNING_PID.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
     }
 }
 

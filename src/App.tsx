@@ -494,6 +494,28 @@ function SessionsView() {
   const [extractTarget, setExtractTarget] = useState<TreeSelection | null>(
     null
   );
+  // ProjectOverview のドロワーが未保存かどうか。サイドバー選択変更・再読み込みは
+  // このドロワーを問答無用で捨てて別プロジェクトへ移動するため、ここで確認を挟む
+  const [overviewDirty, setOverviewDirty] = useState(false);
+
+  const guardUnsaved = (message: string): boolean => {
+    if (!overviewDirty) return true;
+    return window.confirm(message);
+  };
+
+  const selectProject = (next: TreeSelection) => {
+    if (!guardUnsaved("未保存の変更があります。破棄して別のプロジェクトを開きますか？")) {
+      return;
+    }
+    setSelected(next);
+  };
+
+  const reload = () => {
+    if (!guardUnsaved("未保存の変更があります。破棄して再読み込みしますか？")) {
+      return;
+    }
+    setReloadKey((k) => k + 1);
+  };
 
   useEffect(() => {
     setLoading(true);
@@ -557,7 +579,7 @@ function SessionsView() {
           <button
             className={`icon-btn ${loading ? "spinning" : ""}`}
             title="再読み込み"
-            onClick={() => setReloadKey((k) => k + 1)}
+            onClick={reload}
           >
             <svg
               width="14"
@@ -580,7 +602,7 @@ function SessionsView() {
             collapsed={collapsed}
             setCollapsed={setCollapsed}
             selected={selected}
-            onSelect={setSelected}
+            onSelect={selectProject}
             onExtractTasks={setExtractTarget}
           />
         )}
@@ -597,6 +619,7 @@ function SessionsView() {
               key={`${selectionKey(selected)}-${reloadKey}`}
               project={selected.project}
               path={selected.path}
+              onDirtyChange={setOverviewDirty}
             />
           </>
         )}

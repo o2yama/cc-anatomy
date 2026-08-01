@@ -107,6 +107,9 @@ export function DocEditor({
   const [saveError, setSaveError] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
   const [epoch, setEpoch] = useState<number | null>(modifiedEpoch);
+  // 破棄・dirty判定の比較元。初回ロード直後の content ではなく「最後に保存が成功した本文」
+  // で更新する（保存後に「破棄」しても初回ロード状態まで巻き戻らないようにするため）
+  const [savedContent, setSavedContent] = useState(content);
 
   const [analysisPhase, setAnalysisPhase] = useState<AnalysisPhase>("idle");
   const [analysisLog, setAnalysisLog] = useState<DocAnalysisProgress[]>([]);
@@ -215,8 +218,12 @@ export function DocEditor({
     try {
       const doc = await api.writeDoc(path, value, epoch);
       setEpoch(doc.modified_epoch);
-      setDirty(false);
-      onDirtyChange?.(false);
+      setSavedContent(value);
+      // 送信後（await 中）に追加入力があった場合、現在の doc が送信した内容と
+      // 一致する場合のみ dirty を落とす。不一致なら未保存扱いを維持する
+      const stillMatchesSent = viewRef.current?.state.doc.toString() === value;
+      setDirty(!stillMatchesSent);
+      onDirtyChange?.(!stillMatchesSent);
     } catch (e) {
       const msg = String(e);
       if (msg.includes("conflict")) {
@@ -239,7 +246,7 @@ export function DocEditor({
   const discard = () => {
     if (!viewRef.current) return;
     viewRef.current.dispatch({
-      changes: { from: 0, to: viewRef.current.state.doc.length, insert: content },
+      changes: { from: 0, to: viewRef.current.state.doc.length, insert: savedContent },
     });
     setDirty(false);
     setSaveError(null);
@@ -254,6 +261,7 @@ export function DocEditor({
         changes: { from: 0, to: viewRef.current.state.doc.length, insert: doc.content },
       });
       setEpoch(doc.modified_epoch);
+      setSavedContent(doc.content);
       setConflict(false);
       setDirty(false);
       onDirtyChange?.(false);

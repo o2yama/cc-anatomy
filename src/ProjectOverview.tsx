@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   api,
   relativeTime,
@@ -50,9 +50,12 @@ function matches(query: string, ...fields: (string | null | undefined)[]): boole
 export function ProjectOverview({
   project,
   path,
+  onDirtyChange,
 }: {
   project: string;
   path: string | null;
+  /** ドロワーの未保存状態を親（サイドバー選択・再読み込みのガード）に伝える */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const [env, setEnv] = useState<ProjectEnv | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -60,6 +63,10 @@ export function ProjectOverview({
   // ドロワーで編集中（DocEditor から報告される）かどうか。閉じる／別ファイルを開く
   // 操作をガードするために使う
   const [detailDirty, setDetailDirty] = useState(false);
+  const handleDetailDirtyChange = (dirty: boolean) => {
+    setDetailDirty(dirty);
+    onDirtyChange?.(dirty);
+  };
   // ガード対象の遷移先。null は「閉じる」を意味する
   const [pendingDetail, setPendingDetail] = useState<{ next: Detail | null } | null>(
     null
@@ -72,12 +79,12 @@ export function ProjectOverview({
       return;
     }
     setDetailRaw(next);
-    setDetailDirty(false);
+    handleDetailDirtyChange(false);
   };
   const confirmDiscardAndProceed = () => {
     if (!pendingDetail) return;
     setDetailRaw(pendingDetail.next);
-    setDetailDirty(false);
+    handleDetailDirtyChange(false);
     setPendingDetail(null);
   };
   const cancelPendingSwitch = () => setPendingDetail(null);
@@ -98,7 +105,7 @@ export function ProjectOverview({
     setEnv(null);
     // プロジェクト切替は未保存変更ガードの対象外にする（トップレベルの画面遷移のため）
     setDetailRaw(null);
-    setDetailDirty(false);
+    handleDetailDirtyChange(false);
     setPendingDetail(null);
     api
       .getProjectEnv(project, path)
@@ -106,14 +113,20 @@ export function ProjectOverview({
       .catch((e) => setError(String(e)));
   }, [project, path]);
 
+  // 遅延 readDoc の競合防止用リクエスト連番。最新リクエスト以外の完了結果は
+  // 編集中のドロワーを上書きしうるため破棄する
+  const openFileSeqRef = useRef(0);
+
   const openFile = (
     title: string,
     filePath: string,
     scope: "project" | "global" = "project"
   ) => {
+    const seq = ++openFileSeqRef.current;
     api
       .readDoc(filePath)
-      .then((doc: FileDoc) =>
+      .then((doc: FileDoc) => {
+        if (seq !== openFileSeqRef.current) return;
         setDetail({
           title,
           subtitle: doc.path,
@@ -122,11 +135,12 @@ export function ProjectOverview({
           path: doc.path,
           modifiedEpoch: doc.modified_epoch,
           projectScoped: scope === "project",
-        })
-      )
-      .catch((e) =>
-        setDetail({ title, subtitle: filePath, content: String(e) })
-      );
+        });
+      })
+      .catch((e) => {
+        if (seq !== openFileSeqRef.current) return;
+        setDetail({ title, subtitle: filePath, content: String(e) });
+      });
   };
 
   if (error) return <div className="error-box">{error}</div>;
@@ -420,7 +434,7 @@ export function ProjectOverview({
           detail={detail}
           projectDir={env.path}
           onClose={() => setDetail(null)}
-          onDirtyChange={setDetailDirty}
+          onDirtyChange={handleDetailDirtyChange}
         />
       )}
       {pendingDetail && (
