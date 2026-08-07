@@ -139,3 +139,17 @@ macOS universal（Apple Silicon + Intel）と Windows（監視機能のみ）に
 |---|---|
 | `resolve_usage_source`（単一ソースを返す）を `resolve_usage_source_order`（優先順位リストを返す）に再設計。ライブアカウントは ライブOAuth →（失敗なら）監視トークン →（無ければ/失敗なら）スナップショットOAuth の順に、成功するまで1つずつ試す。トレイタイトルの `live_usage_summary()` も同じ考え方で、失敗時だけライブアカウントの監視トークン（`live_account_monitor_token`）にフォールバックする | 従来はライブなら常にライブ OAuth 一本勝負で、失敗時は他ソースを試さず直接キャッシュ（トレイは「-」）へ落ちていた。ライブトークンはスナップショット由来で、久しぶりに切り替えたアカウントほど期限切れになりやすく、リフレッシュは Claude Code 起動時にしか起きないため、「切り替えた直後なのにメニューバーの使用量が見えない」空白期間が生じていた |
 | 監視トークンでのフォールバックは、ライブ OAuth が失敗したときだけ叩く（`live_usage_summary().or_else(...)` で連鎖させ、成功時は監視トークンに一切触れない） | 監視トークン照会は実 API リクエスト（haiku 1トークン消費）で、毎分実行されるトレイの定期更新から無条件に叩くとコスト・レート消費が無視できない |
+
+## resolve_live_owner のエラー分類と wire format 契約（2026-08-08）
+
+`resolve_live_owner`（accounts.rs）は expiresAt 事前チェックを追加し、失敗を `OwnerError`
+（`TokenExpired(Option<email>)` / `NetworkError` / `Other(String)`）に分類するようにした
+（issue #1・#2 対応）。既存の Tauri コマンド境界（`Result<_, String>`）は変えず、
+`OwnerError::Display` がメッセージ先頭に `KIND:` プレフィックスを埋め込んで運ぶ。
+
+- **wire format**: `"<KIND>:<message>"`。`KIND` は `TOKEN_EXPIRED` / `NETWORK_ERROR` / `OTHER` のいずれか（`OwnerError::kind()` が唯一の発生源）
+- **消費者**（プレフィックスを剥がして本文だけ表示する）:
+  - TS（Tauri コマンド境界を越える経路）: `src/api.ts` の `describeAccountError`。`Accounts.tsx`（doSwitch/startAddLogin）・`App.tsx`（ヘッダーの切替）が使う
+  - Rust（コマンド境界を越えない経路。tray のネイティブダイアログ等）: `src-tauri/src/accounts.rs` の `strip_owner_error_tag`。`tray.rs::switch_from_tray` が使う
+- 2つの消費者は独立実装だが「既知の kind 一覧」を暗黙に共有している。`OwnerError::kind()` に kind を増減したら、`strip_owner_error_tag` の `KNOWN_KINDS` と `api.ts` の `OWNER_ERROR_PREFIXES` の両方を揃えること（自動同期の仕組みは無い）
+- `OwnerMismatch` は一度 variant として追加したが、`resolve_live_owner` が実際には送出しない（mismatched は既存の `LiveOwner.mismatched` で表現済み・NeedsImport 導線に流れる）ため YAGNI で撤去した。必要になったら kind を1つ増やす形で足す

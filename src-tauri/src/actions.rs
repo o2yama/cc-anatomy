@@ -169,15 +169,21 @@ pub enum UsageFetch {
     Error { message: String },
 }
 
-/// 期限切れ相当（401 or 応答本文の error フィールド）と、それ以外の予期しない失敗を区別する
-enum FetchOutcome {
+/// 期限切れ相当（401 or 応答本文の error フィールド）、通信不能（接続失敗・タイムアウト等）、
+/// それ以外の予期しない失敗（応答の構文エラー等）を区別する。Network を Other から分離した
+/// のは accounts::resolve_live_owner が「通信を確認して再試行」と「その他のエラー」を
+/// 別文言で案内する必要があるため（2026-08-08、issue #1/#2 対応）。fetch_live_usage_status は
+/// 従来どおり両方を同じ Error 表示にまとめるため、ここでの分離は表示側の挙動を変えない
+pub(crate) enum FetchOutcome {
     Ok(String),
     Expired,
+    Network,
     Other(String),
 }
 
-/// oauth_get_with_token と同じ理由でランタイムコンテキストの無い素の OS スレッドへ逃がす
-fn oauth_get_checked(token: &str, url: &str) -> FetchOutcome {
+/// oauth_get_with_token と同じ理由でランタイムコンテキストの無い素の OS スレッドへ逃がす。
+/// fetch_live_usage_status（使用量取得）と accounts::resolve_live_owner（持ち主確認）が共有する
+pub(crate) fn oauth_get_checked(token: &str, url: &str) -> FetchOutcome {
     let token = token.to_string();
     let url = url.to_string();
     match std::thread::spawn(move || oauth_get_checked_blocking(&token, &url)).join() {
@@ -195,7 +201,7 @@ fn oauth_get_checked_blocking(token: &str, url: &str) -> FetchOutcome {
         .send()
     {
         Ok(r) => r,
-        Err(_) => return FetchOutcome::Other("API への接続に失敗しました".to_string()),
+        Err(_) => return FetchOutcome::Network,
     };
     if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
         return FetchOutcome::Expired;
@@ -224,6 +230,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// access token の有効期限切れ判定。fetch_live_usage_status と accounts::resolve_live_owner
+/// の入口チェックが共有し、無駄な401リクエストを減らす（2026-08-08、issue #1:
+/// resolve_live_owner がこのチェックを持っていなかった）。
+/// なお accounts.rs の `token_is_still_valid`（get_accounts_usage 経由、登録済み他アカウントの
+/// スナップショット判定）は判定の向きが逆（valid か）で用途も別関数のため、ここには統合していない
+/// （今回のスコープ外）
+pub(crate) fn is_token_expired(expires_at: Option<i64>) -> bool {
+    expires_at.is_some_and(|exp| exp <= now_ms())
+}
+
 /// 事前に access token の有効期限を確認し、期限切れなら API を呼ばずに Expired を返す
 /// （無駄な401リクエストを減らす）。期限内でも 401・error フィールド応答が返れば、
 /// 事前判定をすり抜けたケースとして同じ Expired 扱いにする。refresh は一切行わない
@@ -234,12 +250,15 @@ fn fetch_live_usage_status(url: &str) -> UsageFetch {
         Ok(v) => v,
         Err(e) => return UsageFetch::Error { message: e },
     };
-    if expires_at.is_some_and(|exp| exp <= now_ms()) {
+    if is_token_expired(expires_at) {
         return UsageFetch::Expired;
     }
     match oauth_get_checked(&token, url) {
         FetchOutcome::Ok(body) => UsageFetch::Ok { body },
         FetchOutcome::Expired => UsageFetch::Expired,
+        // Network も Other も表示上は同じ「予期しない失敗」扱い（従来どおり）。
+        // メッセージは Network 分離前と同一文言を維持する
+        FetchOutcome::Network => UsageFetch::Error { message: "API への接続に失敗しました".to_string() },
         FetchOutcome::Other(message) => UsageFetch::Error { message },
     }
 }

@@ -233,6 +233,30 @@ export type MonitorSetupPoll =
   | { status: "linked" }
   | { status: "mismatch"; expected_label: string; expected_email: string };
 
+/** switch_account / start_add_account_login の事前 sync-back（持ち主確認）失敗時、
+ * Rust 側（accounts.rs の OwnerError）がメッセージ先頭へ埋め込む機械可読プレフィックス
+ * （wire format の契約は docs/dev-log.md 参照）。それ以外の（分類対象外の）エラー
+ * メッセージには付かない。Rust 側の `strip_owner_error_tag`（tray.rs 用、コマンド境界を
+ * 越えない経路向け）と対になる一覧なので、増減したら両方揃えること。
+ * YAGNI: OWNER_MISMATCH は resolve_live_owner が実際には送出しないため定義しない
+ * （2026-08-08 レビューで一度追加したが未使用のため撤去） */
+const OWNER_ERROR_PREFIXES = ["TOKEN_EXPIRED:", "NETWORK_ERROR:", "OTHER:"] as const;
+
+/** switchAccount / startAddAccountLogin の catch で受け取った失敗（unknown）を表示用文言に
+ * 変換する。回復手段の文言自体は Rust 側（OwnerError::message）が持つので、ここでは
+ * 既知のプレフィックスを剥がして本文だけを返すだけでよい（parseAlreadyRunning と同じ
+ * startsWith 方式）。プレフィックスが無い、または本文が空なら raw をそのまま返す */
+export function describeAccountError(e: unknown): string {
+  const raw = String(e);
+  for (const prefix of OWNER_ERROR_PREFIXES) {
+    if (raw.startsWith(prefix)) {
+      const message = raw.slice(prefix.length);
+      return message || raw;
+    }
+  }
+  return raw;
+}
+
 export const api = {
   listProjects: () => invoke<ProjectInfo[]>("list_projects"),
   getHomeDir: () => invoke<string>("get_home_dir"),

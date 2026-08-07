@@ -5,6 +5,7 @@ import {
   api,
   AccountUsage,
   AccountsUpdatedEvent,
+  describeAccountError,
   formatEpoch,
   OtherAccountOverview,
   ProjectInfo,
@@ -355,7 +356,7 @@ function UsagePopover() {
         );
         load();
       })
-      .catch((e) => setSwitchError(String(e)))
+      .catch((e) => setSwitchError(describeAccountError(e)))
       .finally(() => setBusy(false));
   };
 

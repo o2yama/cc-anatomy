@@ -1251,7 +1251,89 @@ enum SyncBack {
 const PROFILE_UNCONFIRMED_MSG: &str = "ライブ資格情報の持ち主を確認できませんでした。少し待って再試行するか、全セッション終了後に再試行してください";
 const LIVE_HIJACKED_WARNING: &str = "ライブのログインが実行中セッションにより巻き戻っていました。";
 
+/// 持ち主確認（resolve_live_owner）で発生しうるエラーの分類（2026-08-08、issue #2 対応）。
+/// 呼び出し元（sync_back_live_login / auto_sync_live）は既存どおり Result<_, String> で
+/// UI（Tauri コマンド境界）まで運ぶため、型を消さずに `Display`／`From<OwnerError> for String`
+/// でメッセージへ変換する。先頭の `KIND:` プレフィックス（wire format の契約は docs/dev-log.md
+/// 参照）は2つの消費者が剥がして本文だけを表示する:
+/// - TS 側（Tauri コマンド境界を越える経路）: api.ts の `describeAccountError`
+/// - Rust 側（tray.rs のダイアログ表示など、コマンド境界を越えない経路）: `strip_owner_error_tag`
+///
+/// YAGNI: 「oauthAccount と実際の持ち主がズレていた」ケース（OwnerMismatch 相当）は
+/// resolve_live_owner では発生させていない。LiveOwner.mismatched（Ok 側の結果。
+/// apply_live_owner が登録済みアカウントと一致すれば警告付き Synced、一致しなければ
+/// NeedsImport として扱う）で十分表現できており、専用の Err variant は不要と判断した
+/// （2026-08-08 レビューで一度追加したが未使用のため撤去。必要になったら足す）
+#[derive(Debug)]
+enum OwnerError {
+    /// access token の期限切れ（事前チェック、または 401・error フィールド応答での検出）。
+    /// 期限切れなのは「現在ライブにログイン中のアカウント」の token。email が取れていれば
+    /// 案内に埋め込む（identify() の結果を流用。取れなければ省略して汎用文言にする）
+    TokenExpired(Option<String>),
+    /// profile API に到達できなかった（接続失敗・タイムアウト等）
+    NetworkError,
+    /// 上記以外の予期しない失敗（応答の構文エラー・token 自体が読めない等）
+    Other(String),
+}
+
+impl OwnerError {
+    /// strip_owner_error_tag と同じ「既知の kind 一覧」を暗黙に共有する。
+    /// kind を増減したら両方を確認すること
+    fn kind(&self) -> &'static str {
+        match self {
+            OwnerError::TokenExpired(_) => "TOKEN_EXPIRED",
+            OwnerError::NetworkError => "NETWORK_ERROR",
+            OwnerError::Other(_) => "OTHER",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            // 「対象アカウントで」ではなく「現在ライブにログイン中のアカウントで」が正しい:
+            // resolve_live_owner が見ているのは切り替え先ではなく、いま PC 全体のログインを
+            // 握っているアカウントの access token（2026-08-08 レビュー指摘）
+            OwnerError::TokenExpired(Some(email)) => format!(
+                "現在 Claude Code にログイン中のアカウント（{email}）の token が期限切れです。\
+                 Claude Code を一度実行すると token が更新されます。少し待ってから再試行してください"
+            ),
+            OwnerError::TokenExpired(None) =>
+                "現在 Claude Code にログイン中のアカウントの token が期限切れです。\
+                 Claude Code を一度実行すると token が更新されます。少し待ってから再試行してください"
+                    .to_string(),
+            OwnerError::NetworkError =>
+                "profile API に接続できませんでした。ネットワーク接続を確認して再試行してください"
+                    .to_string(),
+            OwnerError::Other(msg) => msg.clone(),
+        }
+    }
+}
+
+impl std::fmt::Display for OwnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.kind(), self.message())
+    }
+}
+
+impl From<OwnerError> for String {
+    fn from(e: OwnerError) -> String {
+        e.to_string()
+    }
+}
+
+/// OwnerError の `KIND:message` からプレフィックスを剥がし本文だけを返す。
+/// Tauri コマンド境界を越えない経路（tray.rs のダイアログ表示）向け。
+/// TS 側の `describeAccountError`（api.ts）と対で、既知の kind 一覧は
+/// `OwnerError::kind()` の実装と揃えること
+pub(crate) fn strip_owner_error_tag(s: &str) -> &str {
+    const KNOWN_KINDS: [&str; 3] = ["TOKEN_EXPIRED", "NETWORK_ERROR", "OTHER"];
+    match s.split_once(':') {
+        Some((kind, rest)) if KNOWN_KINDS.contains(&kind) => rest,
+        _ => s,
+    }
+}
+
 /// oauthAccount とライブ資格情報の実際の持ち主が一致するかを解決した結果
+#[derive(Debug)]
 struct LiveOwner {
     org_id: Option<String>,
     email: Option<String>,
@@ -1261,7 +1343,9 @@ struct LiveOwner {
 }
 
 /// ライブの持ち主を解決する。ハッシュが前回記録と一致していれば「外部からの書き換えなし」と
-/// みなし oauthAccount をそのまま信じる。不一致（または前回記録が無い）なら、
+/// みなし oauthAccount をそのまま信じる。不一致（または前回記録が無い）なら、まず
+/// `expires_at` の事前チェックで期限切れを検出し（actions::fetch_live_usage_status と同じ
+/// ロジックを共有。無駄な401リクエストを避ける。2026-08-08 issue #1 対応）、期限内なら
 /// `fetch_profile`（実装は profile API 呼び出し。テストでは差し替える）で実際の持ち主を
 /// 確認してから帰属を決める。確認できなければ Err で中断する（推測で書き込まない）
 fn resolve_live_owner<F>(
@@ -1269,10 +1353,11 @@ fn resolve_live_owner<F>(
     current_hash: &str,
     oauth_account: &serde_json::Value,
     access_token: Option<&str>,
+    expires_at: Option<i64>,
     fetch_profile: F,
-) -> Result<LiveOwner, String>
+) -> Result<LiveOwner, OwnerError>
 where
-    F: FnOnce(&str) -> Result<String, String>,
+    F: FnOnce(&str) -> crate::actions::FetchOutcome,
 {
     let (org_id, email) = identify(oauth_account);
     if last_live_hash == Some(current_hash) {
@@ -1280,11 +1365,21 @@ where
     }
 
     let Some(token) = access_token else {
-        return Err(PROFILE_UNCONFIRMED_MSG.into());
+        return Err(OwnerError::Other(PROFILE_UNCONFIRMED_MSG.to_string()));
     };
-    let body = fetch_profile(token).map_err(|_| PROFILE_UNCONFIRMED_MSG.to_string())?;
+    if crate::actions::is_token_expired(expires_at) {
+        return Err(OwnerError::TokenExpired(email.clone()));
+    }
+    let body = match fetch_profile(token) {
+        crate::actions::FetchOutcome::Ok(body) => body,
+        crate::actions::FetchOutcome::Expired => return Err(OwnerError::TokenExpired(email.clone())),
+        crate::actions::FetchOutcome::Network => return Err(OwnerError::NetworkError),
+        crate::actions::FetchOutcome::Other(_) => {
+            return Err(OwnerError::Other(PROFILE_UNCONFIRMED_MSG.to_string()))
+        }
+    };
     let profile: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| PROFILE_UNCONFIRMED_MSG.to_string())?;
+        serde_json::from_str(&body).map_err(|_| OwnerError::Other(PROFILE_UNCONFIRMED_MSG.to_string()))?;
     let profile_email = profile
         .pointer("/account/email")
         .and_then(|v| v.as_str())
@@ -1380,14 +1475,18 @@ fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
             let access_token = creds
                 .pointer("/claudeAiOauth/accessToken")
                 .and_then(|v| v.as_str());
+            let expires_at = creds
+                .pointer("/claudeAiOauth/expiresAt")
+                .and_then(|v| v.as_i64());
 
             let owner = resolve_live_owner(
                 meta.last_live_hash.as_deref(),
                 &current_hash,
                 &oauth_account,
                 access_token,
+                expires_at,
                 |token| {
-                    crate::actions::oauth_get_with_token(
+                    crate::actions::oauth_get_checked(
                         token,
                         "https://api.anthropic.com/api/oauth/profile",
                     )
@@ -1497,6 +1596,7 @@ pub fn auto_sync_live() -> Result<AutoSyncResult, String> {
         return Err("現在ログイン中の資格情報を確認できませんでした。時間をおいて再試行してください".into());
     };
     let access_token = creds.pointer("/claudeAiOauth/accessToken").and_then(|v| v.as_str());
+    let expires_at = creds.pointer("/claudeAiOauth/expiresAt").and_then(|v| v.as_i64());
 
     // フェーズ2（ロック外。最大で数秒〜10秒かかりうる profile API 呼び出しはここだけ）
     let owner = resolve_live_owner(
@@ -1504,7 +1604,8 @@ pub fn auto_sync_live() -> Result<AutoSyncResult, String> {
         &current_hash,
         &oauth_account,
         access_token,
-        |token| crate::actions::oauth_get_with_token(token, "https://api.anthropic.com/api/oauth/profile"),
+        expires_at,
+        |token| crate::actions::oauth_get_checked(token, "https://api.anthropic.com/api/oauth/profile"),
     )?;
 
     // フェーズ3
@@ -2382,7 +2483,7 @@ mod tests {
     fn resolve_live_owner_trusts_oauth_account_when_hash_matches() {
         // hash が前回記録と一致＝外部からの書き換えなし。profile を呼ばずに oauthAccount を信じる
         let account = oauth("org-1", "user@example.com");
-        let owner = resolve_live_owner(Some("hash-a"), "hash-a", &account, Some("token"), |_| {
+        let owner = resolve_live_owner(Some("hash-a"), "hash-a", &account, Some("token"), None, |_| {
             panic!("hash が一致しているのに profile を呼んではいけない")
         })
         .expect("一致時は成功するはず");
@@ -2396,8 +2497,10 @@ mod tests {
         // hash 不一致（＝自動 refresh 等）でも、profile の email が oauthAccount と一致すれば
         // ズレなしとして org_id を信頼したまま進める
         let account = oauth("org-1", "user@example.com");
-        let owner = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), |_| {
-            Ok(serde_json::json!({ "account": { "email": "user@example.com" } }).to_string())
+        let owner = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), None, |_| {
+            crate::actions::FetchOutcome::Ok(
+                serde_json::json!({ "account": { "email": "user@example.com" } }).to_string(),
+            )
         })
         .expect("profile が一致すれば成功するはず");
         assert_eq!(owner.org_id.as_deref(), Some("org-1"));
@@ -2410,8 +2513,10 @@ mod tests {
         // hash 不一致で、profile の実際の持ち主が oauthAccount の記載と違う
         // ＝別アカウントのセッションが refresh でライブを巻き戻した状態
         let account = oauth("org-1", "stale@example.com");
-        let owner = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), |_| {
-            Ok(serde_json::json!({ "account": { "email": "real@example.com" } }).to_string())
+        let owner = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), None, |_| {
+            crate::actions::FetchOutcome::Ok(
+                serde_json::json!({ "account": { "email": "real@example.com" } }).to_string(),
+            )
         })
         .expect("profile が確認できれば成功扱い（内容は mismatched で示す）");
         assert!(owner.mismatched);
@@ -2421,19 +2526,53 @@ mod tests {
 
     #[test]
     fn resolve_live_owner_aborts_when_profile_unconfirmed() {
-        // hash 不一致で profile 確認も失敗（401・ネットワークエラー等）＝推測せず中断する
+        // hash 不一致で profile 確認も失敗（応答の構文エラー等）＝推測せず中断する。
+        // メッセージ分類は Other になる
         let account = oauth("org-1", "user@example.com");
-        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), |_| {
-            Err("401".to_string())
+        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), None, |_| {
+            crate::actions::FetchOutcome::Other("応答が不正".to_string())
         });
         assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), OwnerError::Other(_)));
+    }
+
+    #[test]
+    fn resolve_live_owner_classifies_expired_from_precheck() {
+        // 事前チェック（expires_at）で期限切れと分かれば、profile API を呼ばずに
+        // TokenExpired を返す（issue #1: 従来は expiresAt を見ず直接 fetch していた）
+        let account = oauth("org-1", "user@example.com");
+        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), Some(1), |_| {
+            panic!("期限切れが事前チェックで分かっているので profile を呼んではいけない")
+        });
+        assert!(matches!(result, Err(OwnerError::TokenExpired(Some(ref e))) if e == "user@example.com"));
+    }
+
+    #[test]
+    fn resolve_live_owner_classifies_expired_from_api_response() {
+        // 事前チェックをすり抜けても（expires_at 不明・またはギリギリ期限内）、
+        // profile API 応答が Expired（401・error フィールド）なら同じ分類にする
+        let account = oauth("org-1", "user@example.com");
+        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), None, |_| {
+            crate::actions::FetchOutcome::Expired
+        });
+        assert!(matches!(result, Err(OwnerError::TokenExpired(_))));
+    }
+
+    #[test]
+    fn resolve_live_owner_classifies_network_error() {
+        // 接続失敗・タイムアウト等は NetworkError に分類する
+        let account = oauth("org-1", "user@example.com");
+        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, Some("token"), None, |_| {
+            crate::actions::FetchOutcome::Network
+        });
+        assert!(matches!(result, Err(OwnerError::NetworkError)));
     }
 
     #[test]
     fn resolve_live_owner_aborts_when_no_access_token_and_hash_differs() {
         // access token 自体が読めず、かつ hash も一致しない＝確認しようがないため中断する
         let account = oauth("org-1", "user@example.com");
-        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, None, |_| {
+        let result = resolve_live_owner(Some("hash-old"), "hash-new", &account, None, None, |_| {
             panic!("token が無いので呼ばれないはず")
         });
         assert!(result.is_err());
@@ -2443,11 +2582,41 @@ mod tests {
     fn resolve_live_owner_no_baseline_requires_confirmation() {
         // last_live_hash が None（初回等）でも「未確認」と同様に profile 確認を要求する
         let account = oauth("org-1", "user@example.com");
-        let owner = resolve_live_owner(None, "hash-new", &account, Some("token"), |_| {
-            Ok(serde_json::json!({ "account": { "email": "user@example.com" } }).to_string())
+        let owner = resolve_live_owner(None, "hash-new", &account, Some("token"), None, |_| {
+            crate::actions::FetchOutcome::Ok(
+                serde_json::json!({ "account": { "email": "user@example.com" } }).to_string(),
+            )
         })
         .expect("profile が一致すれば成功するはず");
         assert!(!owner.mismatched);
+    }
+
+    #[test]
+    fn owner_error_wire_format_has_kind_prefix() {
+        // TS 側（api.ts の describeAccountError）・Rust 側（strip_owner_error_tag）の
+        // 両方がこのプレフィックスでパースするため、形式が壊れていないことをここで固定する
+        assert_eq!(OwnerError::TokenExpired(None).kind(), "TOKEN_EXPIRED");
+        assert_eq!(OwnerError::NetworkError.kind(), "NETWORK_ERROR");
+        assert!(OwnerError::TokenExpired(None).to_string().starts_with("TOKEN_EXPIRED:"));
+        assert!(OwnerError::NetworkError.to_string().starts_with("NETWORK_ERROR:"));
+    }
+
+    #[test]
+    fn strip_owner_error_tag_removes_known_kind_prefix() {
+        assert_eq!(strip_owner_error_tag("TOKEN_EXPIRED:token 期限切れです"), "token 期限切れです");
+        assert_eq!(strip_owner_error_tag("NETWORK_ERROR:接続できません"), "接続できません");
+        assert_eq!(strip_owner_error_tag("OTHER:その他の理由"), "その他の理由");
+    }
+
+    #[test]
+    fn strip_owner_error_tag_leaves_unrelated_messages_untouched() {
+        // resolve_live_owner 由来ではないエラー（他コマンドの失敗等）はプレフィックスが
+        // 無い、または既知の kind と一致しないため素通しする
+        assert_eq!(
+            strip_owner_error_tag("アカウント「foo」は登録されていません"),
+            "アカウント「foo」は登録されていません"
+        );
+        assert_eq!(strip_owner_error_tag("UNKNOWN_KIND:本文"), "UNKNOWN_KIND:本文");
     }
 
     fn cache(five_pct: f64, seven_pct: f64, five_reset: Option<i64>, fetched_at: i64) -> UsageCache {

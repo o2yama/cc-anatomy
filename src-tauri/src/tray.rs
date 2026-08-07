@@ -759,7 +759,11 @@ fn switch_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
             );
         }
         Err(e) => {
-            info_dialog(&app, "CC Anatomy", &format!("切り替えに失敗しました: {e}"));
+            // OwnerError（accounts.rs）由来なら `KIND:message` になっているため、
+            // ダイアログに機械可読タグをそのまま出さないよう剥がす。
+            // TS 側の api.ts::describeAccountError と対の処理（コマンド境界を越えない経路用）
+            let message = crate::accounts::strip_owner_error_tag(&e);
+            info_dialog(&app, "CC Anatomy", &format!("切り替えに失敗しました: {message}"));
         }
     });
 }

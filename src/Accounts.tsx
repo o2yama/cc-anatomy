@@ -18,7 +18,15 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { restrictToParentElement, restrictToVerticalAxis } from "@dnd-kit/modifiers";
-import { api, Account, AccountsState, AccountUsage, AccountsUpdatedEvent, accountLabel } from "./api";
+import {
+  api,
+  Account,
+  AccountsState,
+  AccountUsage,
+  AccountsUpdatedEvent,
+  accountLabel,
+  describeAccountError,
+} from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
   claude_max: "Max",
@@ -718,7 +726,7 @@ export function AccountsOverlay({
         if (outcome.warning) setNotice(outcome.warning);
         pollForCompletion(outcome.baseline, targetName);
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(describeAccountError(e)))
       .finally(() => setBusy(false));
   };
 
@@ -770,7 +778,7 @@ export function AccountsOverlay({
         );
         reload();
       })
-      .catch((e) => setError(String(e)))
+      .catch((e) => setError(describeAccountError(e)))
       .finally(() => setBusy(false));
   };
 
