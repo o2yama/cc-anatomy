@@ -848,8 +848,13 @@ fn info_dialog<R: Runtime>(app: &AppHandle<R>, title: &str, message: &str) {
 /// tokio ランタイムのコンテキストを持つスレッド（NSMenu イベントハンドラ）から直接呼ばず、
 /// oauth_get_with_token と同様に素の std::thread::spawn へ逃がす
 /// （reqwest::blocking をランタイムコンテキスト内で呼ぶと過去に tokio パニックを踏んでいる）
+/// trust_unverified は常に false（2026-08-08 issue #3, major-3）: 持ち主未確認のまま
+/// 続行するかどうかは影響がユーザーに見える形（確認ダイアログ）で問うべきで、確認ダイアログを
+/// 出せないトレイ導線でこれを黙って force するのは行わない。TokenExpired/NetworkError で
+/// 失敗した場合は、Err 分岐から「アプリのアカウント画面から操作してください」に倒す
+/// （アカウント画面には force で続行する導線がある）
 fn switch_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
-    std::thread::spawn(move || match crate::accounts::switch_account(&name, true) {
+    std::thread::spawn(move || match crate::accounts::switch_account(&name, true, false) {
         Ok(crate::accounts::SwitchOutcome::Switched { warning }) => {
             refresh(app.clone());
             if let Some(w) = warning {
@@ -875,9 +880,15 @@ fn switch_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
         Err(e) => {
             // OwnerError（accounts.rs）由来なら `KIND:message` になっているため、
             // ダイアログに機械可読タグをそのまま出さないよう剥がす。
-            // TS 側の api.ts::describeAccountError と対の処理（コマンド境界を越えない経路用）
+            // TS 側の api.ts::describeAccountError と対の処理（コマンド境界を越えない経路用）。
+            // 持ち主未確認（TokenExpired/NetworkError）の force 続行はここでは行わない
+            // （trust_unverified=false）ため、続行したい場合はアカウント画面へ誘導する
             let message = crate::accounts::strip_owner_error_tag(&e);
-            info_dialog(&app, "CC Anatomy", &format!("切り替えに失敗しました: {message}"));
+            info_dialog(
+                &app,
+                "CC Anatomy",
+                &format!("切り替えに失敗しました: {message}\nアプリのアカウント画面から操作してください。"),
+            );
         }
     });
 }

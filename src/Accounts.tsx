@@ -26,6 +26,8 @@ import {
   AccountsUpdatedEvent,
   accountLabel,
   describeAccountError,
+  ownerErrorKind,
+  isForceSwitchEligible,
 } from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
@@ -64,10 +66,25 @@ type PendingConfirm =
   | { kind: "login"; liveEmail: string | null; targetName?: string };
 
 /** 「起動中セッションがあるが続行するか」の確認ダイアログの対象。
- * 続行を選ぶと同じ操作を force=true で再実行する */
+ * 続行を選ぶと同じ操作を force=true で再実行する。trust はこの確認が発生した時点の
+ * trustUnverified 値を持ち回る（2026-08-08 issue #3 再レビュー: owner確認→セッション確認と
+ * 進んだ後に「続行する」を押した際、trustUnverified を落として再度 owner確認に戻る
+ * 二度手間を防ぐ） */
 type SessionsConfirm =
-  | { kind: "switch"; name: string; count: number }
-  | { kind: "login"; count: number; targetName?: string };
+  | { kind: "switch"; name: string; count: number; trust: boolean }
+  | { kind: "login"; count: number; targetName?: string; trust: boolean };
+
+/** 「持ち主を確認できない（token 期限切れ／通信不能）が続行するか」の確認ダイアログの
+ * 対象（2026-08-08 issue #3、レビュー案A）。続行を選ぶと同じ操作を trustUnverified=true で
+ * 再実行する（force はこの確認が発生した時点の値をそのまま持ち回る。force と
+ * trustUnverified は独立した同意なので、sessionsConfirm 側の「続行する」がここを
+ * 兼ねることはない）。バックエンドは sync-back の書き込みを一切行わずスキップするだけで、
+ * 別アカウントの資格情報で上書きすることはない（accounts.rs::SyncBack::SkippedUnverified 参照）。
+ * message は describeAccountError で得た原文（TokenExpired/NetworkError の回復手段説明）を
+ * そのまま持ち回る */
+type OwnerConfirm =
+  | { kind: "switch"; name: string; message: string; force: boolean }
+  | { kind: "login"; message: string; targetName?: string; force: boolean };
 
 /** 使用率の1行分のテキスト（例: "5h 9% ・ 週 52%"）。リセット時刻を過ぎている想定なら
  * 「5h リセット済み」に置き換える。値が無ければ null（呼び出し側は行ごと出さない） */
@@ -368,6 +385,7 @@ export function AccountsOverlay({
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
   const [sessionsConfirm, setSessionsConfirm] = useState<SessionsConfirm | null>(null);
+  const [ownerConfirm, setOwnerConfirm] = useState<OwnerConfirm | null>(null);
   // ダイアログを開くたびにチェックを外した状態に戻す（前回のチェックを引き継がない）
   const [skipFutureChecked, setSkipFutureChecked] = useState(false);
 
@@ -701,32 +719,45 @@ export function AccountsOverlay({
   };
 
   /** targetName 省略時は「＋アカウントを追加」の汎用フロー、指定時は登録済みカードの
-   * 「再ログイン」導線（ログイン結果の組織IDが targetName と一致しなければ取り込まない） */
-  const startAddLogin = (targetName?: string, force = false): Promise<void> => {
+   * 「再ログイン」導線（ログイン結果の組織IDが targetName と一致しなければ取り込まない）。
+   * force（セッション確認スキップ）と trustUnverified（持ち主未確認でも続行、issue #3）は
+   * 独立した引数（major-2） */
+  const startAddLogin = (targetName?: string, force = false, trustUnverified = false): Promise<void> => {
     setError(null);
     setNotice(null);
     setBusy(true);
     stopLoginPolling();
     return api
-      .startAddAccountLogin(force, targetName)
+      .startAddAccountLogin(force, trustUnverified, targetName)
       .then((outcome) => {
         if (outcome.status === "needs_import") {
           setPendingConfirm({ kind: "login", liveEmail: outcome.live_email, targetName });
           return;
         }
         if (outcome.status === "sessions_running") {
-          // 「今後表示しない」が有効なら確認を出さず自動で force=true 再試行する
+          // 「今後表示しない」が有効なら確認を出さず自動で force=true 再試行する。
+          // trustUnverified はここでは変えない（セッション確認の同意が持ち主未確認への
+          // 同意を兼ねてはいけない）
           if (skipSessionsConfirmEnabled()) {
-            return startAddLogin(targetName, true);
+            return startAddLogin(targetName, true, trustUnverified);
           }
-          setSessionsConfirm({ kind: "login", count: outcome.count, targetName });
+          setSessionsConfirm({ kind: "login", count: outcome.count, targetName, trust: trustUnverified });
           return;
         }
         setSessionsConfirm(null);
         if (outcome.warning) setNotice(outcome.warning);
         pollForCompletion(outcome.baseline, targetName);
       })
-      .catch((e) => setError(describeAccountError(e)))
+      .catch((e) => {
+        // issue #3: 持ち主未確認（token 期限切れ／通信不能）は続行を選べる。
+        // すでに trustUnverified=true で失敗しているときは再提案しない
+        // （Other 等、trustUnverified でも解消しない別要因）
+        if (!trustUnverified && isForceSwitchEligible(ownerErrorKind(e))) {
+          setOwnerConfirm({ kind: "login", message: describeAccountError(e), targetName, force });
+          return;
+        }
+        setError(describeAccountError(e));
+      })
       .finally(() => setBusy(false));
   };
 
@@ -751,23 +782,27 @@ export function AccountsOverlay({
       .finally(() => setBusy(false));
   };
 
-  const doSwitch = (name: string, force = false): Promise<void> => {
+  /** force（セッション確認スキップ）と trustUnverified（持ち主未確認でも続行、issue #3）は
+   * 独立した引数（major-2） */
+  const doSwitch = (name: string, force = false, trustUnverified = false): Promise<void> => {
     setError(null);
     setNotice(null);
     setBusy(true);
     return api
-      .switchAccount(name, force)
+      .switchAccount(name, force, trustUnverified)
       .then((outcome) => {
         if (outcome.status === "needs_import") {
           setPendingConfirm({ kind: "switch", name, liveEmail: outcome.live_email });
           return;
         }
         if (outcome.status === "sessions_running") {
-          // 「今後表示しない」が有効なら確認を出さず自動で force=true 再試行する
+          // 「今後表示しない」が有効なら確認を出さず自動で force=true 再試行する。
+          // trustUnverified はここでは変えない（セッション確認の同意が持ち主未確認への
+          // 同意を兼ねてはいけない）
           if (skipSessionsConfirmEnabled()) {
-            return doSwitch(name, true);
+            return doSwitch(name, true, trustUnverified);
           }
-          setSessionsConfirm({ kind: "switch", name, count: outcome.count });
+          setSessionsConfirm({ kind: "switch", name, count: outcome.count, trust: trustUnverified });
           return;
         }
         setPendingConfirm(null);
@@ -778,7 +813,16 @@ export function AccountsOverlay({
         );
         reload();
       })
-      .catch((e) => setError(describeAccountError(e)))
+      .catch((e) => {
+        // issue #3: 持ち主未確認（token 期限切れ／通信不能）は続行を選べる。
+        // すでに trustUnverified=true で失敗しているときは再提案しない
+        // （Other 等、trustUnverified でも解消しない別要因）
+        if (!trustUnverified && isForceSwitchEligible(ownerErrorKind(e))) {
+          setOwnerConfirm({ kind: "switch", name, message: describeAccountError(e), force });
+          return;
+        }
+        setError(describeAccountError(e));
+      })
       .finally(() => setBusy(false));
   };
 
@@ -808,10 +852,26 @@ export function AccountsOverlay({
     }
     setSessionsConfirm(null);
     setSkipFutureChecked(false);
+    // confirm.trust を引き継ぐ（issue #3 再レビュー: owner確認→セッション確認と進んだ場合、
+    // ここで trust を落とすと再度 owner確認に戻ってしまう二度手間になる）
     if (confirm.kind === "switch") {
-      doSwitch(confirm.name, true);
+      doSwitch(confirm.name, true, confirm.trust);
     } else {
-      startAddLogin(confirm.targetName, true);
+      startAddLogin(confirm.targetName, true, confirm.trust);
+    }
+  };
+
+  /** issue #3: 「持ち主を確認できないが続行する」を選んだら trustUnverified=true で
+   * 再実行する。force はこの確認が発生した時点の値をそのまま持ち回る（major-2:
+   * セッション確認への同意が持ち主未確認への同意を兼ねてはいけないため、force は変えない） */
+  const confirmOwnerAndContinue = () => {
+    if (!ownerConfirm) return;
+    const confirm = ownerConfirm;
+    setOwnerConfirm(null);
+    if (confirm.kind === "switch") {
+      doSwitch(confirm.name, confirm.force, true);
+    } else {
+      startAddLogin(confirm.targetName, confirm.force, true);
     }
   };
 
@@ -876,7 +936,12 @@ export function AccountsOverlay({
   };
   // 名前編集中・busy中・確認ダイアログ表示中はドラッグ操作を無効にする
   const dragDisabled =
-    switchBusy || busy || editingName !== null || pendingConfirm !== null || sessionsConfirm !== null;
+    switchBusy ||
+    busy ||
+    editingName !== null ||
+    pendingConfirm !== null ||
+    sessionsConfirm !== null ||
+    ownerConfirm !== null;
   const activeDragAccount = displayAccounts.find((a) => a.name === activeDragName) ?? null;
 
   return (
@@ -1019,13 +1084,14 @@ export function AccountsOverlay({
 
         </div>
 
-        {(pendingConfirm || sessionsConfirm) && (
+        {(pendingConfirm || sessionsConfirm || ownerConfirm) && (
           <div
             className="acct-modal-overlay"
             onClick={(e) => {
               e.stopPropagation();
               setPendingConfirm(null);
               setSessionsConfirm(null);
+              setOwnerConfirm(null);
               setSkipFutureChecked(false);
             }}
           >
@@ -1089,6 +1155,30 @@ export function AccountsOverlay({
                       className="acct-btn acct-btn-primary"
                       disabled={busy}
                       onClick={confirmSessionsAndContinue}
+                    >
+                      続行する
+                    </button>
+                  </div>
+                </>
+              ) : ownerConfirm ? (
+                <>
+                  <strong>
+                    {ownerConfirm.kind === "switch"
+                      ? `「${labelFor(ownerConfirm.name)}」に切り替えます`
+                      : "ブラウザでログインします"}
+                  </strong>
+                  <p className="muted">
+                    持ち主を確認できませんが切り替えは可能です。直前のセッションのログイン情報は今回同期されません。元のアカウントに戻す際、再ログインが必要になる場合があります。続行しますか？
+                  </p>
+                  <p className="muted acct-owner-confirm-detail">{ownerConfirm.message}</p>
+                  <div className="acct-modal-actions">
+                    <button className="acct-btn acct-btn-ghost" onClick={() => setOwnerConfirm(null)}>
+                      やめる
+                    </button>
+                    <button
+                      className="acct-btn acct-btn-primary"
+                      disabled={busy}
+                      onClick={confirmOwnerAndContinue}
                     >
                       続行する
                     </button>

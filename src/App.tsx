@@ -7,7 +7,9 @@ import {
   AccountsUpdatedEvent,
   describeAccountError,
   formatEpoch,
+  isForceSwitchEligible,
   OtherAccountOverview,
+  ownerErrorKind,
   ProjectInfo,
   SearchHit,
   Transcript,
@@ -274,6 +276,46 @@ function SessionsConfirmModal({
   );
 }
 
+/** 「持ち主を確認できないが続行するか」の確認（issue #3、レビュー案A）。続行すると
+ * sync-back を書き込まずスキップするだけ（trustUnverified=true。Rust 側の
+ * SyncBack::SkippedUnverified 参照）で、別アカウントの資格情報を上書きすることはない。
+ * Accounts.tsx の ownerConfirm と同じ文言。SessionsConfirmModal と同様に body 直下へ
+ * createPortal する */
+function OwnerConfirmModal({
+  name,
+  message,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  name: string;
+  message: string;
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return createPortal(
+    <div className="acct-modal-overlay usage-sessions-modal-overlay" onClick={onCancel}>
+      <div className="acct-modal-card" onClick={(e) => e.stopPropagation()}>
+        <strong>「{name}」に切り替えます</strong>
+        <p className="muted">
+          持ち主を確認できませんが切り替えは可能です。直前のセッションのログイン情報は今回同期されません。元のアカウントに戻す際、再ログインが必要になる場合があります。続行しますか？
+        </p>
+        <p className="muted acct-owner-confirm-detail">{message}</p>
+        <div className="acct-modal-actions">
+          <button className="acct-btn acct-btn-ghost" onClick={onCancel}>
+            やめる
+          </button>
+          <button className="acct-btn acct-btn-primary" disabled={busy} onClick={onConfirm}>
+            続行する
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 /** メニューバートレイパネルと同一の表示内容・数値・フォーマットを再現する使用量ポップオーバー
  * （2026-07-31 UsageCard/UsageCardView ベースの独自表示から作り替え）。
  * データは get_usage_overview（tray::fetch_raw_status 共有）から取得するため、
@@ -286,8 +328,15 @@ function UsagePopover() {
   // 切り替え失敗は取得エラー（error、全置換）とは別枠で目立たせる（M-2）
   const [switchError, setSwitchError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // trust はこの確認が発生した時点の trustUnverified 値を持ち回る（issue #3 再レビュー:
+  // owner確認→セッション確認と進んだ後の「続行する」で trust を落とさないため）
   const [sessionsConfirm, setSessionsConfirm] = useState<
-    { name: string; label: string; count: number } | null
+    { name: string; label: string; count: number; trust: boolean } | null
+  >(null);
+  // issue #3: 持ち主未確認（token 期限切れ／通信不能）で続行を選べる確認。
+  // force はこの確認が発生した時点の値を持ち回る（force と trustUnverified は独立、major-2）
+  const [ownerConfirm, setOwnerConfirm] = useState<
+    { name: string; label: string; message: string; force: boolean } | null
   >(null);
 
   const load = useCallback(() => {
@@ -308,6 +357,7 @@ function UsagePopover() {
       if (e.key === "Escape") {
         setOpen(false);
         setSessionsConfirm(null);
+        setOwnerConfirm(null);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -327,13 +377,15 @@ function UsagePopover() {
   }, [open, load]);
 
   /** トレイの switch_from_tray と同じ確認フロー（needs_import は案内のみ、
-   * sessions_running は確認モーダル＋「今後表示しない」設定を踏襲） */
-  const doSwitch = (name: string, force = false): Promise<void> => {
+   * sessions_running は確認モーダル＋「今後表示しない」設定を踏襲）。
+   * force（セッション確認スキップ）と trustUnverified（持ち主未確認でも続行、issue #3）は
+   * 独立した引数（major-2） */
+  const doSwitch = (name: string, force = false, trustUnverified = false): Promise<void> => {
     setNotice(null);
     setSwitchError(null);
     setBusy(true);
     return api
-      .switchAccount(name, force)
+      .switchAccount(name, force, trustUnverified)
       .then((outcome) => {
         if (outcome.status === "needs_import") {
           setNotice(
@@ -342,11 +394,13 @@ function UsagePopover() {
           return;
         }
         if (outcome.status === "sessions_running") {
+          // trustUnverified はここでは変えない（セッション確認の同意が持ち主未確認への
+          // 同意を兼ねてはいけない）
           if (skipSessionsConfirmEnabled()) {
-            return doSwitch(name, true);
+            return doSwitch(name, true, trustUnverified);
           }
           const label = overview?.others.find((a) => a.name === name)?.display_name ?? name;
-          setSessionsConfirm({ name, label, count: outcome.count });
+          setSessionsConfirm({ name, label, count: outcome.count, trust: trustUnverified });
           return;
         }
         setSessionsConfirm(null);
@@ -356,8 +410,26 @@ function UsagePopover() {
         );
         load();
       })
-      .catch((e) => setSwitchError(describeAccountError(e)))
+      .catch((e) => {
+        // issue #3: 持ち主未確認（token 期限切れ／通信不能）は続行を選べる。
+        // すでに trustUnverified=true で失敗しているときは再提案しない
+        // （Other 等、trustUnverified でも解消しない別要因）
+        if (!trustUnverified && isForceSwitchEligible(ownerErrorKind(e))) {
+          const label = overview?.others.find((a) => a.name === name)?.display_name ?? name;
+          setOwnerConfirm({ name, label, message: describeAccountError(e), force });
+          return;
+        }
+        setSwitchError(describeAccountError(e));
+      })
       .finally(() => setBusy(false));
+  };
+
+  /** issue #3: force はこの確認が発生した時点の値をそのまま持ち回る（major-2） */
+  const confirmOwnerAndContinue = () => {
+    if (!ownerConfirm) return;
+    const target = ownerConfirm;
+    setOwnerConfirm(null);
+    doSwitch(target.name, target.force, true);
   };
 
   const confirmSessionsAndContinue = (skipFuture: boolean) => {
@@ -365,7 +437,9 @@ function UsagePopover() {
     if (skipFuture) localStorage.setItem(SKIP_SESSIONS_CONFIRM_KEY, "1");
     const target = sessionsConfirm;
     setSessionsConfirm(null);
-    doSwitch(target.name, true);
+    // target.trust を引き継ぐ（issue #3 再レビュー: owner確認→セッション確認と進んだ場合、
+    // ここで trust を落とすと再度 owner確認に戻ってしまう二度手間になる）
+    doSwitch(target.name, true, target.trust);
   };
 
   // tray.rs の live_header と同じ規則：使用量取得が失敗（live_error）した場合は
@@ -384,6 +458,7 @@ function UsagePopover() {
         onClick={() => {
           setOpen((v) => !v);
           setSessionsConfirm(null);
+          setOwnerConfirm(null);
         }}
       >
         <svg
@@ -409,6 +484,7 @@ function UsagePopover() {
             onMouseDown={() => {
               setOpen(false);
               setSessionsConfirm(null);
+              setOwnerConfirm(null);
             }}
           />
           <div className="usage-popover">
@@ -477,6 +553,15 @@ function UsagePopover() {
               busy={busy}
               onCancel={() => setSessionsConfirm(null)}
               onConfirm={confirmSessionsAndContinue}
+            />
+          )}
+          {ownerConfirm && (
+            <OwnerConfirmModal
+              name={ownerConfirm.label}
+              message={ownerConfirm.message}
+              busy={busy}
+              onCancel={() => setOwnerConfirm(null)}
+              onConfirm={confirmOwnerAndContinue}
             />
           )}
         </>

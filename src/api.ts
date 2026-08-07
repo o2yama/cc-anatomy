@@ -241,6 +241,23 @@ export type MonitorSetupPoll =
  * YAGNI: OWNER_MISMATCH は resolve_live_owner が実際には送出しないため定義しない
  * （2026-08-08 レビューで一度追加したが未使用のため撤去） */
 const OWNER_ERROR_PREFIXES = ["TOKEN_EXPIRED:", "NETWORK_ERROR:", "OTHER:"] as const;
+export type OwnerErrorKind = "TOKEN_EXPIRED" | "NETWORK_ERROR" | "OTHER";
+
+/** catch で受け取った失敗（unknown）が OwnerError 由来ならその種別を返す（分類できない
+ * エラーは null）。「持ち主未確認でも続行を選べる導線を出してよいか」の判定に使う
+ * （2026-08-08 issue #3、レビュー案A: TokenExpired/NetworkError は「今は確認できないだけ」で
+ * 続行時は sync-back を書き込まずスキップするだけなので安全
+ * [accounts.rs::SyncBack::SkippedUnverified 参照]。Other は応答の構文エラー等、
+ * 真に予期しない失敗のため対象外） */
+export function ownerErrorKind(e: unknown): OwnerErrorKind | null {
+  const raw = String(e);
+  for (const prefix of OWNER_ERROR_PREFIXES) {
+    if (raw.startsWith(prefix)) {
+      return prefix.slice(0, -1) as OwnerErrorKind;
+    }
+  }
+  return null;
+}
 
 /** switchAccount / startAddAccountLogin の catch で受け取った失敗（unknown）を表示用文言に
  * 変換する。回復手段の文言自体は Rust 側（OwnerError::message）が持つので、ここでは
@@ -256,6 +273,12 @@ export function describeAccountError(e: unknown): string {
   }
   return raw;
 }
+
+/** ownerErrorKind が TOKEN_EXPIRED/NETWORK_ERROR のとき、「持ち主を確認できませんが
+ * 切り替え自体は可能です」の force 続行導線を出してよいか（issue #3 スコープ）。
+ * OTHER・null（分類対象外のエラー）は対象外 */
+export const isForceSwitchEligible = (kind: OwnerErrorKind | null): boolean =>
+  kind === "TOKEN_EXPIRED" || kind === "NETWORK_ERROR";
 
 export const api = {
   listProjects: () => invoke<ProjectInfo[]>("list_projects"),
@@ -297,13 +320,22 @@ export const api = {
   importLiveAccount: () => invoke<Account>("import_live_account"),
   /** target が指定された場合は登録済みカードの「再ログイン」導線。ログイン結果の組織IDが
    * target と一致しなければ取り込まず mismatch を返す（誤紐づけ防止）。省略時は従来どおり
-   * 「＋アカウントを追加」の汎用フロー（対象を問わず取り込む） */
-  startAddAccountLogin: (force = false, targetName?: string) =>
-    invoke<StartLoginOutcome>("start_add_account_login", { force, targetName: targetName ?? null }),
+   * 「＋アカウントを追加」の汎用フロー（対象を問わず取り込む）。
+   * `force`（外部セッション確認スキップ）と `trustUnverified`（2026-08-08 issue #3:
+   * 持ち主未確認でも sync-back をスキップして続行する同意）は独立した引数。
+   * セッション確認への同意（force）が持ち主未確認への同意を兼ねてはいけないため、
+   * 呼び出し側で混同しないこと（Accounts.tsx/App.tsx の sessionsConfirm/ownerConfirm 参照） */
+  startAddAccountLogin: (force = false, trustUnverified = false, targetName?: string) =>
+    invoke<StartLoginOutcome>("start_add_account_login", {
+      force,
+      trustUnverified,
+      targetName: targetName ?? null,
+    }),
   pollAddAccountLogin: (baseline: string) =>
     invoke<PollResult>("poll_add_account_login", { baseline }),
-  switchAccount: (name: string, force = false) =>
-    invoke<SwitchOutcome>("switch_account", { name, force }),
+  /** force/trustUnverified の意味は startAddAccountLogin と同じ（独立した引数） */
+  switchAccount: (name: string, force = false, trustUnverified = false) =>
+    invoke<SwitchOutcome>("switch_account", { name, force, trustUnverified }),
   removeAccount: (name: string) => invoke<void>("remove_account", { name }),
   renameAccount: (name: string, displayName: string) =>
     invoke<void>("rename_account", { name, displayName }),

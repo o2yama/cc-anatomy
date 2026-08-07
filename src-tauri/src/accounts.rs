@@ -1246,10 +1246,33 @@ enum SyncBack {
     Synced { warning: Option<String> },
     NoLiveLogin,
     Unregistered(Option<String>),
+    /// 持ち主未確認（TokenExpired/NetworkError）のまま `trust_unverified=true` で続行した
+    /// （2026-08-08 issue #3、レビュー案A）。**keychain_write も meta（org_id/email/
+    /// oauth_account/last_live_hash）の更新も一切行わない**（sync-back を丸ごとスキップする）。
+    /// 呼び出し側は切替処理自体は続行してよいが、警告を出すこと。
+    ///
+    /// なぜ「未確認のまま信じて書き込む」を選ばなかったか: 一度そのように実装したが
+    /// レビューで却下された。last_live_hash（`Meta.last_live_hash` の doc 参照）が
+    /// 「Keychain=旧アカウントの新トークン／oauthAccount=切り替え先」という過渡的な不整合の
+    /// 状態で TokenExpired/NetworkError が起きると、誤った持ち主のまま登録済みアカウントの
+    /// スナップショットを上書きし、かつ last_live_hash を「確認済み」として更新してしまう。
+    /// 次サイクルの auto_sync_live（trust なし）はハッシュ一致で早期returnするため、
+    /// 一度誤帰属すると二度と自己修復しない不可逆な破壊になる。書き込みを一切行わなければ
+    /// last_live_hash は古いまま残り、次の sync-back（trust なしの手動再試行や
+    /// auto_sync_live）が普通に再検証してくれる
+    SkippedUnverified,
 }
 
 const PROFILE_UNCONFIRMED_MSG: &str = "ライブ資格情報の持ち主を確認できませんでした。少し待って再試行するか、全セッション終了後に再試行してください";
 const LIVE_HIJACKED_WARNING: &str = "ライブのログインが実行中セッションにより巻き戻っていました。";
+/// SyncBack::SkippedUnverified のとき、切替成功の warning としてそのまま notice に使われる
+/// 文言（issue #3。フロント側は `outcome.warning` をそのまま表示するため、ここに成功文言
+/// 込みのフルセンテンスを持つ）。UI の「続行する」直前に見せる確認文言（Accounts.tsx/App.tsx の
+/// 説明テキスト）とは別物: あちらは「これから起きること」の予告、こちらは
+/// 「実際に何が起きた／起きなかったか」の事後報告。「元のアカウントに戻す際、再ログインが
+/// 必要になる場合があります」は、sync-back をスキップしたことで直前アカウントの最新資格情報
+/// （snapshot 未更新）が失われるコストを明示する（2026-08-08 レビュー追記）
+const UNVERIFIED_OWNER_SKIPPED_WARNING: &str = "切り替えました。ただし直前のアカウントの最新ログイン情報は同期されていません（持ち主未確認のため）。元のアカウントに戻す際、再ログインが必要になる場合があります。";
 
 /// 持ち主確認（resolve_live_owner）で発生しうるエラーの分類（2026-08-08、issue #2 対応）。
 /// 呼び出し元（sync_back_live_login / auto_sync_live）は既存どおり Result<_, String> で
@@ -1347,7 +1370,17 @@ struct LiveOwner {
 /// `expires_at` の事前チェックで期限切れを検出し（actions::fetch_live_usage_status と同じ
 /// ロジックを共有。無駄な401リクエストを避ける。2026-08-08 issue #1 対応）、期限内なら
 /// `fetch_profile`（実装は profile API 呼び出し。テストでは差し替える）で実際の持ち主を
-/// 確認してから帰属を決める。確認できなければ Err で中断する（推測で書き込まない）
+/// 確認してから帰属を決める。確認できなければ Err で中断する（推測で書き込まない）。
+///
+/// force による「確認できなくても続行する」導線（issue #3）は、ここでは一切扱わない。
+/// 一度は trust-fallback（oauthAccount を未確認のまま信じて書き込む）として実装したが
+/// レビューで却下された: last_live_hash（`Meta.last_live_hash` の doc 参照）が
+/// 「Keychain=旧アカウントの新トークン／oauthAccount=切り替え先」という過渡的な不整合の
+/// 状態で TokenExpired/NetworkError が起きると、誤った持ち主のまま登録済みアカウントの
+/// スナップショットを上書きし、かつ last_live_hash を更新してしまう。次サイクルの
+/// auto_sync_live はハッシュ一致で「確認済み」と判断してしまうため、一度誤帰属すると
+/// 二度と自己修復しない不可逆な破壊になる。安全な代替は sync_back_live_login 側で
+/// 「書き込まずスキップする」（`SyncBack::SkippedUnverified`）
 fn resolve_live_owner<F>(
     last_live_hash: Option<&str>,
     current_hash: &str,
@@ -1454,11 +1487,33 @@ fn apply_live_owner(
     }
 }
 
+/// resolve_live_owner の Err を受けて sync-back をスキップしてよいか（＝書き込まず切替続行を
+/// 許可してよいか）の純粋判定（テスト容易性のため I/O から分離。2026-08-08 issue #3
+/// レビュー案A）。trust_unverified かつ「今は確認できないだけ」（TokenExpired/NetworkError）の
+/// ときだけ許可する。Other（応答の構文エラー等、真に予期しない失敗）・missing-token は
+/// trust_unverified でも許可しない（不整合の疑いが残るため）
+fn should_skip_unverified_sync_back(err: &OwnerError, trust_unverified: bool) -> bool {
+    trust_unverified && matches!(err, OwnerError::TokenExpired(_) | OwnerError::NetworkError)
+}
+
 /// sync-back 本体。switch_account / start_add_account_login の「事前 sync-back」から呼ばれる
 /// （呼び出し側がロックを保持したまま呼ぶ、ユーザー操作に伴う短時間の処理という位置づけ。
 /// profile API 呼び出しを含めロック内で完結させる方針は今回変更しない。ロック外に出したのは
-/// 60秒ごとに無人で走る auto_sync_live のみ。2026-07-26 レビュー M-B3 のスコープ）
-fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
+/// 60秒ごとに無人で走る auto_sync_live のみ。2026-07-26 レビュー M-B3 のスコープ）。
+///
+/// `trust_unverified` は `force`（外部セッション確認のスキップ）とは独立した引数
+/// （2026-08-08 issue #3、major-2: レビュー指摘によりフラグを分離。セッション確認への同意が
+/// 持ち主未確認への同意を兼ねてはいけない）。呼び出し元（switch_account/
+/// start_add_account_login）の同名引数をそのまま渡す。true のとき、持ち主確認（profile API）が
+/// TokenExpired/NetworkError で失敗しても `sync_back_live_login` 全体は中断せず、
+/// `SyncBack::SkippedUnverified` を返して切替処理自体は続行させる（keychain_write も
+/// meta の更新も一切行わない。レビュー案A。SyncBack::SkippedUnverified の doc 参照）。
+/// missing-token・Other（真に予期しない失敗）は trust_unverified でも中断したままにする
+/// （resolve_live_owner が返す OwnerError の種類で判定）。
+/// NeedsImport（未登録ライブの取り込み確認）は trust_unverified の影響を受けない
+/// （resolve_live_owner が Err を返す限り apply_live_owner 自体を呼ばないため、
+/// find_match_idx によるガードを迂回しようがない）
+fn sync_back_live_login(meta: &mut Meta, trust_unverified: bool) -> Result<SyncBack, String> {
     if meta.inconsistent {
         return Err(
             "直前の切り替えが中途半端な状態のままです。「取り込む」または「再ログイン」で解消してから実行してください"
@@ -1491,7 +1546,14 @@ fn sync_back_live_login(meta: &mut Meta) -> Result<SyncBack, String> {
                         "https://api.anthropic.com/api/oauth/profile",
                     )
                 },
-            )?;
+            );
+            let owner = match owner {
+                Ok(owner) => owner,
+                Err(e) if should_skip_unverified_sync_back(&e, trust_unverified) => {
+                    return Ok(SyncBack::SkippedUnverified);
+                }
+                Err(e) => return Err(e.into()),
+            };
 
             apply_live_owner(meta, &owner, oauth_account, &creds_str, &current_hash)
         }
@@ -1598,7 +1660,9 @@ pub fn auto_sync_live() -> Result<AutoSyncResult, String> {
     let access_token = creds.pointer("/claudeAiOauth/accessToken").and_then(|v| v.as_str());
     let expires_at = creds.pointer("/claudeAiOauth/expiresAt").and_then(|v| v.as_i64());
 
-    // フェーズ2（ロック外。最大で数秒〜10秒かかりうる profile API 呼び出しはここだけ）
+    // フェーズ2（ロック外。最大で数秒〜10秒かかりうる profile API 呼び出しはここだけ）。
+    // resolve_live_owner に trust-fallback は無い（issue #3 レビューで撤去）。無人で動く
+    // 自動同期はユーザーの明示同意を得ようがないため、確認できなければそのまま Err で中断する
     let owner = resolve_live_owner(
         last_live_hash_snapshot.as_deref(),
         &current_hash,
@@ -1629,6 +1693,13 @@ pub fn auto_sync_live() -> Result<AutoSyncResult, String> {
             Ok(AutoSyncResult::Unregistered)
         }
         SyncBack::NoLiveLogin => Ok(AutoSyncResult::NoLiveLogin),
+        // apply_live_owner 自体は SkippedUnverified を作らない（sync_back_live_login の
+        // trust_unverified 分岐が apply_live_owner を呼ぶ前に早期returnする形でしか
+        // 発生しない。auto_sync_live はここで直接 apply_live_owner を呼んでおり、
+        // その分岐を経由しないため現状は到達不能）。将来 apply_live_owner の呼び出し経路が
+        // 変わってここに来ても、無人ループを panic で落とすのは避け、何もせず次サイクルに
+        // 委ねる安全側に倒す（2026-08-08 レビュー: unreachable! は back ground loop で使わない）
+        SyncBack::SkippedUnverified => Ok(AutoSyncResult::Unchanged),
     }
 }
 
@@ -1740,6 +1811,7 @@ fn run_script_in_terminal(script_path: &Path) -> Result<(), String> {
 pub fn start_add_account_login(
     app: &tauri::AppHandle,
     force: bool,
+    trust_unverified: bool,
     target_name: Option<&str>,
 ) -> Result<StartLoginOutcome, String> {
     // switch_account と同じ理由でガードを関数全体に保持する
@@ -1773,13 +1845,15 @@ pub fn start_add_account_login(
                 ));
             }
         }
-        let sync_warning = match sync_back_live_login(&mut meta)? {
+        let sync_warning = match sync_back_live_login(&mut meta, trust_unverified)? {
             SyncBack::Unregistered(live_email) => return Ok(StartLoginOutcome::NeedsImport { live_email }),
             SyncBack::Synced { warning } => {
                 save_meta(&meta)?;
                 warning
             }
             SyncBack::NoLiveLogin => None,
+            // SkippedUnverified は meta を一切変更していないので save_meta 不要
+            SyncBack::SkippedUnverified => Some(UNVERIFIED_OWNER_SKIPPED_WARNING.to_string()),
         };
 
         let baseline = LoginBaseline {
@@ -2141,8 +2215,15 @@ fn verify_swap(expected_cred: &str, expected_oauth: &serde_json::Value) -> Resul
 /// （どちらのアカウントが最新か確定できない資格情報を書き戻すと被害が広がるため）。
 ///
 /// 外部セッションが1件以上あると、そのセッションが自分のトークンをライブへ書き戻して
-/// 結果を踏み潰しうる。force=false の間は `SessionsRunning` を返して確認を挟む
-pub fn switch_account(name: &str, force: bool) -> Result<SwitchOutcome, String> {
+/// 結果を踏み潰しうる。force=false の間は `SessionsRunning` を返して確認を挟む。
+///
+/// `trust_unverified`（2026-08-08 issue #3）は `force` とは独立した引数（major-2: レビュー指摘
+/// によりフラグを分離。セッション確認への同意が持ち主未確認への同意を兼ねてはいけない）。
+/// true のとき、持ち主確認が TokenExpired/NetworkError で失敗しても中断せず、sync-back を
+/// スキップして切替自体は続行する（sync_back_live_login::SyncBack::SkippedUnverified 参照。
+/// 書き込みは一切行わないため、誤帰属で登録済みアカウントのスナップショットを破壊する
+/// リスクは無い）
+pub fn switch_account(name: &str, force: bool, trust_unverified: bool) -> Result<SwitchOutcome, String> {
     // 関数全体（return地点すべて）で保持し、doc_analysis/diagnostics の spawn 直前チェックと
     // 突き合わせる。ensure_app_not_busy 単体のチェックだけでは通過直後に分析が
     // spawn される TOCTOU が残るため
@@ -2165,10 +2246,13 @@ pub fn switch_account(name: &str, force: bool) -> Result<SwitchOutcome, String> 
         ));
     }
 
-    let sync_warning = match sync_back_live_login(&mut meta)? {
+    let sync_warning = match sync_back_live_login(&mut meta, trust_unverified)? {
         SyncBack::Unregistered(live_email) => return Ok(SwitchOutcome::NeedsImport { live_email }),
         SyncBack::Synced { warning } => warning,
         SyncBack::NoLiveLogin => None,
+        // SkippedUnverified は meta を一切変更していない。ここでの save_meta（後続の
+        // Keychain スワップ確定用）には影響しないので、そのまま先へ進んでよい
+        SyncBack::SkippedUnverified => Some(UNVERIFIED_OWNER_SKIPPED_WARNING.to_string()),
     };
 
     let target = meta.accounts[target_idx].clone();
@@ -2187,7 +2271,12 @@ pub fn switch_account(name: &str, force: bool) -> Result<SwitchOutcome, String> 
     save_meta(&meta)?;
 
     // ロールバック用に、スワップ直前のライブ状態を退避しておく
-    // （sync-back 済みなので、失われても sync-back 先の登録アカウントには最新分が残っている）
+    // （sync-back 済みなら、失われても sync-back 先の登録アカウントには最新分が残っている。
+    // ただし SyncBack::SkippedUnverified のとき（trust_unverified=true で持ち主未確認のまま
+    // sync-back をスキップしたケース）はこの前提が成立しない: どの登録アカウントにも
+    // 書き戻していないため、この prior_live_cred がロールバック成功時の唯一の退避先になる。
+    // 2026-08-08 issue #3 レビュー: この関数自体はスキップの有無を知らないが、
+    // ここでの退避処理自体は両ケースで共通のロールバック機構としてそのまま機能する）
     let prior_live_cred = live_credentials_value().ok().map(|v| v.to_string());
     let prior_live_oauth = live_oauth_account();
 
@@ -2566,6 +2655,31 @@ mod tests {
             crate::actions::FetchOutcome::Network
         });
         assert!(matches!(result, Err(OwnerError::NetworkError)));
+    }
+
+    #[test]
+    fn should_skip_unverified_sync_back_allows_token_expired_and_network_when_trusted() {
+        // issue #3 レビュー案A: trust_unverified=true のときだけ、TokenExpired/NetworkError で
+        // スキップ（＝書き込まず切替続行）を許可する
+        assert!(should_skip_unverified_sync_back(
+            &OwnerError::TokenExpired(Some("user@example.com".to_string())),
+            true
+        ));
+        assert!(should_skip_unverified_sync_back(&OwnerError::NetworkError, true));
+    }
+
+    #[test]
+    fn should_skip_unverified_sync_back_rejects_without_trust_flag() {
+        // trust_unverified=false（通常の切替・auto_sync_live）なら、理由を問わず中断のまま
+        assert!(!should_skip_unverified_sync_back(&OwnerError::TokenExpired(None), false));
+        assert!(!should_skip_unverified_sync_back(&OwnerError::NetworkError, false));
+    }
+
+    #[test]
+    fn should_skip_unverified_sync_back_rejects_other_even_when_trusted() {
+        // Other（応答の構文エラー等、真に予期しない失敗）は trust_unverified でもスキップ対象外
+        // （「今は確認できないだけ」ではなく不整合の疑いが残るため）
+        assert!(!should_skip_unverified_sync_back(&OwnerError::Other("応答が不正".to_string()), true));
     }
 
     #[test]

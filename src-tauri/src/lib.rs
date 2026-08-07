@@ -153,6 +153,9 @@ fn import_live_account() -> Result<accounts::Account, String> {
 
 /// `claude auth login` を Terminal で起動し、完了検知の基準値を返す（Flow B）。
 /// 事前 sync-back を含むので async。`force` は外部セッション確認済みの再実行フラグ。
+/// `trust_unverified`（2026-08-08 issue #3）は `force` とは独立: 持ち主確認が
+/// TokenExpired/NetworkError で失敗しても sync-back をスキップして続行する同意フラグ
+/// （accounts::sync_back_live_login の SyncBack::SkippedUnverified 参照）。
 /// 2026-07-26、統合フロー（1/2 ログイン→2/2 監視の承認）のため同じ Terminal で
 /// 続けて setup-token も起動するようになり、スクリプトの書き出し先に AppHandle が要る
 /// `target_name` を指定すると登録済みカードの「再ログイン」導線になり、ログイン結果の
@@ -162,9 +165,10 @@ fn import_live_account() -> Result<accounts::Account, String> {
 fn start_add_account_login(
     app: tauri::AppHandle,
     force: bool,
+    trust_unverified: bool,
     target_name: Option<String>,
 ) -> Result<accounts::StartLoginOutcome, String> {
-    accounts::start_add_account_login(&app, force, target_name.as_deref())
+    accounts::start_add_account_login(&app, force, trust_unverified, target_name.as_deref())
 }
 
 /// フロントが2秒間隔で呼ぶ完了検知ポーリング（Flow B）
@@ -188,14 +192,17 @@ fn poll_monitor_setup(name: String) -> Result<accounts::MonitorSetupPoll, String
 }
 
 /// Keychain スワップによる切り替え（Flow C）。sync-back・読み戻し検証を伴うので async。
-/// 切り替え成功時はトレイの使用率表示にも即反映する。`force` は外部セッション確認済みの再実行フラグ
+/// 切り替え成功時はトレイの使用率表示にも即反映する。`force` は外部セッション確認済みの再実行フラグ。
+/// `trust_unverified`（2026-08-08 issue #3）は `force` とは独立した同意フラグ
+/// （accounts::switch_account の doc 参照）
 #[tauri::command(async)]
 fn switch_account(
     app: tauri::AppHandle,
     name: String,
     force: bool,
+    trust_unverified: bool,
 ) -> Result<accounts::SwitchOutcome, String> {
-    let outcome = accounts::switch_account(&name, force)?;
+    let outcome = accounts::switch_account(&name, force, trust_unverified)?;
     if matches!(outcome, accounts::SwitchOutcome::Switched { .. }) {
         tray::refresh(app);
     }
