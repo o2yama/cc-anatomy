@@ -30,6 +30,7 @@
 //!   描画した RGBA 画像を `IconMenuItem` の icon として渡す（macOS のみ。他 OS は色無しの
 //!   プレーンテキストにフォールバック）
 
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{
     image::Image,
@@ -102,9 +103,14 @@ pub struct UsageOverview {
     /// 「ログイン中アカウント」にフォールバックする＝トレイの `live_header` と同じ規則）
     pub live_name: Option<String>,
     pub live: Option<LiveUsage>,
-    /// 取得失敗時の案内。トレイの2行分（"使用量を取得できません" / "Claude Code で
-    /// ログインしてください"）を改行区切りの1文字列にまとめて渡す
+    /// 取得失敗時（live が None）の案内。原因（token 期限切れ／通信不能／その他）に応じて
+    /// 文言が変わる2行を改行区切りの1文字列にまとめて渡す（2026-08-08 issue #4:
+    /// 以前は原因を問わず固定の2行だった。`tray::usage_advisory` 参照）
     pub live_error: Option<String>,
+    /// live が Some（前回取得値でゲージを埋められた）でも、その値が最新でない可能性がある
+    /// ときの注記1行（例: token 期限切れでバッチキャッシュにフォールバックした）。
+    /// live_error とは排他（片方が Some ならもう片方は必ず None）
+    pub live_note: Option<String>,
     pub others: Vec<OtherAccountEntry>,
 }
 
@@ -417,6 +423,12 @@ struct RawStatus {
     live_name: Option<String>,
     other_accounts: Vec<OtherAccountEntry>,
     usage_result: Result<crate::actions::UsageSummary, String>,
+    /// 「ライブ OAuth 直叩き」だけの失敗理由（2026-08-08 issue #4）。usage_result が Err の
+    /// ときは「原因＋回復手段」の2行（Blocking）の根拠に、usage_result が Ok でもこれが
+    /// Some（バッチ・監視トークンへのフォールバックで埋めた＝ライブは失敗していた）のときは
+    /// ゲージ下の注記1行（Note）の根拠になる（2026-08-08 再レビュー: 以前は Err 時のみ
+    /// 意味を持つとしていたが、Ok 側でも usage_advisory が参照するようになった）
+    live_error: Option<crate::actions::LiveUsageError>,
 }
 
 /// 登録アカウント一覧・使用率一括照会・ライブ使用率の取得元フォールバックをまとめて行う
@@ -462,23 +474,108 @@ fn fetch_raw_status() -> RawStatus {
     // 2026-07-27 レビュー M-1: 従来はここで無条件にもう一度監視トークンへ POST しており、
     // 「ライブトークン期限切れ＋監視トークンあり」のケースで毎サイクル /v1/messages への
     // 実リクエストが2回（get_accounts_usage 内と、ここ）走っていた
-    let usage_result = crate::actions::live_usage_summary()
-        .or_else(|_| {
-            usage_summary_from_batch(live_usage_from_batch)
-                .ok_or_else(|| "バッチ結果に使える値なし".to_string())
-        })
-        .or_else(|_| {
-            crate::accounts::live_account_monitor_token()
-                .ok_or_else(|| "監視トークンなし".to_string())
-                .and_then(|token| crate::actions::usage_via_monitor_token(&token))
-        });
+    let live_result = crate::actions::live_usage_summary();
+    // 表示用の原因分類（token 期限切れ／通信エラー）は「ライブ OAuth 直叩き」の結果だけを見る
+    // （issue #4）。バッチ・監視トークンのフォールバックはあくまで数値を埋めるための代替経路で、
+    // その失敗理由（「バッチ結果に使える値なし」等）は「現在ログイン中のアカウントの token
+    // 状態」を説明しないため使わない
+    let live_error = live_result.as_ref().err().cloned();
+    match &live_error {
+        Some(crate::actions::LiveUsageError::Other(msg)) => log_unexpected_usage_error_once(msg),
+        // Other 以外（正常復帰、または Expired/Network という「原因が分かっている」失敗）に
+        // 戻ったら dedup 状態をリセットする。しないと、一度ログした Other が回復を挟んで
+        // 再発しても「直前と同じ」判定で再ログされなくなる（2026-08-08 再レビュー minor-3）
+        _ => reset_logged_usage_error(),
+    }
+    let usage_result = match live_result {
+        Ok(u) => Ok(u),
+        Err(_) => usage_summary_from_batch(live_usage_from_batch)
+            .ok_or_else(|| "バッチ結果に使える値なし".to_string())
+            .or_else(|_| {
+                crate::accounts::live_account_monitor_token()
+                    .ok_or_else(|| "監視トークンなし".to_string())
+                    .and_then(|token| crate::actions::usage_via_monitor_token(&token))
+            }),
+    };
 
-    RawStatus { live_name, other_accounts, usage_result }
+    RawStatus { live_name, other_accounts, usage_result, live_error }
+}
+
+/// 直近に stderr へ出した LiveUsageError::Other のメッセージ。連続する同一メッセージの
+/// 再出力を抑止するための状態（2026-08-08 issue #4 再レビュー minor-1）。
+/// 未ログイン（Keychain / 資格情報ファイルが無い）は Other としてここへ流れ着く定常状態で、
+/// 区別する新 variant を起こす代わりに「変化がなければ黙る」dedup で毎分のログ洪水を防ぐ。
+/// fetch_raw_status（トレイの定期更新・ポップオーバー双方の共通経路）1箇所だけで呼ぶことで、
+/// 従来 fetch_status だけがログし usage_overview はログしていなかった非対称も解消する
+static LAST_LOGGED_OTHER_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// message が直前にログした内容と同じかどうかの純粋判定（テスト容易性のため IO から分離）
+fn should_log_usage_error(last: Option<&str>, message: &str) -> bool {
+    last != Some(message)
+}
+
+fn log_unexpected_usage_error_once(message: &str) {
+    let mut last = LAST_LOGGED_OTHER_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if should_log_usage_error(last.as_deref(), message) {
+        eprintln!("live usage fetch failed with an unexpected error: {message}");
+        *last = Some(message.to_string());
+    }
+}
+
+fn reset_logged_usage_error() {
+    let mut last = LAST_LOGGED_OTHER_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *last = None;
+}
+
+/// live_error の分類に応じた案内文言。usage_result が Err のとき（Blocking）は画面全体を
+/// 置き換える2行（原因＋回復手段）、Ok でも live_error が Some のとき（Note）は
+/// ゲージの下に添える1行（表示中の値が最新でない可能性がある旨）を返す。トレイ・アプリ内
+/// ポップオーバー（usage_overview）共通で使う（2026-07-31 決定「表示を1箇所に集約する」の
+/// 延長）。2026-08-08 issue #4 再レビュー: バッチキャッシュ（accounts.json の usage_cache、
+/// 無期限に残る）にフォールバックできると usage_result が Ok になり、期限切れ・通信不能で
+/// あることが一切伝わらない問題があったため、Ok 側にも Note を出せるよう拡張した
+enum UsageAdvisory {
+    Blocking(&'static str, &'static str),
+    Note(&'static str),
+}
+
+fn usage_advisory(usage_is_ok: bool, live_error: Option<&crate::actions::LiveUsageError>) -> Option<UsageAdvisory> {
+    if usage_is_ok {
+        return match live_error {
+            // 「前回取得値を表示中」は誤り: バッチのフォールバックが今まさに取得した最新値の
+            // こともあるため、「古い値だ」と断定しない言い回しに緩める（2026-08-08 再レビュー）
+            Some(crate::actions::LiveUsageError::Expired) => Some(UsageAdvisory::Note(
+                "token 期限切れ（最新でない可能性）。Claude Code を一度実行すると復帰します",
+            )),
+            Some(crate::actions::LiveUsageError::Network) => {
+                Some(UsageAdvisory::Note("接続できません（最新でない可能性）"))
+            }
+            // Other（本来起きないはずの失敗）でもバッチにフォールバックできた＝実害が薄いため、
+            // 注記までは出さず現在値をそのまま出す（既存挙動を維持）
+            Some(crate::actions::LiveUsageError::Other(_)) | None => None,
+        };
+    }
+    let (line1, line2) = match live_error {
+        Some(crate::actions::LiveUsageError::Expired) => (
+            "token 期限切れ",
+            "Claude Code を一度実行すると復帰します",
+        ),
+        Some(crate::actions::LiveUsageError::Network) => (
+            "使用量を取得できません",
+            "接続できません。ネットワークを確認してください",
+        ),
+        Some(crate::actions::LiveUsageError::Other(_)) | None => (
+            "使用量を取得できません",
+            "Claude Code でログインしてください",
+        ),
+    };
+    Some(UsageAdvisory::Blocking(line1, line2))
 }
 
 fn fetch_status() -> StatusData {
     let raw = fetch_raw_status();
     let live_name = raw.live_name;
+    let live_error = raw.live_error;
     let mut usage_lines = Vec::new();
     let (live_header, title) = match raw.usage_result {
         Ok(u) => {
@@ -492,6 +589,9 @@ fn fetch_status() -> StatusData {
                 label: format!("週次 {s}%{}", reset_suffix(u.seven_reset)),
                 pct: s,
             });
+            if let Some(UsageAdvisory::Note(note)) = usage_advisory(true, live_error.as_ref()) {
+                usage_lines.push(InfoLine::Plain(note.into()));
+            }
             let header = match &live_name {
                 Some(name) => format!("ログイン中: {name}"),
                 None => "ログイン中アカウント".to_string(),
@@ -499,8 +599,10 @@ fn fetch_status() -> StatusData {
             (header, format!("{}%", u.five_pct.max(u.seven_pct).round() as i64))
         }
         Err(_) => {
-            usage_lines.push(InfoLine::Plain("使用量を取得できません".into()));
-            usage_lines.push(InfoLine::Plain("Claude Code でログインしてください".into()));
+            if let Some(UsageAdvisory::Blocking(line1, line2)) = usage_advisory(false, live_error.as_ref()) {
+                usage_lines.push(InfoLine::Plain(line1.into()));
+                usage_lines.push(InfoLine::Plain(line2.into()));
+            }
             ("ログイン中アカウント".to_string(), "-".to_string())
         }
     };
@@ -517,26 +619,38 @@ fn fetch_status() -> StatusData {
 /// `fetch_raw_status` を使うため、数値・フォールバック優先順位はトレイと完全に一致する
 pub fn usage_overview() -> UsageOverview {
     let raw = fetch_raw_status();
-    let (live, live_error) = match raw.usage_result {
-        Ok(u) => (
-            Some(LiveUsage {
-                five_pct: u.five_pct,
-                seven_pct: u.seven_pct,
-                five_reset: u.five_reset,
-                seven_reset: u.seven_reset,
-            }),
-            None,
-        ),
+    let live_error_detail = raw.live_error;
+    let (live, live_error, live_note) = match raw.usage_result {
+        Ok(u) => {
+            let note = match usage_advisory(true, live_error_detail.as_ref()) {
+                Some(UsageAdvisory::Note(n)) => Some(n.to_string()),
+                _ => None,
+            };
+            (
+                Some(LiveUsage {
+                    five_pct: u.five_pct,
+                    seven_pct: u.seven_pct,
+                    five_reset: u.five_reset,
+                    seven_reset: u.seven_reset,
+                }),
+                None,
+                note,
+            )
+        }
         // トレイの2行分の案内文言（InfoLine::Plain）と同じ内容を改行区切りで渡す
-        Err(_) => (
-            None,
-            Some("使用量を取得できません\nClaude Code でログインしてください".to_string()),
-        ),
+        Err(_) => {
+            let error = match usage_advisory(false, live_error_detail.as_ref()) {
+                Some(UsageAdvisory::Blocking(line1, line2)) => Some(format!("{line1}\n{line2}")),
+                _ => None,
+            };
+            (None, error, None)
+        }
     };
     UsageOverview {
         live_name: raw.live_name,
         live,
         live_error,
+        live_note,
         others: raw.other_accounts,
     }
 }
@@ -839,6 +953,84 @@ mod tests {
         let pitch = f64::from(BAR_WIDTH_PX) / f64::from(DOT_COUNT);
         let cx = ((f64::from(dot_idx) + 0.5) * pitch - 0.5).round() as u32;
         (cx, BAR_HEIGHT_PX / 2)
+    }
+
+    #[test]
+    fn usage_advisory_blocking_expired_names_the_cause_and_recovery() {
+        // issue #4: 固定文言「Claude Code でログインしてください」のままだと、期限切れが
+        // 原因であることが伝わらない
+        match usage_advisory(false, Some(&crate::actions::LiveUsageError::Expired)) {
+            Some(UsageAdvisory::Blocking(line1, line2)) => {
+                assert_eq!(line1, "token 期限切れ");
+                assert!(line2.contains("Claude Code を一度実行すると"));
+            }
+            _ => panic!("Blocking を期待した"),
+        }
+    }
+
+    #[test]
+    fn usage_advisory_blocking_network_is_distinguished_from_expired() {
+        match usage_advisory(false, Some(&crate::actions::LiveUsageError::Network)) {
+            Some(UsageAdvisory::Blocking(line1, line2)) => {
+                assert_ne!(line1, "token 期限切れ");
+                assert!(line2.contains("接続"));
+            }
+            _ => panic!("Blocking を期待した"),
+        }
+    }
+
+    #[test]
+    fn usage_advisory_blocking_other_and_none_fall_back_to_legacy_wording() {
+        // Other・情報なし（None）は従来どおりの固定文言を維持する（既存挙動を変えない）
+        let none_lines = match usage_advisory(false, None) {
+            Some(UsageAdvisory::Blocking(l1, l2)) => (l1, l2),
+            _ => panic!("Blocking を期待した"),
+        };
+        let other_lines = match usage_advisory(false, Some(&crate::actions::LiveUsageError::Other("x".into()))) {
+            Some(UsageAdvisory::Blocking(l1, l2)) => (l1, l2),
+            _ => panic!("Blocking を期待した"),
+        };
+        assert_eq!(none_lines, other_lines);
+        assert_eq!(none_lines, ("使用量を取得できません", "Claude Code でログインしてください"));
+    }
+
+    #[test]
+    fn usage_advisory_ok_with_expired_or_network_adds_a_stale_note() {
+        // issue #4 再レビュー: バッチキャッシュで usage_result が Ok になっても、
+        // 期限切れ・通信不能であることは注記1行で伝える
+        match usage_advisory(true, Some(&crate::actions::LiveUsageError::Expired)) {
+            Some(UsageAdvisory::Note(note)) => {
+                assert!(note.contains("期限切れ"));
+                // 「前回取得値を表示中」＝古い値だと断定する言い回しはしない
+                // （バッチ側が今取得した最新値のこともあるため）
+                assert!(!note.contains("前回取得値"));
+                assert!(note.contains("最新でない可能性"));
+            }
+            _ => panic!("Note を期待した"),
+        }
+        match usage_advisory(true, Some(&crate::actions::LiveUsageError::Network)) {
+            Some(UsageAdvisory::Note(note)) => {
+                assert!(!note.contains("前回取得値"));
+                assert!(note.contains("最新でない可能性"));
+            }
+            _ => panic!("Note を期待した"),
+        }
+    }
+
+    #[test]
+    fn usage_advisory_ok_without_live_error_or_other_has_no_note() {
+        // 正常取得（live_error なし）や、フォールバックできた Other は注記不要（既存挙動）
+        assert!(usage_advisory(true, None).is_none());
+        assert!(usage_advisory(true, Some(&crate::actions::LiveUsageError::Other("x".into()))).is_none());
+    }
+
+    #[test]
+    fn should_log_usage_error_suppresses_identical_repeats() {
+        // 未ログイン状態（Keychain に資格情報が無い）は毎分同じ Other が上がってくる定常状態。
+        // 直前と同じメッセージなら再ログしない
+        assert!(should_log_usage_error(None, "資格情報が見つかりません"));
+        assert!(!should_log_usage_error(Some("資格情報が見つかりません"), "資格情報が見つかりません"));
+        assert!(should_log_usage_error(Some("資格情報が見つかりません"), "別のエラー"));
     }
 
     #[test]

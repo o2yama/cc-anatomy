@@ -339,11 +339,15 @@ export interface OtherAccountOverview {
   usage: AccountUsage | null;
 }
 
-/** get_usage_overview の戻り値。live_error はトレイの案内2行を改行区切りで持つ */
+/** get_usage_overview の戻り値。live が取れなかったとき、live_error に原因（token 期限切れ／
+ * 通信不能／その他）に応じて文言が変わる2行を改行区切りで持つ（固定文言ではない。
+ * tray.rs::usage_advisory 参照）。live が取れていても、その値がバッチキャッシュ由来で
+ * 最新でない可能性があるときは live_note に注記1行が入る（live_error とは排他） */
 export interface UsageOverview {
   live_name: string | null;
   live: LiveUsage | null;
   live_error: string | null;
+  live_note: string | null;
   others: OtherAccountOverview[];
 }
 

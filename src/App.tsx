@@ -433,6 +433,7 @@ function UsagePopover() {
                         {resetSuffix(overview.live.seven_reset)}
                       </span>
                     </div>
+                    {overview.live_note && <p className="muted usage-live-note">{overview.live_note}</p>}
                   </div>
                 ) : overview?.live_error ? (
                   overview.live_error

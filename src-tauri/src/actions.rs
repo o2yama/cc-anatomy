@@ -156,8 +156,10 @@ pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 /// ライブ access token の取得状態。`expired` は Claude Code 側の自動 refresh 待ちの
 /// 正常な状態であり、エラー扱いしない（2026-07-26 ユーザー報告: 期限切れ時の応答が
 /// そのまま「再ログインが必要かもしれません」という誤誘導なエラー文言として毎回
-/// 表示されていた）。`error` は本当に予期しない失敗（ネットワーク不通・応答の構文エラー等）
-/// だけに限定する
+/// 表示されていた）。`network`（接続失敗・タイムアウト等）は `error`（応答の構文エラー等、
+/// それ以外の予期しない失敗）から分離している（2026-08-08 issue #4: トレイが「token 期限切れ」
+/// と「通信できない」を区別して案内する必要が生じたため。live_usage_summary の
+/// LiveUsageError で外部へ引き継ぐ）
 #[derive(serde::Serialize, Clone)]
 #[serde(tag = "status")]
 pub enum UsageFetch {
@@ -165,6 +167,8 @@ pub enum UsageFetch {
     Ok { body: String },
     #[serde(rename = "expired")]
     Expired,
+    #[serde(rename = "network")]
+    Network,
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -256,9 +260,7 @@ fn fetch_live_usage_status(url: &str) -> UsageFetch {
     match oauth_get_checked(&token, url) {
         FetchOutcome::Ok(body) => UsageFetch::Ok { body },
         FetchOutcome::Expired => UsageFetch::Expired,
-        // Network も Other も表示上は同じ「予期しない失敗」扱い（従来どおり）。
-        // メッセージは Network 分離前と同一文言を維持する
-        FetchOutcome::Network => UsageFetch::Error { message: "API への接続に失敗しました".to_string() },
+        FetchOutcome::Network => UsageFetch::Network,
         FetchOutcome::Other(message) => UsageFetch::Error { message },
     }
 }
@@ -397,16 +399,28 @@ pub fn usage_via_monitor_token(token: &str) -> Result<UsageSummary, String> {
     })
 }
 
+/// live_usage_summary() の失敗理由。トレイ・使用量ポップオーバー（tray.rs）が原因つきの
+/// 案内文を出し分けるための分類（2026-08-08、issue #4）。以前は「期限切れも通常の失敗も
+/// 区別せず表示しない」としていたが、切り替え後に token 期限切れで使用量が固定表示のまま
+/// 止まる原因が伝わらないという報告を受け、区別を外へ引き継ぐようにした。
+/// Expired/Network の分類自体は fetch_live_usage_status（#1 で導入した is_token_expired・
+/// FetchOutcome::Expired/Network）をそのまま使う
+#[derive(Debug, Clone)]
+pub enum LiveUsageError {
+    Expired,
+    Network,
+    Other(String),
+}
+
 /// 現在ログイン中（ライブ）アカウントの使用率。`/api/oauth/usage` を直接叩く
 /// （2026-07-25 ユーザー決定: 監視用長期トークンによる複数アカウント表示は全廃し、
-/// ライブアカウントのみを表示する一本道にした）。
-/// トレイアイコンのタイトル/ツールチップ表示専用で、期限切れも通常の失敗も区別せず
-/// 「取得できなかった」として扱ってよい（呼び出し側は "-" を出すだけで文言は表示しない）
-pub fn live_usage_summary() -> Result<UsageSummary, String> {
+/// ライブアカウントのみを表示する一本道にした）
+pub fn live_usage_summary() -> Result<UsageSummary, LiveUsageError> {
     match fetch_live_usage_status(USAGE_URL) {
-        UsageFetch::Ok { body } => parse_usage_body(&body),
-        UsageFetch::Expired => Err("access token が期限切れです".to_string()),
-        UsageFetch::Error { message } => Err(message),
+        UsageFetch::Ok { body } => parse_usage_body(&body).map_err(LiveUsageError::Other),
+        UsageFetch::Expired => Err(LiveUsageError::Expired),
+        UsageFetch::Network => Err(LiveUsageError::Network),
+        UsageFetch::Error { message } => Err(LiveUsageError::Other(message)),
     }
 }
 
