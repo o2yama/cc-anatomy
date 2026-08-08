@@ -813,7 +813,7 @@ fn ensure_app_not_busy() -> Result<(), String> {
         || crate::doc_analysis::is_running()
     {
         return Err(
-            "本アプリの環境診断/タスク抽出/AI分析実行中は切り替え・追加ができません。完了してから実行してください。"
+            "本アプリの環境診断/タスク抽出/AI分析/token 自動復帰の実行中は切り替え・追加ができません。完了してから実行してください。"
                 .into(),
         );
     }
@@ -842,7 +842,7 @@ impl AccountOpGuard {
         {
             ACCOUNT_OP_IN_PROGRESS.store(false, Ordering::SeqCst);
             return Err(
-                "本アプリの環境診断/タスク抽出/AI分析実行中は切り替え・追加ができません。完了してから実行してください。"
+                "本アプリの環境診断/タスク抽出/AI分析/token 自動復帰の実行中は切り替え・追加ができません。完了してから実行してください。"
                     .into(),
             );
         }

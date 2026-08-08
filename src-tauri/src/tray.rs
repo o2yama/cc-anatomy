@@ -487,6 +487,12 @@ fn fetch_raw_status() -> RawStatus {
         // 再発しても「直前と同じ」判定で再ログされなくなる（2026-08-08 再レビュー minor-3）
         _ => reset_logged_usage_error(),
     }
+    // 期限切れなら claude CLI の裏起動で自動復帰を試みる（issue #5）。別スレッドに投げるだけで
+    // トレイ更新はブロックしない。復帰すれば次の60秒ポーリングで表示が正常に戻る
+    #[cfg(target_os = "macos")]
+    if matches!(&live_error, Some(crate::actions::LiveUsageError::Expired)) {
+        crate::actions::spawn_token_refresh_nudge();
+    }
     let usage_result = match live_result {
         Ok(u) => Ok(u),
         Err(_) => usage_summary_from_batch(live_usage_from_batch)
@@ -931,6 +937,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                     // exit 前に best-effort で kill する
                     crate::doc_analysis::kill_running();
                     crate::diagnostics::kill_running();
+                    crate::actions::kill_token_nudge();
                     app.exit(0);
                 }
                 _ => {}

@@ -25,8 +25,14 @@ pub const MAC_ONLY: &str = "この機能は macOS 版でのみ利用できます
 /// アカウント切り替え・追加のブロック条件に含める（accounts::ensure_no_running_sessions）
 static EXTRACT_TASKS_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// token 自動復帰の claude CLI 裏起動（issue #5）が実行中か。子プロセスがライブ資格情報を
+/// 更新しうる間はアカウント切り替え・追加をブロックする対象に含める
+static TOKEN_NUDGE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn is_agent_busy() -> bool {
     EXTRACT_TASKS_RUNNING.load(std::sync::atomic::Ordering::Relaxed)
+        // nudge 側は ACCOUNT_OP_IN_PROGRESS との相互排他（二重チェック）を成立させるため SeqCst
+        || TOKEN_NUDGE_RUNNING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// 存在するディレクトリだけを外部アプリに渡す（消えたパスで空ウィンドウを開かない）
@@ -454,6 +460,222 @@ pub fn resolve_claude_bin() -> Result<std::path::PathBuf, String> {
         .into_iter()
         .find(|p| p.exists())
         .ok_or_else(|| "claude CLI が見つかりません（/opt/homebrew/bin 等を確認）".into())
+}
+
+/// 直近に token 自動復帰を試みた時刻（デバウンス用）。refresh が失敗し続ける環境で
+/// 60秒ポーリングのたびに claude CLI を起動し続けないよう、発火間隔を空ける。
+/// Instant はシステムスリープ中に進まず、スリープ復帰直後（＝期限切れになりやすい
+/// タイミング）の抑止が不当に延びるため SystemTime を使う
+#[cfg(target_os = "macos")]
+static LAST_TOKEN_NUDGE: std::sync::Mutex<Option<std::time::SystemTime>> = std::sync::Mutex::new(None);
+#[cfg(target_os = "macos")]
+const TOKEN_NUDGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// 子プロセスの待機上限。無期限待ちにすると、ハング時に TOKEN_NUDGE_RUNNING が立ったまま
+/// アカウント切り替えが長時間不能になるため必ず打ち切る。nudge の発火条件（期限切れ）は
+/// ユーザーが切り替えたくなる状況と重なるため、ブロック窓は短めに取る
+/// （第1段はローカル処理なのでさらに短い上限を使う）
+#[cfg(target_os = "macos")]
+const TOKEN_NUDGE_TIMEOUT_LOCAL: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(target_os = "macos")]
+const TOKEN_NUDGE_TIMEOUT_API: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// nudge が起動した claude 子プロセスの PID。quit ハンドラからの best-effort kill 用
+/// （doc_analysis / diagnostics の kill_running と同じ孤児化防止の方針）
+#[cfg(target_os = "macos")]
+static TOKEN_NUDGE_CHILD_PID: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+#[cfg(target_os = "macos")]
+pub fn kill_token_nudge() {
+    let pid = TOKEN_NUDGE_CHILD_PID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(pid) = pid {
+        // 直後に app.exit するため、TERM を握り潰されないよう doc_analysis と同じ -9
+        let _ = Command::new("/bin/kill").args(["-9", &pid.to_string()]).status();
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn kill_token_nudge() {}
+
+/// TOKEN_NUDGE_RUNNING を Drop で必ずクリアするガード（AccountOpGuard と同型）。
+/// nudge スレッドが panic してもフラグが立ちっぱなしにならないようにする
+#[cfg(target_os = "macos")]
+struct TokenNudgeGuard;
+
+#[cfg(target_os = "macos")]
+impl Drop for TokenNudgeGuard {
+    fn drop(&mut self) {
+        TOKEN_NUDGE_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// ライブ access token が期限切れのとき、claude CLI を裏起動して Claude Code 本体に
+/// 正規の refresh をさせ、usage 表示を自動復帰させる（issue #5）。
+/// アプリ自身は refresh token に一切触れない（触れると one-time use の refresh token を
+/// 消費してしまう）という設計制約を維持したまま、「refresh のきっかけ」だけを作る。
+/// 失敗しても何もしない（既存の期限切れ案内表示のまま、次回デバウンス明けに再試行）。
+#[cfg(target_os = "macos")]
+pub fn spawn_token_refresh_nudge() {
+    if debounced_token_nudge() {
+        return;
+    }
+    // 多重起動の排除とフラグ設定を1操作で行う（先行 nudge が生きているうちに
+    // 2本目が走って store(false) でガードを誤解除する事故の防止）。
+    // spawn 前・呼び出しスレッド側で立てることで、フラグ可視化までの窓を最小にする
+    if TOKEN_NUDGE_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return;
+    }
+    let guard = TokenNudgeGuard;
+    // フラグを立てた後にアカウント操作中でないことを再確認する（AccountOpGuard::acquire と
+    // 同じ二重チェック。チェック→セットの間に切り替えが始まっていたら退く）
+    if crate::accounts::ACCOUNT_OP_IN_PROGRESS.load(std::sync::atomic::Ordering::SeqCst) {
+        return; // guard の Drop がフラグを戻す
+    }
+    // 両ガードを通過してから発火時刻を記録する（CAS 失敗やロールバックで
+    // 10分窓を無駄に消費しないため）
+    {
+        let mut last = LAST_TOKEN_NUDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *last = Some(std::time::SystemTime::now());
+    }
+    std::thread::spawn(move || {
+        let _guard = guard; // スレッド終了（panic 含む）で必ずフラグをクリア
+        if let Err(e) = run_token_refresh_nudge() {
+            eprintln!("token 自動復帰の試行に失敗（次回デバウンス明けに再試行）: {e}");
+        }
+    });
+}
+
+/// デバウンス窓の内側なら true（発火を抑止する）。時計巻き戻しで duration_since が
+/// Err になったら「経過扱い」で再発火を許す
+#[cfg(target_os = "macos")]
+fn debounced_token_nudge() -> bool {
+    let last = LAST_TOKEN_NUDGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match *last {
+        Some(t) => std::time::SystemTime::now()
+            .duration_since(t)
+            .map(|d| d < TOKEN_NUDGE_MIN_INTERVAL)
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+/// 子プロセスを PID 記録つきでタイムアウト待機する。超過したら kill して打ち切る
+#[cfg(target_os = "macos")]
+fn wait_child_with_timeout(
+    mut child: std::process::Child,
+    label: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, String> {
+    {
+        let mut pid = TOKEN_NUDGE_CHILD_PID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pid = Some(child.id());
+    }
+    let started = std::time::Instant::now();
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status.success()),
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break Err(format!("{label} が {}秒以内に終了せず kill", timeout.as_secs()));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => break Err(format!("{label} の待機に失敗: {e}")),
+        }
+    };
+    {
+        let mut pid = TOKEN_NUDGE_CHILD_PID
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pid = None;
+    }
+    result
+}
+
+/// 二段構えで refresh を誘発する。第1段（auth status）はローカル処理で無コストだが
+/// refresh まで走るかは CLI の実装次第のため、効かなければ第2段（最小の headless 呼び出し）で
+/// 実際の API アクセスを発生させて確実に refresh させる。どちらで復帰したかはログで判別できる
+#[cfg(target_os = "macos")]
+fn run_token_refresh_nudge() -> Result<(), String> {
+    let claude = resolve_claude_bin()?;
+
+    let child = Command::new(&claude)
+        .args(["auth", "status"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("claude CLI の起動に失敗: {e}"))?;
+    let _ = wait_child_with_timeout(child, "claude auth status", TOKEN_NUDGE_TIMEOUT_LOCAL);
+    // CLI が資格情報を書き戻すまでのラグを吸収してから期限を再確認する（経験則の余裕）
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    if live_token_now_valid() {
+        eprintln!("token 自動復帰: claude auth status で復帰");
+        return Ok(());
+    }
+
+    // 無人・定期実行のため、ユーザー設定の hooks / MCP サーバを起動しない
+    // （doc_analysis の headless 硬化方針を踏襲。cwd もプロジェクトに依存させない）
+    let mut child = Command::new(&claude)
+        .args([
+            "-p",
+            "--model",
+            "haiku",
+            "--max-turns",
+            "1",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "user",
+        ])
+        .current_dir(crate::db::home_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("claude CLI の起動に失敗: {e}"))?;
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().ok_or("stdin の取得に失敗")?;
+        stdin.write_all(b"ok").map_err(|e| e.to_string())?;
+    }
+    drop(child.stdin.take());
+    let success = wait_child_with_timeout(child, "claude -p", TOKEN_NUDGE_TIMEOUT_API)?;
+    if !success {
+        return Err("claude CLI がエラー終了".into());
+    }
+    if live_token_now_valid() {
+        eprintln!("token 自動復帰: headless 呼び出しで復帰");
+        Ok(())
+    } else {
+        Err("claude CLI は成功したが token 期限が更新されていない".into())
+    }
+}
+
+/// ライブ資格情報の expiresAt が現在有効か（nudge の成否判定用）
+#[cfg(target_os = "macos")]
+fn live_token_now_valid() -> bool {
+    matches!(
+        crate::credentials::live_token_with_expiry(),
+        Ok((_, expires_at)) if !is_token_expired(expires_at)
+    )
 }
 
 /// claude-mem のサマリー履歴を claude CLI（ヘッドレス）に渡して未完了タスクを抽出する。
