@@ -135,6 +135,7 @@ pub fn import_live_account() -> Result<Account, String> {
 pub fn start_add_account_login(
     _app: &tauri::AppHandle,
     _force: bool,
+    _trust_unverified: bool,
     _target_name: Option<&str>,
 ) -> Result<StartLoginOutcome, String> {
     Err(crate::actions::MAC_ONLY.into())
@@ -158,8 +159,18 @@ pub fn poll_add_account_login(_baseline: &str) -> Result<PollResult, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
-pub fn switch_account(_name: &str, _force: bool) -> Result<SwitchOutcome, String> {
+pub fn switch_account(
+    _name: &str,
+    _force: bool,
+    _trust_unverified: bool,
+) -> Result<SwitchOutcome, String> {
     Err(crate::actions::MAC_ONLY.into())
+}
+
+/// 本実装（accounts.rs）の同名関数と対。非 macOS では OwnerError の wire format 自体が
+/// 発生しないため、受け取った文字列をそのまま返す
+pub fn strip_owner_error_tag(message: &str) -> &str {
+    message
 }
 
 pub fn remove_account(_name: &str) -> Result<(), String> {
