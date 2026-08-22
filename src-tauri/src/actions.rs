@@ -3,8 +3,13 @@
 //! 使用量取得は全プラットフォーム共通。
 //!
 //! ライブアカウント（現在ログイン中）の使用量は常にライブ資格情報の access token で
-//! `/api/oauth/usage` を直接叩く（`live_usage_summary`。トレイ・アプリ内ポップオーバー
-//! （`tray::usage_overview`）が共有する）。2026-07-26 に任意機能として復活した
+//! `/api/oauth/usage` を直接叩く。登録済みアカウント一括取得（accounts::get_accounts_usage）の
+//! LiveOauth 経路が本線で、バッチにライブが存在しないとき（未登録ライブ・
+//! has_credentials=false・非 macOS 全体）だけ `live_usage_summary_gated` が tray.rs の
+//! フォールバック経路として同じ資格情報チェック→ゲート→HTTP の順で照会する（V-1、
+//! 2026-08-22 第6ラウンド）。トレイ・アプリ内ポップオーバー（`tray::usage_overview`）は
+//! `tray::fetch_raw_status` を共有することで、この2経路のどちらが返した値でも同じ表示ロジックに
+//! 乗せている。2026-07-26 に任意機能として復活した
 //! 監視用長期トークン（`claude setup-token` 発行）は `oauth/usage` のスコープ外のため、
 //! `usage_via_monitor_token` が `/v1/messages` へ最小リクエストを投げてレスポンスヘッダ
 //! （`anthropic-ratelimit-unified-*`）から使用率を読む別経路を使う
@@ -131,35 +136,173 @@ static HTTP: std::sync::LazyLock<reqwest::blocking::Client> = std::sync::LazyLoc
 /// 登録済み全アカウントの使用率一括取得（accounts::get_accounts_usage）の両方から使うため公開する
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 
-/// ライブ access token の取得状態。`expired` は Claude Code 側の自動 refresh 待ちの
-/// 正常な状態であり、エラー扱いしない（2026-07-26 ユーザー報告: 期限切れ時の応答が
-/// そのまま「再ログインが必要かもしれません」という誤誘導なエラー文言として毎回
-/// 表示されていた）。`network`（接続失敗・タイムアウト等）は `error`（応答の構文エラー等、
-/// それ以外の予期しない失敗）から分離している（2026-08-08 issue #4: トレイが「token 期限切れ」
-/// と「通信できない」を区別して案内する必要が生じたため。live_usage_summary の
-/// LiveUsageError で外部へ引き継ぐ）
-#[derive(serde::Serialize, Clone)]
-#[serde(tag = "status")]
-pub enum UsageFetch {
-    #[serde(rename = "ok")]
-    Ok { body: String },
-    #[serde(rename = "expired")]
-    Expired,
-    /// 429（レート制限）。2026-08-22 追加: 以前は Expired に誤って合流していた
-    #[serde(rename = "rate_limited")]
-    RateLimited,
-    #[serde(rename = "network")]
-    Network,
-    #[serde(rename = "error")]
-    Error { message: String },
+/// 自動経路（force==false）でのライブアカウントに対する `/api/oauth/usage` 再試行間隔（秒）。
+/// 元は accounts.rs 内に private const として持っていたが、U-1（2026-08-22、第5ラウンド）で
+/// tray.rs のフォールバック経路（未登録ライブ・has_credentials=false・Windows/Linux 全体では
+/// `/api/oauth/usage` の唯一の取得経路になる）にも同じ間隔を通す必要が生じ、全プラットフォームで
+/// コンパイルされるここへ移した（accounts.rs は macOS 限定ファイルで、tray.rs からは
+/// 参照できない）。
+///
+/// なぜ300秒か（実測に基づく根拠。V-5、2026-08-22 第6ラウンドで accounts.rs から
+/// この doc へ一本化した。以前は定数の実体だけをここへ移し、根拠の説明は accounts.rs 側に
+/// 残していたが、「本ファイルの doc に書いた」という自己参照が実際には別ファイルを指しており、
+/// 実在しない参照になっていた）:
+///
+/// 2026-08-22（第4ラウンド、S-1）: 45秒から300秒（5分）へ大幅に緩めた。
+///
+/// 実測で分かったこと（同日、`/api/oauth/usage` に対して）:
+/// - 429 は**リクエスト頻度**によるもので、そのアカウントの使用量の枠とは無関係。
+///   5h 枠を 100% 使い切ったアカウント2件が 200 を返す一方、枠に余裕のある（16%）
+///   アカウントが 429 を返した。違いは「そのアカウントがライブで、アプリがポーリング
+///   していたかどうか」だった
+/// - 枠は**アカウント単位**。非ライブのアカウントは、アプリが監視トークン経由で取得
+///   していてこのエンドポイントを叩かないため、外部から3回連続で叩いても影響がない
+/// - 枠は狭い。8秒間隔で3回叩けば 429 になる程度
+///
+/// つまり毎分1回（旧45秒設定＋60秒周期）は上限に張り付いた状態で、同一アカウントに
+/// 対する消費者がもう1つあれば即あふれる。5分間隔にして実質的な余裕を作る方針にした
+/// （ユーザー決定、2026-08-22）。
+///
+/// 未確定: 正確な閾値と回復速度。「claude セッションがこの枠を共有している」という仮説は
+/// 立てたが、裏付けは取れていない（非ライブのアカウントが影響を受けていないことから、
+/// むしろアプリ自身のポーリングが支配的だと考えられる）
+///
+/// 旧45秒の根拠（2026-08-22、R-5。当時はポーリング周期60秒に対して意図的に短くしていた）
+/// は300秒化で意味を失った
+pub(crate) const USAGE_MIN_REFETCH_SECS: i64 = 300;
+
+/// 手動経路（force==true。トレイの「ステータス更新」・アカウント画面表示・切り替え直後）での
+/// 試行間隔の下限（秒）。U-1（2026-08-22、第5ラウンド）新設。
+/// ユーザー操作を自動経路と同じ5分間まったく効かなくするのは行き過ぎだが、
+/// `accounts-updated` イベント経由でフロントが繰り返し再取得しうるため無制限にもしない。
+///
+/// 60 ではなく45（V-4、2026-08-22 第6ラウンド）: トレイの `REFRESH_INTERVAL`（60秒）と
+/// 同値だと、到達時刻の揺れ（処理時間・スケジューラの遅延等）で「60秒経過している/いない」が
+/// 実行のたびにぶれ、force 経路が通ったり弾かれたりする。R-5 で `USAGE_MIN_REFETCH_SECS` を
+/// 45秒にしていた（後に S-1 で300秒化）のと同じ理由で、周期と同値を避ける
+pub(crate) const USAGE_FORCE_MIN_ATTEMPT_SECS: i64 = 45;
+
+/// 非ライブアカウント（切り替え前に眺めるだけの他アカウント）はライブほど鮮度が要らないため、
+/// 別の緩い閾値を持つ（2026-08-22: リクエスト数削減。ライブと同じ60秒だと、登録アカウント数が
+/// 増えるほど `/api/oauth/usage` への打鍵回数が線形に増えていた）。
+///
+/// 元は accounts.rs 内で完結していたが、V-2（2026-08-22 第6ラウンド）で
+/// `usage_attempt_min_interval` をここへ一本化したのに伴い、この定数も一緒に移した
+/// （accounts.rs は macOS 限定ファイルで、非ライブを扱わない tray.rs からは参照できないため）
+pub(crate) const NON_LIVE_MIN_REFETCH_SECS: i64 = 600;
+
+/// 「最後に試行した時刻」ゲート（`gate_usage_attempt`）に渡す下限間隔（U-1、2026-08-22
+/// 第5ラウンドで導入。V-2、2026-08-22 第6ラウンドで accounts.rs から actions.rs へ移設）。
+///
+/// Why 移設: accounts.rs（macOS 限定）に private として置いていたが、tray.rs の
+/// フォールバック経路も同じ規則（force かどうかで間隔を切り替える）を必要とし、
+/// tray.rs 側は同じ規則をインラインの `if force {...} else {...}` として別々に持っていた。
+/// 同じ規則を2箇所が別々に持つ構図（切り出したはずが本体側にも別ロジックが残る）は
+/// 前ラウンドで一度指摘された構図の再発だったため、全プラットフォームでコンパイルされる
+/// ここへ一本化し、accounts.rs と tray.rs の両方から呼ぶ形にした。
+///
+/// `force_skips_freshness_check` と同じ規約で、force の短縮効果はライブアカウントに
+/// 限定する（非ライブは force の値に関係なく常に `NON_LIVE_MIN_REFETCH_SECS`）。
+/// tray.rs のフォールバック経路は常にライブ単体を扱うため `is_live = true` 固定で呼ぶ。
+///
+/// これは「キャッシュがどれだけ新鮮なら試行自体をスキップするか」（accounts.rs の
+/// `cache_is_fresh_enough`）とは別物: あちらは前回**成功**した時刻を基準にするが、
+/// こちらは前回**試行した**時刻（成否を問わない）を基準にする。429 等が続いてキャッシュが
+/// 一向に新鮮化しない場合でも、この間隔だけは守らせるためのゲート
+pub(crate) fn usage_attempt_min_interval(is_live: bool, force: bool) -> std::time::Duration {
+    let secs = if is_live && force {
+        USAGE_FORCE_MIN_ATTEMPT_SECS
+    } else if is_live {
+        USAGE_MIN_REFETCH_SECS
+    } else {
+        NON_LIVE_MIN_REFETCH_SECS
+    };
+    std::time::Duration::from_secs(secs as u64)
+}
+
+/// 表示中の使用量が「本当に古い」と言える閾値（tray.rs の注記表示が使う。2026-08-22、
+/// 第4ラウンド S-3 新設）。USAGE_MIN_REFETCH_SECS（照会間隔）とは別の目的の定数: こちらは
+/// 「いつ取得したか」ではなく「表示に使っている値がどれだけ古いか」を見て注記を出すかどうかの
+/// 基準。
+///
+/// 元は accounts.rs にあり、tray.rs（macOS 以外でもコンパイルされる）が
+/// `accounts_stub.rs` 側に同じ値をミラーして参照していたが、cfg が排他なので値がズレても
+/// コンパイル時・実行時のどちらでも検知できなかった（U-3、2026-08-22 第5ラウンドでここへ
+/// 一本化。以後ミラーは持たない）
+pub const USAGE_STALE_NOTE_SECS: i64 = 600;
+
+/// 「最後に `/api/oauth/usage` への照会を試みた時刻」をプロセス内に保持する
+/// （U-1、2026-08-22 第5ラウンド）。
+///
+/// Why: 従来のスロットルは「成功したら usage_cache に fetched_at を書き、次回それが
+/// 閾値以内ならスキップ」だけだった。これは「成功時のキャッシュ」を鮮度判定に使っている
+/// だけで、「試行したこと自体」はどこにも記録していなかった。そのため 429 が続く間は
+/// fetched_at が一切更新されず、トレイの60秒サイクルごとに `/api/oauth/usage` を
+/// 叩き続けてしまっていた（いちばん間隔を空けたい場面でスロットルが消えていた）。
+///
+/// **usage_cache 側の `fetched_at`（成功時のみ更新）を失敗時にも更新して代用してはいけない**。
+/// S-3 の「表示に使った値の古さ」判定はその `fetched_at` に依存しており、失敗時にも
+/// 更新してしまうと実際には古い値を「今取得した」と誤認させてしまい、注記が出なくなる
+/// （S-3 の修正が丸ごと無意味になる）。そのため試行時刻は usage_cache とは別の状態として
+/// ここに持つ。
+///
+/// キーは照会対象の識別子。`accounts::get_accounts_usage` は同一アカウントでも
+/// LiveOauth と SnapshotOauth で別々のキー（`<name>:live` / `<name>:snapshot`）を使う
+/// （同じキーを共有すると、429以外の理由でライブ経路が失敗した直後にスナップショット経路への
+/// フォールバックまで塞いでしまい、2026-07-27 に導入したフォールバック連鎖が壊れるため）。
+/// `tray.rs` のフォールバック経路は固定キー（`TRAY_LIVE_FALLBACK_KEY`）を使う
+static USAGE_LAST_ATTEMPT: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// `tray.rs` のフォールバック経路（`live_usage_summary()` を直接呼ぶ側）専用の固定キー。
+/// 登録アカウントの `name` ベースのキー（`<name>:live` 等）と衝突しない文字列にする
+pub(crate) const TRAY_LIVE_FALLBACK_KEY: &str = "__live_fallback__";
+
+/// 直近の試行時刻から `min_interval` が経過していれば true（＝試行してよい）。
+/// HTTP を打たずに単体テストできるよう、状態・時計から分離した純粋関数（U-1）。
+/// - `last` が `None`（まだ一度も試していない）→ true
+/// - `now.duration_since(last)` が `Ok` で `min_interval` 以上経過している → true
+/// - 時計が巻き戻っていて `duration_since` が `Err` → true（経過扱いにして再開を許す。
+///   `debounced_token_nudge` と同じ方針）
+/// - それ以外（`min_interval` 未満しか経過していない）→ false
+pub(crate) fn usage_attempt_allowed(
+    last: Option<std::time::SystemTime>,
+    min_interval: std::time::Duration,
+    now: std::time::SystemTime,
+) -> bool {
+    match last {
+        None => true,
+        Some(last) => now
+            .duration_since(last)
+            .map(|elapsed| elapsed >= min_interval)
+            .unwrap_or(true),
+    }
+}
+
+/// `key` について `usage_attempt_allowed` を判定し、許可されたときだけ「今試行した」ことを
+/// 記録して true を返す。呼び出し側はこれが true のときだけ実際に HTTP を打つこと
+/// （false ならキャッシュへフォールバックし、HTTP は一切打たない）。
+///
+/// 成否にかかわらず「試みた」時点で記録するのが要点（成功だけを記録する usage_cache の
+/// `fetched_at` とは別物）。実際の成否は呼び出し側が別途 `oauth_get_checked` 等で判定する
+pub(crate) fn gate_usage_attempt(key: &str, min_interval: std::time::Duration) -> bool {
+    let now = std::time::SystemTime::now();
+    let mut map = USAGE_LAST_ATTEMPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let last = map.get(key).copied();
+    if usage_attempt_allowed(last, min_interval, now) {
+        map.insert(key.to_string(), now);
+        true
+    } else {
+        false
+    }
 }
 
 /// 期限切れ相当（401 or 応答本文の authentication_error）、レート制限（429 or 応答本文の
 /// rate_limit_error）、通信不能（接続失敗・タイムアウト等）、それ以外の予期しない失敗
 /// （応答の構文エラー等）を区別する。Network を Other から分離したのは
 /// accounts::resolve_live_owner が「通信を確認して再試行」と「その他のエラー」を
-/// 別文言で案内する必要があるため（2026-08-08、issue #1/#2 対応）。fetch_live_usage_status は
-/// 従来どおり両方を同じ Error 表示にまとめるため、ここでの分離は表示側の挙動を変えない。
+/// 別文言で案内する必要があるため（2026-08-08、issue #1/#2 対応）。
 /// RateLimited は 2026-08-22 追加: 従来は HTTP ステータスを一切見ず「本文に error フィールドが
 /// あれば全部期限切れ」と判定していたため、429（レート制限。実測: 本文
 /// `{"error":{"type":"rate_limit_error",...}}`）が「token 期限切れ」と誤表示されていた
@@ -213,7 +356,7 @@ pub(crate) fn classify_oauth_response(status: u16, body: &str) -> FetchOutcome {
 }
 
 /// reqwest::blocking のランタイムパニック回避のため、上記と同じ理由で素の OS スレッドへ逃がす。
-/// fetch_live_usage_status（使用量取得）と accounts::resolve_live_owner（持ち主確認）が共有する
+/// live_usage_summary_gated（使用量取得）と accounts::resolve_live_owner（持ち主確認）が共有する
 pub(crate) fn oauth_get_checked(token: &str, url: &str) -> FetchOutcome {
     let token = token.to_string();
     let url = url.to_string();
@@ -249,7 +392,16 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// access token の有効期限切れ判定。fetch_live_usage_status と accounts::resolve_live_owner
+/// UsageSummary::fetched_at のスタンプ用（S-3、2026-08-22）。now_ms と同じ SystemTime だが
+/// 表示側（tray.rs::reset_local）が epoch 秒で扱うため秒精度で返す
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// access token の有効期限切れ判定。live_usage_summary_gated と accounts::resolve_live_owner
 /// の入口チェックが共有し、無駄な401リクエストを減らす（2026-08-08、issue #1:
 /// resolve_live_owner がこのチェックを持っていなかった）。
 /// なお accounts.rs の `token_is_still_valid`（get_accounts_usage 経由、登録済み他アカウントの
@@ -259,34 +411,28 @@ pub(crate) fn is_token_expired(expires_at: Option<i64>) -> bool {
     expires_at.is_some_and(|exp| exp <= now_ms())
 }
 
-/// 事前に access token の有効期限を確認し、期限切れなら API を呼ばずに Expired を返す
-/// （無駄な401リクエストを減らす）。期限内でも 401・error フィールド応答が返れば、
-/// 事前判定をすり抜けたケースとして同じ Expired 扱いにする。refresh は一切行わない
-/// （refresh してしまうと refresh token が消費され、アカウント切り替え機能の安全性の
-/// 根幹である「refresh token は Claude Code 本体だけが触る」という前提が崩れるため）
-fn fetch_live_usage_status(url: &str) -> UsageFetch {
-    let (token, expires_at) = match crate::credentials::live_token_with_expiry() {
-        Ok(v) => v,
-        Err(e) => return UsageFetch::Error { message: e },
-    };
-    if is_token_expired(expires_at) {
-        return UsageFetch::Expired;
-    }
-    match oauth_get_checked(&token, url) {
-        FetchOutcome::Ok(body) => UsageFetch::Ok { body },
-        FetchOutcome::Expired => UsageFetch::Expired,
-        FetchOutcome::RateLimited => UsageFetch::RateLimited,
-        FetchOutcome::Network => UsageFetch::Network,
-        FetchOutcome::Other(message) => UsageFetch::Error { message },
-    }
-}
-
-/// メニューバー向けの使用量サマリー。使用率は 0〜100、リセットは epoch 秒
+/// メニューバー向けの使用量サマリー。使用率は 0〜100、リセットは epoch 秒。
+///
+/// `fetched_at`（2026-08-22、S-3 追加）: この値が実際にいつ取得されたか（epoch 秒）。
+/// tray.rs が「表示中の値がどれだけ古いか」を判定して注記を出すために使う
+/// （live_error という「取得に失敗したか」ではなく「表示している値そのものの古さ」を
+/// 見る方針に変えたため。live_error だけを見ると、失敗しても別ソースで新鮮な値が
+/// 取れているケースで事実と違う注記が出てしまっていた）。
+/// `parse_usage_body`・`usage_via_monitor_token` はいずれも HTTP 応答を受け取った直後にしか
+/// 呼ばれないため、その時点の `now_epoch_secs()` をそのままスタンプしてよい
+/// （キャッシュ経由で古い値を UsageSummary に詰め直す経路は tray.rs 側で別途 fetched_at を
+/// 引き継ぐ。`usage_summary_from_batch` 参照）
+///
+/// `Clone` は V-1（2026-08-22、第6ラウンド）で追加: tray.rs のフォールバック経路専用の
+/// 「直近に取得できた値」保持（`TRAY_LIVE_FALLBACK_LAST_OK`）に複製して格納するために必要。
+/// `Debug` はテストの失敗時アサーションメッセージ（`{result:?}` 等）用
+#[derive(Clone, Debug)]
 pub struct UsageSummary {
     pub five_pct: f64,
     pub seven_pct: f64,
     pub five_reset: Option<i64>,
     pub seven_reset: Option<i64>,
+    pub fetched_at: Option<i64>,
 }
 
 fn iso_to_epoch(s: &str) -> Option<i64> {
@@ -294,7 +440,8 @@ fn iso_to_epoch(s: &str) -> Option<i64> {
 }
 
 /// `/api/oauth/usage` の応答本文を UsageSummary へ変換する。ライブアカウント・登録済み他
-/// アカウント問わず同じ形の応答なので、accounts::get_accounts_usage からも共有して使う
+/// アカウント問わず同じ形の応答なので、accounts::get_accounts_usage からも共有して使う。
+/// 呼ばれるのは常に HTTP 応答を受け取った直後なので、fetched_at は現在時刻でよい
 pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|_| "使用量の応答が不正です".to_string())?;
@@ -319,6 +466,7 @@ pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
         seven_pct,
         five_reset,
         seven_reset,
+        fetched_at: Some(now_epoch_secs()),
     })
 }
 
@@ -412,15 +560,16 @@ pub fn usage_via_monitor_token(token: &str) -> Result<UsageSummary, String> {
         seven_pct: pct("7d").unwrap_or(0.0),
         five_reset: reset("5h"),
         seven_reset: reset("7d"),
+        fetched_at: Some(now_epoch_secs()),
     })
 }
 
-/// live_usage_summary() の失敗理由。トレイ・使用量ポップオーバー（tray.rs）が原因つきの
-/// 案内文を出し分けるための分類（2026-08-08、issue #4）。以前は「期限切れも通常の失敗も
-/// 区別せず表示しない」としていたが、切り替え後に token 期限切れで使用量が固定表示のまま
-/// 止まる原因が伝わらないという報告を受け、区別を外へ引き継ぐようにした。
-/// Expired/Network の分類自体は fetch_live_usage_status（#1 で導入した is_token_expired・
-/// FetchOutcome::Expired/Network）をそのまま使う
+/// ライブアカウントの使用率取得（`live_usage_summary_gated`。accounts.rs の LiveOauth 経路）の
+/// 失敗理由。トレイ・使用量ポップオーバー（tray.rs）が原因つきの案内文を出し分けるための分類
+/// （2026-08-08、issue #4）。以前は「期限切れも通常の失敗も区別せず表示しない」としていたが、
+/// 切り替え後に token 期限切れで使用量が固定表示のまま止まる原因が伝わらないという報告を受け、
+/// 区別を外へ引き継ぐようにした。Expired/Network の分類自体は #1 で導入した
+/// is_token_expired・FetchOutcome::Expired/Network をそのまま使う
 #[derive(Debug, Clone)]
 pub enum LiveUsageError {
     Expired,
@@ -428,19 +577,6 @@ pub enum LiveUsageError {
     RateLimited,
     Network,
     Other(String),
-}
-
-/// 現在ログイン中（ライブ）アカウントの使用率。`/api/oauth/usage` を直接叩く
-/// （2026-07-25 ユーザー決定: 監視用長期トークンによる複数アカウント表示は全廃し、
-/// ライブアカウントのみを表示する一本道にした）
-pub fn live_usage_summary() -> Result<UsageSummary, LiveUsageError> {
-    match fetch_live_usage_status(USAGE_URL) {
-        UsageFetch::Ok { body } => parse_usage_body(&body).map_err(LiveUsageError::Other),
-        UsageFetch::Expired => Err(LiveUsageError::Expired),
-        UsageFetch::RateLimited => Err(LiveUsageError::RateLimited),
-        UsageFetch::Network => Err(LiveUsageError::Network),
-        UsageFetch::Error { message } => Err(LiveUsageError::Other(message)),
-    }
 }
 
 /// FetchOutcome（HTTP から得た生の判定）を LiveUsageError 系の Result へ変換する純粋関数。
@@ -457,79 +593,223 @@ pub(crate) fn live_oauth_outcome_to_result(outcome: FetchOutcome) -> Result<Usag
     }
 }
 
-/// 429（レート制限）を受けた後に `/api/oauth/usage` への照会を控える期間の管理。
-/// プロセス内グローバル1本で持つ（同一エンドポイントへの過剰打鍵を確実に止めることを
-/// 最優先にしたため）。
+/// 「最後に `/api/oauth/usage` を試行した際の実際の失敗理由」を、`USAGE_LAST_ATTEMPT` と
+/// 同じキー空間でプロセス内に保持する（W-1、2026-08-22 第7ラウンド）。
 ///
-/// accounts.rs ではなくここ（actions.rs）に置く理由（2026-08-22、T-2）: `/api/oauth/usage` を
-/// 叩く経路は accounts::get_accounts_usage（LiveOauth/SnapshotOauth）だけでなく、
-/// tray::fetch_raw_status がライブをバッチから拾えなかったときに直接呼ぶ
-/// `live_usage_summary()`（未登録ライブ・has_credentials=false、および **Windows/Linux では
-/// これが唯一の取得経路**）もある。accounts.rs は macOS でしかコンパイルされないため、
-/// そちらにバックオフ状態を置くと非 macOS ビルドの `live_usage_summary()` 経由の打鍵が
-/// バックオフの管轄外のまま 429 に張り付き続けてしまう。actions.rs は全プラットフォームで
-/// 無条件にコンパイルされるため、両方の経路から同じグローバル状態を共有できる。
+/// Why: 試行間隔ゲート（`USAGE_LAST_ATTEMPT` / `gate_usage_attempt`）は「いつ試行したか」だけを
+/// 記録し、「その試行が何で失敗したか」は保持していなかった。そのためゲートに塞がれた
+/// 呼び出し側は「塞がれた」という事実からしか結果を組み立てられず、実際には起きていない
+/// 原因を名乗ってしまっていた: accounts.rs の LiveOauth 経路は通信ゼロのまま
+/// `RateLimited`（レート制限）を決め打ちし、tray.rs の `resolve_gated_live_usage` は
+/// 保持値（`UsageSummary`）が無いとき `Other`（＝「Claude Code でログインしてください」）に
+/// 倒していた。後者は特に矛盾している: `Gated` を返す時点で `live_usage_summary_gated` は
+/// 資格情報の読み取りと期限チェックを既に通過しており、ログイン済み・期限内であることは
+/// 型レベルで確定しているのに「ログインしてください」と案内していた。
 ///
-/// 「終端時刻（until）」ではなく「記録時刻＋待ち時間」で持つ（2026-08-22、R-4）。終端時刻方式は
-/// `until.duration_since(now)` が Err になるのを巻き戻り検知に使うつもりだったが、Err になるのは
-/// until < now（＝普通に経過しただけ）のときで、想定していた「now が過去へ飛んで
-/// until - now が巨大になる」ケースの保護になっていなかった。記録時刻からの経過方向
-/// （`now.duration_since(recorded_at)`）で測れば、時計が巻き戻って now < recorded_at に
-/// なった場合は Err になり、そこを「経過扱い」にして再開を許せる
-static USAGE_BACKOFF_SINCE: std::sync::Mutex<Option<(std::time::SystemTime, std::time::Duration)>> =
-    std::sync::Mutex::new(None);
-/// 連続 429 回数。バックオフ時間を指数的に伸ばすのに使う
-static USAGE_BACKOFF_STREAK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+/// この状態を使い、ゲートで塞いだときは「塞いだ」という事実の代わりに「直近に実際に
+/// 試行して分かった失敗理由」を返す（`resolve_gated_error` 参照）
+static USAGE_LAST_ERROR: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, LiveUsageError>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// バックオフ待ち時間 = min(5分 * 2^streak, 60分)。HTTP を打たずにテストできるよう
-/// 純粋関数として切り出す
-pub(crate) fn usage_backoff_wait(streak: u32) -> std::time::Duration {
-    let minutes = 5u64.saturating_mul(1u64.checked_shl(streak).unwrap_or(u64::MAX));
-    std::time::Duration::from_secs(minutes.min(60) * 60)
+/// `key` の直近の失敗理由として `error` を記録する。実際に試行して失敗した箇所から呼ぶ
+/// （ゲートに塞がれて試行しなかった場合は呼ばない）
+pub(crate) fn record_usage_error(key: &str, error: LiveUsageError) {
+    USAGE_LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key.to_string(), error);
 }
 
-/// recorded_at・wait・now だけから「まだバックオフの途中か」を判定する純粋関数。
-/// now.duration_since(recorded_at) が Err になるのは now < recorded_at（＝時計が過去へ
-/// 巻き戻った）ときで、この場合は経過扱いにして再開を許す（R-4）
-pub(crate) fn usage_backoff_pending(
-    recorded_at: std::time::SystemTime,
-    wait: std::time::Duration,
-    now: std::time::SystemTime,
-) -> bool {
-    now.duration_since(recorded_at).is_ok_and(|elapsed| elapsed < wait)
+/// `key` の直近の失敗理由を消す。実際に試行して成功した箇所から呼ぶ
+pub(crate) fn clear_usage_error(key: &str) {
+    USAGE_LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
 }
 
-/// 現在バックオフ中か（HTTP を打つ前に必ず確認する）
-pub(crate) fn usage_backoff_active(now: std::time::SystemTime) -> bool {
-    let since = USAGE_BACKOFF_SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    since.is_some_and(|(recorded_at, wait)| usage_backoff_pending(recorded_at, wait, now))
+/// `key` が直近保持している失敗理由を取り出す（消費せず参照のみ）
+pub(crate) fn last_usage_error(key: &str) -> Option<LiveUsageError> {
+    USAGE_LAST_ERROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
 }
 
-/// 429 を受けたのでバックオフを延長し、連続回数を+1する
-pub(crate) fn usage_backoff_record_rate_limited() {
-    let now = std::time::SystemTime::now();
-    let mut streak = USAGE_BACKOFF_STREAK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let wait = usage_backoff_wait(*streak);
-    *USAGE_BACKOFF_SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((now, wait));
-    *streak = streak.saturating_add(1);
+/// ゲートで塞いだときに何を返すべきかを決める純粋関数（W-1）。HTTP を打たずに単体テスト
+/// できるよう、状態（`USAGE_LAST_ERROR`）から分離してある。
+/// - `Some(e)` → 直近に実際に試行して分かった失敗理由をそのまま返す
+/// - `None` → 塞がれたのに一度も試行していない状態。理論上は起きない（ゲートは
+///   `gate_usage_attempt` が試行を許可した直後にしか消費されず、その消費と対になる形で
+///   このキーへ必ず記録・消去のどちらかが行われるため）が、防御的に扱う。この場合も
+///   `RateLimited`（実際は通信していない）や、既存の `Other` 決め打ち文言（実質
+///   「ログインしてください」を意味していた）は名乗らせず、新しい中立な文言を持つ `Other` を返す
+pub(crate) fn resolve_gated_error(held: Option<LiveUsageError>) -> LiveUsageError {
+    held.unwrap_or_else(|| LiveUsageError::Other("使用量を取得できませんでした".to_string()))
 }
 
-/// 照会に成功したのでバックオフを解除する
-pub(crate) fn usage_backoff_reset() {
-    *USAGE_BACKOFF_SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-    *USAGE_BACKOFF_STREAK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
+/// `live_usage_summary_gated` の戻り値（V-1、2026-08-22 第6ラウンド）。
+///
+/// Why: `LiveUsageError` だけでは「試行間隔ゲートに塞がれて HTTP を一度も打っていない」ことと
+/// 「実際に HTTP を打って（あるいは資格情報チェックの時点で）判明した失敗」を区別できない。
+/// U-1（第5ラウンド）でこの経路にゲートを追加した際、ゲートを資格情報チェックより手前に
+/// 置いてしまったため、(1) この経路には accounts.rs の usage_cache のような永続キャッシュが
+/// 無く、ゲートで塞ぐとそのまま数値が消えてエラー画面になる、(2) 未ログイン・期限切れという
+/// HTTP を伴わない失敗でもゲートを消費してしまい、一度も通信していないのに
+/// 「レート制限」と誤表示する、という2つの退行を生んだ（accounts.rs の LiveOauth 経路は
+/// もともと資格情報チェック→ゲート→HTTP の順で正しく、tray.rs 側だけが順序を誤っていた）。
+/// この型で「塞がれた」ことを他の失敗と型レベルで分離し、呼び出し側が RateLimited を
+/// 誤って名乗らないようにする
+#[derive(Debug)]
+pub(crate) enum GatedLiveUsageOutcome {
+    Ok(UsageSummary),
+    /// 資格情報の読み取り・期限チェック、または実際の HTTP 呼び出しで判明した失敗理由。
+    /// ゲートは一切絡んでいない（RateLimited もここに含まれうるが、それは実際に 429 を
+    /// 受け取った場合のみ）
+    Failed(LiveUsageError),
+    /// 資格情報チェックは通過したが、試行間隔ゲートに塞がれて HTTP を打たなかった。
+    /// 「レート制限を受けた」という意味ではない
+    Gated,
 }
+
+/// tray.rs のフォールバック経路（バッチにライブアカウントが存在しないとき＝未ログイン・
+/// 未登録ライブ・`has_credentials=false`・非 macOS 全体）専用の取得関数（V-1(a)）。
+/// `live_usage_summary()` と違い、「資格情報の読み取り → 期限チェック → ゲート → HTTP」の
+/// 順で処理し、ゲートは資格情報チェックを通過した後にだけかける（accounts.rs の
+/// LiveOauth 経路と同じ順序に揃えた）。これにより、資格情報が無い・期限切れという時点で
+/// 判明する失敗はゲートを一切消費せず、実際の理由がそのまま呼び出し側へ渡る
+pub(crate) fn live_usage_summary_gated(key: &str, min_interval: std::time::Duration) -> GatedLiveUsageOutcome {
+    let (token, expires_at) = match crate::credentials::live_token_with_expiry() {
+        Ok(v) => v,
+        Err(e) => return GatedLiveUsageOutcome::Failed(LiveUsageError::Other(e)),
+    };
+    if is_token_expired(expires_at) {
+        return GatedLiveUsageOutcome::Failed(LiveUsageError::Expired);
+    }
+    if !gate_usage_attempt(key, min_interval) {
+        return GatedLiveUsageOutcome::Gated;
+    }
+    // W-1（2026-08-22 第7ラウンド）: ゲートを消費した実際の HTTP 結果を USAGE_LAST_ERROR に
+    // 記録・消去する。次回この key がゲートに塞がれたとき、`resolve_gated_live_usage` が
+    // ここで記録した値を「実際の失敗理由」として参照する
+    match live_oauth_outcome_to_result(oauth_get_checked(&token, USAGE_URL)) {
+        Ok(u) => {
+            clear_usage_error(key);
+            GatedLiveUsageOutcome::Ok(u)
+        }
+        Err(e) => {
+            record_usage_error(key, e.clone());
+            GatedLiveUsageOutcome::Failed(e)
+        }
+    }
+}
+
+/// tray.rs のフォールバック経路で最後に成功取得できた値をプロセス内に保持する（V-1(b)）。
+///
+/// Why: この経路には accounts.rs の usage_cache のような永続キャッシュが無い。ゲートに
+/// 塞がれたときに何も返せないと数値がそのまま消えてエラー画面になってしまう
+/// （トレイは60秒周期・自動経路の間隔は300秒のため、5〜6サイクルに1回しか通信せず、
+/// 残りのサイクルではこの保持値だけが頼りになる）。**成功時にのみ更新すること**
+/// （失敗・ゲート時にも更新すると `fetched_at`＝「実際にいつ取得したか」という意味が壊れ、
+/// S-3 の古さ判定が丸ごと無意味になる）
+static TRAY_LIVE_FALLBACK_LAST_OK: std::sync::Mutex<Option<UsageSummary>> = std::sync::Mutex::new(None);
+
+pub(crate) fn tray_live_fallback_last_ok() -> Option<UsageSummary> {
+    TRAY_LIVE_FALLBACK_LAST_OK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+pub(crate) fn store_tray_live_fallback_last_ok(summary: UsageSummary) {
+    *TRAY_LIVE_FALLBACK_LAST_OK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(summary);
+}
+
+/// `GatedLiveUsageOutcome` と保持値から、呼び出し側が使う最終結果を決める純粋関数
+/// （V-1(b)(c)、W-1 で `held_error` 引数を追加）。HTTP を打たずに単体テストできるよう、
+/// ネットワーク I/O（`live_usage_summary_gated`）から分離した。
+///
+/// - `Ok(u)` → そのまま `Ok(u)`。保持値の更新は呼び出し側の責務（この関数は参照のみ）
+/// - `Failed(e)` → そのまま `Err(e)`。ゲートは絡んでいない実際の失敗理由なので、そのまま渡す
+/// - `Gated` かつ保持値（`UsageSummary`）あり → 保持値を `Ok` として返す（数値が出続ける。
+///   V-1(b)）。`fetched_at` は保持値が実際に取得された時刻のままなので、S-3 の古さ判定
+///   （`USAGE_STALE_NOTE_SECS`）が引き続き機能する
+/// - `Gated` かつ保持値なし → 従来はここで `RateLimited` を経ずに `Other`（＝「ログインして
+///   ください」）を決め打ちしていたが、`Gated` を返す時点で資格情報チェックは既に通過して
+///   いる（`live_usage_summary_gated` 参照）ため、ログイン済み・期限内の人に矛盾した案内を
+///   していた（W-1）。塞いだという事実の代わりに `held_error`（`USAGE_LAST_ERROR` に記録
+///   された、直近に実際に試行して分かった失敗理由）を `resolve_gated_error` で解決して返す
+pub(crate) fn resolve_gated_live_usage(
+    outcome: GatedLiveUsageOutcome,
+    held: Option<UsageSummary>,
+    held_error: Option<LiveUsageError>,
+) -> Result<UsageSummary, LiveUsageError> {
+    match outcome {
+        GatedLiveUsageOutcome::Ok(u) => Ok(u),
+        GatedLiveUsageOutcome::Failed(e) => Err(e),
+        GatedLiveUsageOutcome::Gated => match held {
+            Some(u) => Ok(u),
+            None => Err(resolve_gated_error(held_error)),
+        },
+    }
+}
+
+// 429（レート制限）を受けた後に段階的に待ち時間を延ばすバックオフ（5→10→20→40→60分）は、
+// 2026-08-22 の第3ラウンドまでで導入・完成させたが、同日の第4ラウンドで撤去した（S-2）。
+//
+// 導入した理由: 60秒サイクルで /api/oauth/usage を打ち続けると恒常的に429に張り付いていた
+// ため、429を受けたら指数的に間隔を空けて自然に収まるのを待つ設計にした。
+//
+// 撤去した理由: 実運用で「ほぼ常時オン」になり、副作用の方が実害として大きかった。
+// (1) バックオフ中は live_error が RateLimited 固定になるため、同じ周期内に他ソース
+//     （監視トークン等）が新鮮な値を取れていても注記が出っぱなしになり、「最新でない
+//     可能性」という文言が事実と食い違う（S-3 で注記の根拠を fetched_at に変えたのは
+//     これが理由）。ユーザーからは「少し時間が経つと必ず出てくる。普通に使えてはいる」
+//     という形で報告された
+// (2) Expired の自動復帰判定も RateLimited 固定に埋もれて最大60分遅れる
+//
+// 実測で分かった 429 の性質は USAGE_MIN_REFETCH_SECS（本ファイル。2026-08-22 第5ラウンド
+// U-1 で accounts.rs から移設した）の doc に書いた。
+// 要点は「頻度によるものでアカウント単位、かつ枠が狭い」こと。段階的に延長するより、
+// 照会間隔そのものを5分に空けて上限から距離を取るほうが素直に効く（ユーザー決定、2026-08-22）。
+//
+// 撤去後に残すもの: 「同一サイクル内で429を観測したら、以降のソースも同じエンドポイントを
+// 叩かない」というローカルフラグ（cycle_saw_rate_limited、accounts.rs 参照）だけは残す。
+// これは同一周期内の無駄打ちを避けるだけで、次の周期（5分後）は必ず再試行するため、
+// 上記の副作用を持ち込まない。
+//
+// 注記（2026-08-22、第5ラウンド U-1）: 撤去した直後の時点では、この「次の周期（5分後）は
+// 必ず再試行する」という記述は不正確だった。試行した時刻自体をどこにも記録していなかった
+// ため、429が続く間は usage_cache の fetched_at（成功時のみ更新）が更新されず、
+// キャッシュが古いままになって実際にはトレイの60秒サイクルごとに毎回再試行していた
+// （5分に空けたはずの間隔が、いちばん空けたい場面で消えていた）。U-1 で
+// 試行間隔ゲート（usage_attempt_allowed / gate_usage_attempt、成否にかかわらず
+// 試行した時点を記録する）を導入したことで、この記述は文字通り正しくなっている。
+//
+// 将来429が再び問題になった場合は、グローバルな段階的バックオフを再導入する前に、
+// まず照会間隔（USAGE_MIN_REFETCH_SECS）の見直しから検討すること。
 
 #[cfg(test)]
 mod tests {
     /// 実環境の資格情報とネットワークを使う e2e 検証。
-    /// curl → reqwest 置き換え後も、ライブ資格情報 → /v1/messages のレート制限ヘッダ →
-    /// 使用率組み立ての経路が実際に通ることを確かめる。
-    /// CI では資格情報が無いため ignore とし、手元で `cargo test -- --ignored` で実行する
+    /// curl → reqwest 置き換え後も、ライブ資格情報 → /api/oauth/usage の
+    /// 使用率組み立ての経路が実際に通ることを確かめる。V-1（2026-08-22 第6ラウンド）で
+    /// tray.rs のフォールバック経路が `live_usage_summary_gated` に統一されたのに合わせ、
+    /// このテストもそちらを直接呼ぶ。他テストのキーと衝突しない専用キー・ゲートを
+    /// 一切効かせない `Duration::ZERO` を渡して、ゲート判定を経由せず実際の HTTP 経路だけを
+    /// 検証する。CI では資格情報が無いため ignore とし、手元で `cargo test -- --ignored` で実行する
     #[test]
     #[ignore]
     fn live_usage_e2e() {
-        let u = super::live_usage_summary().expect("ライブ使用量の取得に失敗");
+        let outcome = super::live_usage_summary_gated("test-e2e-live-usage", std::time::Duration::ZERO);
+        let u = match outcome {
+            super::GatedLiveUsageOutcome::Ok(u) => u,
+            other => panic!("ライブ使用量の取得に失敗: {other:?}"),
+        };
         assert!((0.0..=100.0).contains(&u.five_pct), "5h 使用率が範囲外: {}", u.five_pct);
         assert!(u.five_reset.is_some(), "5h リセット時刻が取れていない");
     }
@@ -630,82 +910,218 @@ mod tests {
         assert!(matches!(result, Err(super::LiveUsageError::Expired)));
     }
 
+    // U-1（2026-08-22、第5ラウンド）: 試行間隔ゲートの4分岐＋実際の状態管理（gate_usage_attempt）
+    use std::time::{Duration, SystemTime};
+
     #[test]
-    fn usage_backoff_wait_grows_exponentially_capped_at_60min() {
-        assert_eq!(super::usage_backoff_wait(0), std::time::Duration::from_secs(5 * 60));
-        assert_eq!(super::usage_backoff_wait(1), std::time::Duration::from_secs(10 * 60));
-        assert_eq!(super::usage_backoff_wait(2), std::time::Duration::from_secs(20 * 60));
-        assert_eq!(super::usage_backoff_wait(3), std::time::Duration::from_secs(40 * 60));
-        // 5分*2^3=40分 の次で60分に張り付く（80分にはならない）
-        assert_eq!(super::usage_backoff_wait(4), std::time::Duration::from_secs(60 * 60));
-        assert_eq!(super::usage_backoff_wait(10), std::time::Duration::from_secs(60 * 60));
+    fn usage_attempt_allowed_when_never_attempted() {
+        assert!(super::usage_attempt_allowed(None, Duration::from_secs(300), SystemTime::now()));
     }
 
     #[test]
-    fn usage_backoff_pending_true_within_window() {
-        let recorded_at = std::time::SystemTime::now();
-        let wait = std::time::Duration::from_secs(60);
-        let now = recorded_at + std::time::Duration::from_secs(30);
-        assert!(super::usage_backoff_pending(recorded_at, wait, now));
+    fn usage_attempt_allowed_when_interval_has_elapsed() {
+        let now = SystemTime::now();
+        let last = now - Duration::from_secs(301);
+        assert!(super::usage_attempt_allowed(Some(last), Duration::from_secs(300), now));
     }
 
     #[test]
-    fn usage_backoff_pending_false_after_elapsed() {
-        let recorded_at = std::time::SystemTime::now();
-        let wait = std::time::Duration::from_secs(60);
-        // wait を過ぎていれば経過済み
-        let now = recorded_at + std::time::Duration::from_secs(61);
-        assert!(!super::usage_backoff_pending(recorded_at, wait, now));
-        // ちょうど wait 経過（残り0秒）も「経過済み」扱い
-        assert!(!super::usage_backoff_pending(recorded_at, wait, recorded_at + wait));
+    fn usage_attempt_not_allowed_within_interval() {
+        let now = SystemTime::now();
+        let last = now - Duration::from_secs(100);
+        assert!(!super::usage_attempt_allowed(Some(last), Duration::from_secs(300), now));
+    }
+
+    /// 時計が巻き戻って duration_since が Err になるケース。R-4 と同じ方針で
+    /// 「経過扱い」にして再開を許す（無期限に止まったままにしない）
+    #[test]
+    fn usage_attempt_allowed_when_clock_went_backwards() {
+        let now = SystemTime::now();
+        let last = now + Duration::from_secs(50); // last が未来 = duration_since(last) が Err
+        assert!(super::usage_attempt_allowed(Some(last), Duration::from_secs(300), now));
+    }
+
+    /// gate_usage_attempt は「成否にかかわらず、試行した時点で記録する」ことの確認。
+    /// HTTP を一切打たずに、直後の再試行が間隔内でスキップされることだけを検証する
+    /// （＝ 429 等で失敗しても記録は残り、間隔内の再試行を抑止できることの土台）
+    #[test]
+    fn gate_usage_attempt_throttles_subsequent_call_within_interval() {
+        let key = "test-gate-basic-throttle";
+        assert!(super::gate_usage_attempt(key, Duration::from_secs(300)), "初回は許可されるはず");
+        assert!(!super::gate_usage_attempt(key, Duration::from_secs(300)), "直後の再試行は間隔内なのでスキップされるはず");
+    }
+
+    /// force 経路（USAGE_FORCE_MIN_ATTEMPT_SECS = 45秒。V-4 で60→45に変更）は
+    /// 自動経路より短い下限でスロットルされることの確認
+    #[test]
+    fn gate_usage_attempt_force_interval_still_throttles_immediate_retry() {
+        let key = "test-gate-force-interval";
+        let force_interval = Duration::from_secs(super::USAGE_FORCE_MIN_ATTEMPT_SECS as u64);
+        assert!(super::gate_usage_attempt(key, force_interval), "初回は許可されるはず");
+        assert!(!super::gate_usage_attempt(key, force_interval), "下限秒未満の再試行はスキップされるはず");
+    }
+
+    /// 異なるキーは互いに独立してスロットルされる（アカウントごと・経路ごとに個別に
+    /// 間隔を管理できることの確認）
+    #[test]
+    fn gate_usage_attempt_keys_are_independent() {
+        assert!(super::gate_usage_attempt("test-gate-key-a", Duration::from_secs(300)));
+        assert!(super::gate_usage_attempt("test-gate-key-b", Duration::from_secs(300)), "別キーは影響を受けないはず");
+    }
+
+    // V-3（2026-08-22 第6ラウンド）: usage_attempt_min_interval の4通り（ライブ×force）の
+    // 戻り値を固定する。従来のテストは「60秒を引数で渡して塞がること」しか見ておらず、
+    // 「force のときに USAGE_FORCE_MIN_ATTEMPT_SECS が選ばれること」自体は守っていなかった
+    #[test]
+    fn usage_attempt_min_interval_live_auto_uses_min_refetch_secs() {
+        assert_eq!(
+            super::usage_attempt_min_interval(true, false),
+            Duration::from_secs(super::USAGE_MIN_REFETCH_SECS as u64),
+        );
     }
 
     #[test]
-    fn usage_backoff_pending_false_on_clock_rewind() {
-        // R-4: 時計が過去へ巻き戻った（now < recorded_at）ケースを実際に検証する。
-        // 旧実装（until 方式）はこのケースで until - now が巨大になり、
-        // 巻き戻り保護のつもりが逆にバックオフを解除できなくなっていた
-        let recorded_at = std::time::SystemTime::now();
-        let wait = std::time::Duration::from_secs(60);
-        let now = recorded_at - std::time::Duration::from_secs(3600);
-        assert!(!super::usage_backoff_pending(recorded_at, wait, now));
+    fn usage_attempt_min_interval_live_force_uses_force_min_attempt_secs() {
+        assert_eq!(
+            super::usage_attempt_min_interval(true, true),
+            Duration::from_secs(super::USAGE_FORCE_MIN_ATTEMPT_SECS as u64),
+        );
     }
 
-    /// T-3 追加テスト項目4: usage_backoff_active/record/reset のグローバル状態遷移。
-    /// プロセス内グローバル1本を直接操作するため、他のテストと並行に走って干渉しないよう
-    /// 1つのテスト関数にまとめて直列に検証する
     #[test]
-    fn usage_backoff_global_state_machine() {
-        super::usage_backoff_reset();
-        assert!(!super::usage_backoff_active(std::time::SystemTime::now()), "初期状態は非バックオフ");
+    fn usage_attempt_min_interval_non_live_auto_uses_non_live_min_refetch_secs() {
+        assert_eq!(
+            super::usage_attempt_min_interval(false, false),
+            Duration::from_secs(super::NON_LIVE_MIN_REFETCH_SECS as u64),
+        );
+    }
 
-        super::usage_backoff_record_rate_limited();
-        assert!(super::usage_backoff_active(std::time::SystemTime::now()), "1回目の429でバックオフ中になる");
-        {
-            let since = super::USAGE_BACKOFF_SINCE.lock().unwrap();
-            let (_, wait) = since.expect("バックオフ中は記録されているはず");
-            assert_eq!(wait, std::time::Duration::from_secs(5 * 60), "1回目の待ち時間は5分");
+    /// 非ライブは force の効果を受けない（force_skips_freshness_check と同じ規約）。
+    /// force=true でも NON_LIVE_MIN_REFETCH_SECS のままであることを固定する
+    #[test]
+    fn usage_attempt_min_interval_non_live_force_still_uses_non_live_min_refetch_secs() {
+        assert_eq!(
+            super::usage_attempt_min_interval(false, true),
+            Duration::from_secs(super::NON_LIVE_MIN_REFETCH_SECS as u64),
+        );
+    }
+
+    // V-1（2026-08-22 第6ラウンド）: ゲート後の資格情報チェックの順序と、保持値による
+    // フォールバックを HTTP を打たずに検証する
+    use super::{GatedLiveUsageOutcome, LiveUsageError, UsageSummary};
+
+    fn dummy_summary(fetched_at: i64) -> UsageSummary {
+        UsageSummary { five_pct: 12.0, seven_pct: 3.0, five_reset: None, seven_reset: None, fetched_at: Some(fetched_at) }
+    }
+
+    /// Ok は保持値の有無に関わらずそのまま Ok になる
+    #[test]
+    fn resolve_gated_live_usage_ok_passes_through_regardless_of_held() {
+        let outcome = GatedLiveUsageOutcome::Ok(dummy_summary(100));
+        let result = super::resolve_gated_live_usage(outcome, Some(dummy_summary(1)), None);
+        assert!(matches!(result, Ok(u) if u.fetched_at == Some(100)));
+    }
+
+    /// Failed（資格情報チェックの失敗、または実際の HTTP 失敗）はゲートを経由していないため、
+    /// 保持値があっても無視してそのままエラーを伝える（数値のすり替えをしない）
+    #[test]
+    fn resolve_gated_live_usage_failed_passes_through_even_with_held_value() {
+        let outcome = GatedLiveUsageOutcome::Failed(LiveUsageError::Expired);
+        let result = super::resolve_gated_live_usage(outcome, Some(dummy_summary(1)), None);
+        assert!(matches!(result, Err(LiveUsageError::Expired)));
+    }
+
+    /// V-1(b): ゲートで塞がれても保持値（UsageSummary）があればそれを返す（数値が消えない）。
+    /// held_error があっても held（数値）を優先する
+    #[test]
+    fn resolve_gated_live_usage_gated_with_held_value_returns_held_value() {
+        let outcome = GatedLiveUsageOutcome::Gated;
+        let result = super::resolve_gated_live_usage(
+            outcome,
+            Some(dummy_summary(42)),
+            Some(LiveUsageError::Network),
+        );
+        assert!(matches!(result, Ok(u) if u.fetched_at == Some(42)));
+    }
+
+    /// W-1: ゲートで塞がれ、保持値（UsageSummary）は無いが直近の失敗理由（held_error）は
+    /// あるとき、その実際の理由をそのまま返す（RateLimited でも Other でもなく、
+    /// 記録されていた本来の理由になること）
+    #[test]
+    fn resolve_gated_live_usage_gated_without_held_value_uses_held_error() {
+        let outcome = GatedLiveUsageOutcome::Gated;
+        let result = super::resolve_gated_live_usage(outcome, None, Some(LiveUsageError::Network));
+        assert!(matches!(result, Err(LiveUsageError::Network)));
+    }
+
+    /// V-1(c)/W-1: ゲートで塞がれ、保持値も held_error も無い（理論上は起きない防御的分岐）
+    /// ときは RateLimited を名乗らない
+    #[test]
+    fn resolve_gated_live_usage_gated_without_held_value_or_error_is_not_rate_limited() {
+        let outcome = GatedLiveUsageOutcome::Gated;
+        let result = super::resolve_gated_live_usage(outcome, None, None);
+        assert!(!matches!(result, Err(LiveUsageError::RateLimited)), "RateLimited を名乗ってはいけない: {result:?}");
+    }
+
+    // W-1（2026-08-22 第7ラウンド）: resolve_gated_error の2分岐と、USAGE_LAST_ERROR の
+    // 記録・消去・参照（HTTP を打たない状態操作のみを対象にする）
+
+    /// resolve_gated_error: 保持値があればそれをそのまま返す
+    #[test]
+    fn resolve_gated_error_with_held_returns_it() {
+        let result = super::resolve_gated_error(Some(LiveUsageError::Expired));
+        assert!(matches!(result, LiveUsageError::Expired));
+    }
+
+    /// resolve_gated_error: 保持値が無いとき（理論上は起きない防御的分岐）は RateLimited を
+    /// 名乗らず、Other だが従来の「ログインしてください」に紐づいていた固定文言とも異なる
+    /// 中立な文言になる
+    #[test]
+    fn resolve_gated_error_without_held_is_neutral_other_not_rate_limited() {
+        let result = super::resolve_gated_error(None);
+        match result {
+            LiveUsageError::Other(msg) => assert_eq!(msg, "使用量を取得できませんでした"),
+            other => panic!("Other になるはず: {other:?}"),
         }
-
-        // streak が加算前の値で wait 計算されていることを固定する（2回目は10分）
-        super::usage_backoff_record_rate_limited();
-        {
-            let since = super::USAGE_BACKOFF_SINCE.lock().unwrap();
-            let (_, wait) = since.expect("バックオフ中は記録されているはず");
-            assert_eq!(wait, std::time::Duration::from_secs(10 * 60), "2回目の待ち時間は10分");
-        }
-
-        super::usage_backoff_reset();
-        assert!(!super::usage_backoff_active(std::time::SystemTime::now()), "reset 後は非バックオフ");
-
-        super::usage_backoff_record_rate_limited();
-        {
-            let since = super::USAGE_BACKOFF_SINCE.lock().unwrap();
-            let (_, wait) = since.expect("バックオフ中は記録されているはず");
-            assert_eq!(wait, std::time::Duration::from_secs(5 * 60), "reset 後に再び429を受けたら5分に戻る");
-        }
-        super::usage_backoff_reset();
     }
+
+    /// USAGE_LAST_ERROR: 失敗を記録すると last_usage_error で取り出せる
+    #[test]
+    fn record_usage_error_then_last_usage_error_returns_it() {
+        let key = "test-usage-error-record";
+        super::record_usage_error(key, LiveUsageError::Network);
+        assert!(matches!(super::last_usage_error(key), Some(LiveUsageError::Network)));
+    }
+
+    /// USAGE_LAST_ERROR: 成功で消去すると last_usage_error は None に戻る
+    #[test]
+    fn clear_usage_error_removes_recorded_entry() {
+        let key = "test-usage-error-clear";
+        super::record_usage_error(key, LiveUsageError::Expired);
+        assert!(super::last_usage_error(key).is_some());
+        super::clear_usage_error(key);
+        assert!(super::last_usage_error(key).is_none());
+    }
+
+    /// USAGE_LAST_ERROR: 一度も記録していないキーは None
+    #[test]
+    fn last_usage_error_is_none_for_unrecorded_key() {
+        assert!(super::last_usage_error("test-usage-error-never-recorded").is_none());
+    }
+
+    // 資格情報チェックがゲートより先に走ること（＝未ログイン・期限切れでゲートを消費しない）
+    // の検証は、実 I/O 抜きでは書けないためテストにしない。
+    //
+    // 2026-08-22 第6ラウンドのレビューで、ここに `live_usage_summary_gated` を直接呼ぶ
+    // テストを置いていたが、次の3つの理由で削除した:
+    // 1. ログイン済みの開発機では Keychain を読んで `/api/oauth/usage` へ**実リクエストを送る**。
+    //    まさに節約しようとしている枠を、テストを走らせるたびに消費していた
+    // 2. その環境では分岐に入らず、アサーションが1つも実行されない空テストだった
+    // 3. オフライン・プロキシ下では偽陽性で落ちた（実測で確認済み）
+    //
+    // 順序そのものは `live_usage_summary_gated` の実装（資格情報の読み取りと期限チェックを
+    // `gate_usage_attempt` より手前に置く）で担保する。ゲート判定自体は
+    // `usage_attempt_allowed` / `gate_usage_attempt` の単体テストでカバー済み。
 }
 
 /// GUI アプリは zsh の PATH（.zshrc）を継承しないため、claude CLI は既知の

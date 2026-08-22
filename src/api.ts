@@ -373,8 +373,10 @@ export interface OtherAccountOverview {
 
 /** get_usage_overview の戻り値。live が取れなかったとき、live_error に原因（token 期限切れ／
  * 通信不能／その他）に応じて文言が変わる2行を改行区切りで持つ（固定文言ではない。
- * tray.rs::usage_advisory 参照）。live が取れていても、その値がバッチキャッシュ由来で
- * 最新でない可能性があるときは live_note に注記1行が入る（live_error とは排他） */
+ * tray.rs::usage_advisory 参照）。live が取れていても、その値の取得時刻が古い
+ * （USAGE_STALE_NOTE_SECS 超）ときは live_note に取得時刻の注記が入る（live_error とは排他）。
+ * 2026-08-22（S-3）: live_note は原因が Expired のときだけ復帰案内の行が付き、
+ * 改行区切りで2行になることがある */
 export interface UsageOverview {
   live_name: string | null;
   live: LiveUsage | null;

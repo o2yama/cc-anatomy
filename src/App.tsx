@@ -509,7 +509,15 @@ function UsagePopover() {
                         {resetSuffix(overview.live.seven_reset)}
                       </span>
                     </div>
-                    {overview.live_note && <p className="muted usage-live-note">{overview.live_note}</p>}
+                    {overview.live_note &&
+                      // S-3（2026-08-22）: 注記が2行（取得時刻＋Expiredのときの復帰案内）に
+                      // なることがあるため、live_error と同じ「\n で分割して1行1<p>」の
+                      // 既存機構に乗せる（overview.live_error のレンダリングと同一パターン）
+                      overview.live_note.split("\n").map((line, i) => (
+                        <p key={i} className="muted usage-live-note">
+                          {line}
+                        </p>
+                      ))}
                   </div>
                 ) : overview?.live_error ? (
                   overview.live_error

@@ -76,6 +76,7 @@
 //! `meta.active` フィールド自体は「ライブ追随の記録専用」として存置する
 //! （Keychain の裏付けは持たない、表示・記録用のブックキーピングのみ）。
 
+use crate::actions::{usage_attempt_min_interval, NON_LIVE_MIN_REFETCH_SECS, USAGE_MIN_REFETCH_SECS};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -518,25 +519,29 @@ pub fn live_account_monitor_token() -> Option<String> {
     keychain_read(&monitor_token_svc(&name))
 }
 
-/// 一括照会の連打防止。前回取得からこの秒数未満ならキャッシュをそのまま返す
-/// （モーダルを開き直す・トレイの手動更新連打で毎回 API を叩かないようにする）。
-/// ライブアカウントはトレイの自動更新間隔（60秒）に近づけつつ、意図的にそれより短くしている
-/// （2026-08-22、R-5: 閾値をポーリング周期と同値の60秒にすると、先行する `auto_sync_live`
-/// （Keychain 読み・profile API で最大10秒程度かかる）の所要時間の揺れで
-/// `now - fetched_at == 59` のような際どい値になり、その周期はライブを照会せずキャッシュを
-/// 返してしまう。しかも `live_error = None` のままなので注記も出ず、ユーザーからは
-/// 古い値と区別が付かない）
-const USAGE_MIN_REFETCH_SECS: i64 = 45;
-/// 非ライブアカウント（切り替え前に眺めるだけの他アカウント）はライブほど鮮度が要らないため、
-/// 別の緩い閾値を持つ（2026-08-22: リクエスト数削減。ライブと同じ60秒だと、登録アカウント数が
-/// 増えるほど `/api/oauth/usage` への打鍵回数が線形に増えていた）
-const NON_LIVE_MIN_REFETCH_SECS: i64 = 600;
+// 一括照会の連打防止。前回取得からこの秒数未満ならキャッシュをそのまま返す
+// （モーダルを開き直す・トレイの手動更新連打で毎回 API を叩かないようにする）。
+//
+// 実体・「なぜ300秒か」の実測根拠はいずれも `crate::actions::USAGE_MIN_REFETCH_SECS`
+// の doc コメントに一本化した（2026-08-22、第5ラウンド U-1 で定数の実体を移設、
+// 第6ラウンド V-5 で根拠の説明もそちらへ移し重複を削った。以後の変更は actions.rs で行うこと）。
+//
+// NON_LIVE_MIN_REFETCH_SECS（非ライブアカウントの緩い閾値）も同じ第6ラウンド（V-2）で
+// `crate::actions::NON_LIVE_MIN_REFETCH_SECS` へ移した。tray.rs のフォールバック経路が
+// 使う `usage_attempt_min_interval` と同じ場所に置くことで、両ファイルが同じ規則を
+// 別々に持つ構図（切り出したはずが本体に別ロジックが残る）を避けるため
 
-// 429（レート制限）を受けた後に `/api/oauth/usage` への照会を控える状態は、この LiveOauth/
-// SnapshotOauth 経路だけでなく tray.rs のフォールバック経路（Windows/Linux では唯一の経路）
-// とも共有する必要があるため、`actions.rs`（全プラットフォーム共通でコンパイルされる）へ
-// 移した（2026-08-22、T-2）。ここでは `crate::actions::usage_backoff_active` /
-// `usage_backoff_record_rate_limited` / `usage_backoff_reset` をそのまま使う
+// 表示中の使用量が「本当に古い」と言える閾値（tray.rs の注記表示が使う）は
+// `crate::actions::USAGE_STALE_NOTE_SECS` へ移設した（2026-08-22、第5ラウンド U-3）。
+// 元は accounts.rs と accounts_stub.rs の両方に同じ値をミラーしていたが、cfg が排他なので
+// 値がズレてもコンパイル時・実行時のどちらでも検知できなかった。全プラットフォームで
+// コンパイルされる actions.rs へ一本化し、ミラーは廃止した
+
+// 429（レート制限）を受けた後に `/api/oauth/usage` への照会を控える段階的バックオフは
+// 2026-08-22 の第4ラウンド（S-2）で撤去した。撤去の経緯・理由は actions.rs の
+// バックオフ撤去コメントを参照。撤去後も「同一サイクル内で429を観測したら以降の
+// ソースも同じエンドポイントを叩かない」というローカルフラグ（cycle_saw_rate_limited、
+// get_accounts_usage 内）だけは残す
 
 fn now_epoch() -> i64 {
     std::time::SystemTime::now()
@@ -676,12 +681,12 @@ struct UsageTarget {
 /// これにより `tray::fetch_raw_status` は `actions::live_usage_summary()` を別途呼ばずに済み、
 /// ライブアカウントの `/api/oauth/usage` への打鍵が1サイクルあたり2回→1回に減る。
 ///
-/// `live_error` の規約（2026-08-22、T-4: R-3・R-7 の修正後の実態に合わせて自己矛盾を修正）。
-/// `targets`（＝ `has_credentials` の登録アカウントのうち今回照会対象になったもの）に
-/// ライブアカウントが含まれない場合のみ None。含まれる場合は次のいずれか:
-/// - 新鮮キャッシュで continue した（今回は照会していない）→ バックオフ中でなければ None、
-///   バックオフ中なら `RateLimited`（新鮮キャッシュ返しでも「取得を控えている最中」を
-///   隠さないため。R-7・`live_error_for_fresh_cache`）
+/// `live_error` の規約（2026-08-22、第4ラウンド S-2 でグローバルバックオフを撤去したことに
+/// 合わせて更新）。`targets`（＝ `has_credentials` の登録アカウントのうち今回照会対象になった
+/// もの）にライブアカウントが含まれない場合のみ None。含まれる場合は次のいずれか:
+/// - 新鮮キャッシュで continue した（今回は照会していない）→ このサイクルで既に429を
+///   観測していなければ None、観測済みなら `RateLimited`（新鮮キャッシュ返しでも「今回は
+///   取得を控えた」ことをそのまま伝えるため。`live_error_for_fresh_cache`）
 /// - 今回 LiveOauth 経路を試行した → その結果そのまま（成功なら None、失敗ならその分類）
 pub struct UsageBatch {
     pub accounts: Vec<AccountUsage>,
@@ -689,35 +694,27 @@ pub struct UsageBatch {
 }
 
 /// 新鮮キャッシュで continue する対象について live_error に何を入れるかの純粋関数
-/// （2026-08-22、T-3・R-7）。ライブでなければ常に None（この関数はライブのときしか
-/// 呼ばれない想定だが、境界を明示するため is_live も引数に取る）。ライブかつバックオフ中なら
-/// 「今は取得を控えている最中」であることを None で隠さず RateLimited のまま伝える
-fn live_error_for_fresh_cache(is_live: bool, backing_off: bool) -> Option<crate::actions::LiveUsageError> {
-    if is_live && backing_off {
+/// （2026-08-22、T-3・R-7。第4ラウンドでグローバルバックオフを撤去した後も、
+/// 「このサイクルで既に429を観測したか」というローカルフラグに対して同じ規則を適用する）。
+/// ライブでなければ常に None（この関数はライブのときしか呼ばれない想定だが、境界を
+/// 明示するため is_live も引数に取る）。ライブかつ観測済みなら「今回は取得を控えた」ことを
+/// None で隠さず RateLimited のまま伝える
+fn live_error_for_fresh_cache(is_live: bool, cycle_saw_rate_limited: bool) -> Option<crate::actions::LiveUsageError> {
+    if is_live && cycle_saw_rate_limited {
         Some(crate::actions::LiveUsageError::RateLimited)
     } else {
         None
     }
 }
 
-/// 1サイクル（`get_accounts_usage` の1回の呼び出し）を終えた後、グローバルなバックオフ状態を
-/// どう更新するかの判定（2026-08-22、T-3・R-3: ループ末尾の if/else をテスト可能な純粋関数へ
-/// 切り出した）。429 を一度でも観測していれば成功があってもバックオフを優先する（安全側に倒す）
-#[derive(Debug, PartialEq, Eq)]
-enum CycleBackoffAction {
-    Record,
-    Reset,
-    None,
-}
-
-fn resolve_cycle_backoff_action(saw_rate_limited: bool, saw_success: bool) -> CycleBackoffAction {
-    if saw_rate_limited {
-        CycleBackoffAction::Record
-    } else if saw_success {
-        CycleBackoffAction::Reset
-    } else {
-        CycleBackoffAction::None
-    }
+/// 429 を観測した後、同一サイクル内で次のソースへ `/api/oauth/usage` を試みてよいかの
+/// 純粋関数（2026-08-22、第4ラウンド S-2）。段階的バックオフ（グローバル状態・指数的な
+/// 待ち時間の延長）は撤去したが、「同一サイクル内で429を観測したら以降のソースも同じ
+/// エンドポイントへ無駄打ちしない」というローカルな抑制だけは残す（次のサイクル＝5分後は
+/// 必ず再試行する）。cycle_saw_rate_limited は false→true の一方向にしか変わらないため、
+/// ループ内で都度この関数を呼んでも判定がぶれることはない
+fn should_skip_usage_source(cycle_saw_rate_limited: bool) -> bool {
+    cycle_saw_rate_limited
 }
 
 /// 登録済み全アカウント（has_credentials のもの）の使用率をまとめて取得する。
@@ -728,7 +725,13 @@ fn resolve_cycle_backoff_action(saw_rate_limited: bool, saw_success: bool) -> Cy
 ///   必ず照会する。非ライブは force の値に関係なく常に NON_LIVE_MIN_REFETCH_SECS の閾値を
 ///   適用する（フロントがポップオーバーを開いたまま accounts-updated を購読して再読込するため、
 ///   常時 force=true だと開きっぱなしのたびに登録アカウント全件へ強制照会が走ってしまう）
-///   （ただし 429 バックオフ中はこれより優先され、force でも HTTP は打たない）
+///   （このサイクルで既に429を観測している場合はそれが優先され、force でも HTTP は打たない）
+/// - U-1（2026-08-22、第5ラウンド）: キャッシュ新鮮判定を抜けた後も、実際に HTTP を打つ直前で
+///   `usage_attempt_min_interval` / `gate_usage_attempt` による「最後に試行した時刻」ゲートを
+///   通す。force=true でも無制限にはならず USAGE_FORCE_MIN_ATTEMPT_SECS（45秒）の下限は残る。
+///   このゲートは**成否にかかわらず**試行時点で記録するため、429・期限切れ・通信不能等が
+///   続く間もサイクルをまたいで間隔が保たれる（成功時のみ更新される usage_cache の
+///   fetched_at では、失敗が続く間はスロットルが効かなくなってしまうため別の状態として持つ）
 /// - 照会に成功したら usage_cache へ保存する。切り替え後もこれが「最終既知値」として残る
 /// - refresh は一切行わない（access token 期限切れは正常な状態として静かにキャッシュへ委ねる）
 pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
@@ -758,32 +761,31 @@ pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
     // ライブアカウント（登録済みなら targets に高々1件だけ含まれる）の LiveOauth 経路の
     // 試行結果。UsageBatch::live_error としてそのまま返す
     let mut live_error: Option<crate::actions::LiveUsageError> = None;
-    // R-3（2026-08-22）: USAGE_BACKOFF_STREAK はプロセス内グローバル1本なのに、ループ中に
-    // 都度 usage_backoff_reset/record を呼んでいると、targets の並び順（accounts.json の
-    // D&D 順）次第で「非ライブの成功が streak をリセットした直後にライブが429」のような
-    // 挙動になり、指数バックオフが並び順に依存してしまっていた。1サイクル（この関数の
-    // 1回の呼び出し）を単位にして、ループ末尾でまとめて一度だけ判定する
+    // このサイクル（この関数の1回の呼び出し）内で429を一度でも観測したか。
+    // 2026-08-22 第4ラウンド（S-2）でグローバルなバックオフ状態は撤去したが、
+    // 「同一サイクル内で以降のソースへ無駄打ちしない」ためだけのローカルフラグとして残す
+    // （actions.rs のバックオフ撤去コメント参照）
     let mut cycle_saw_rate_limited = false;
-    let mut cycle_saw_success = false;
     for t in &targets {
-        let now_time = std::time::SystemTime::now();
-
         if !force_skips_freshness_check(force, t.is_live)
             && t.cache.as_ref().is_some_and(|c| cache_is_fresh_enough(c.fetched_at, now, t.is_live))
         {
             results.push(to_account_usage(&t.name, t.cache.as_ref(), true, now));
-            // R-7: 新鮮キャッシュを返すだけの場合でも、バックオフ中なら「今は取得を
-            // 控えている最中」であることをそのまま伝える（None にすると Note が消え、
+            // R-7: 新鮮キャッシュを返すだけの場合でも、このサイクルで既に429を観測して
+            // いるなら「今回は取得を控えた」ことをそのまま伝える（None にすると Note が消え、
             // ユーザーから見て古い値と区別が付かなくなる）
             if t.is_live {
-                let backing_off = cycle_saw_rate_limited || crate::actions::usage_backoff_active(now_time);
-                live_error = live_error_for_fresh_cache(t.is_live, backing_off);
+                live_error = live_error_for_fresh_cache(t.is_live, cycle_saw_rate_limited);
             }
             continue;
         }
 
         let snapshot_token = stored_access_token(&t.name).filter(|(_, exp)| token_is_still_valid(*exp, now));
         let source_order = resolve_usage_source_order(t.is_live, has_monitor_token(&t.name), snapshot_token.is_some());
+        // U-1（2026-08-22、第5ラウンド）: 「最後に試行した時刻」ゲートの下限間隔。
+        // LiveOauth・SnapshotOauth どちらも /api/oauth/usage を叩くため同じ間隔を使うが、
+        // 記録するキーはソースごとに分ける（下記コメント参照）
+        let min_interval = usage_attempt_min_interval(t.is_live, force);
 
         // 優先順位どおりに試し、最初に成功したものを採用する（失敗・スキップしたソースは
         // 次へ進む。2026-07-27: 従来は is_live のライブ OAuth 1本勝負で、期限切れのまま
@@ -791,17 +793,17 @@ pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
         let mut fetched = None;
         let mut live_oauth_error: Option<crate::actions::LiveUsageError> = None;
         for source in &source_order {
-            // T-1（2026-08-22）: backing_off はソースごとに都度評価する。従来は target 単位で
+            // T-1（2026-08-22）: skip はソースごとに都度評価する。従来は target 単位で
             // 1回だけ確定していたため、同一 target 内で source_order の最初のソース（例:
             // LiveOauth）が429を観測して cycle_saw_rate_limited を立てても、その直後に試す
             // 次のソース（例: SnapshotOauth）には反映されず、「429観測後は同一サイクル内で
             // 以降のソースも打たない」が守られていなかった。false→true の一方向にしか
             // 変わらないため、都度評価してもループ内で判定がぶれることはない
-            let backing_off = cycle_saw_rate_limited || crate::actions::usage_backoff_active(now_time);
+            let skip = should_skip_usage_source(cycle_saw_rate_limited);
             fetched = match source {
                 UsageSource::LiveOauth => {
-                    // 429 バックオフ中は打たない（force より優先。B-3）
-                    if backing_off {
+                    // このサイクルで既に429を観測していたら打たない（force より優先）
+                    if skip {
                         live_oauth_error = Some(crate::actions::LiveUsageError::RateLimited);
                         None
                     } else {
@@ -817,29 +819,54 @@ pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
                                 None
                             }
                             Ok((token, _)) => {
-                                let outcome = crate::actions::oauth_get_checked(&token, crate::actions::USAGE_URL);
-                                match &outcome {
-                                    crate::actions::FetchOutcome::RateLimited => cycle_saw_rate_limited = true,
-                                    // T-8: バックオフ解除の意味は「HTTP が通った（レート制限
-                                    // されていない）」ことなので、parse の成否にかかわらず
-                                    // Ok を受けた時点で success 扱いにする（SnapshotOauth 側の
-                                    // 判定と揃える。parse 失敗はレート制限とは別問題なので
-                                    // バックオフの解除自体は行ってよい）
-                                    crate::actions::FetchOutcome::Ok(_) => cycle_saw_success = true,
-                                    _ => {}
-                                }
-                                // FetchOutcome → LiveUsageError の3分岐（成功/429/期限切れ他）は
-                                // 純粋関数 live_oauth_outcome_to_result に集約済み（R-3 追加テスト
-                                // 項目1: HTTP を打たずにテストできるようにするための抽出）
-                                match crate::actions::live_oauth_outcome_to_result(outcome) {
-                                    Ok(summary) => {
-                                        live_oauth_error = None;
-                                        Some(summary)
+                                // U-1: 試行間隔ゲート。同一サイクル内の cycle_saw_rate_limited
+                                // （skip）とは別に、サイクルをまたいだ「最後に試行した時刻」を
+                                // 見る。キーは LiveOauth 専用（`<name>:live`）にし、
+                                // SnapshotOauth の試行間隔を巻き添えで消費しないようにする
+                                // （同じキーを共有すると、429以外の理由でここが失敗した直後の
+                                // SnapshotOauth フォールバックまで塞いでしまう）
+                                let live_key = format!("{}:live", t.name);
+                                if crate::actions::gate_usage_attempt(&live_key, min_interval) {
+                                    let outcome = crate::actions::oauth_get_checked(&token, crate::actions::USAGE_URL);
+                                    if matches!(outcome, crate::actions::FetchOutcome::RateLimited) {
+                                        cycle_saw_rate_limited = true;
                                     }
-                                    Err(e) => {
-                                        live_oauth_error = Some(e);
-                                        None
+                                    // FetchOutcome → LiveUsageError の3分岐（成功/429/期限切れ他）は
+                                    // 純粋関数 live_oauth_outcome_to_result に集約済み（R-3 追加テスト
+                                    // 項目1: HTTP を打たずにテストできるようにするための抽出）
+                                    match crate::actions::live_oauth_outcome_to_result(outcome) {
+                                        Ok(summary) => {
+                                            // W-1（2026-08-22 第7ラウンド）: 成功したので
+                                            // 直近の失敗理由を消す（次回このキーが
+                                            // ゲートに塞がれたとき、古い失敗理由を
+                                            // 誤って再利用しないため）
+                                            crate::actions::clear_usage_error(&live_key);
+                                            live_oauth_error = None;
+                                            Some(summary)
+                                        }
+                                        Err(e) => {
+                                            // W-1: 失敗理由を live_key に記録する。
+                                            // 次回このキーがゲートに塞がれたとき、
+                                            // `resolve_gated_error` がこれを「塞いだ」という
+                                            // 事実の代わりに返す
+                                            crate::actions::record_usage_error(&live_key, e.clone());
+                                            live_oauth_error = Some(e);
+                                            None
+                                        }
                                     }
+                                } else {
+                                    // W-1（2026-08-22 第7ラウンド）: 従来はここで HTTP を
+                                    // 一切打っていないのに `RateLimited`（レート制限）を
+                                    // 決め打ちしていた。「ゲートに塞がれた」ことと
+                                    // 「レート制限を受けた」ことは別物であり、
+                                    // 前者を後者として表示すると事実と違う案内
+                                    // （「取得が一時的に制限されています」）になる。
+                                    // 直近にこのキーで実際に試行して分かった失敗理由
+                                    // （USAGE_LAST_ERROR）を代わりに返す
+                                    live_oauth_error = Some(crate::actions::resolve_gated_error(
+                                        crate::actions::last_usage_error(&live_key),
+                                    ));
+                                    None
                                 }
                             }
                         }
@@ -848,16 +875,16 @@ pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
                 UsageSource::MonitorToken => keychain_read(&monitor_token_svc(&t.name))
                     .and_then(|token| crate::actions::usage_via_monitor_token(&token).ok()),
                 UsageSource::SnapshotOauth => {
-                    // 429 バックオフ中は打たない（B-3。こちらも /api/oauth/usage を叩くため対象）
-                    if backing_off {
+                    // このサイクルで既に429を観測していたら打たない
+                    // （こちらも /api/oauth/usage を叩くため対象）
+                    // U-1: さらに試行間隔ゲートも通す。キーは SnapshotOauth 専用
+                    // （`<name>:snapshot`）にし、LiveOauth 側の記録とは独立させる
+                    if skip || !crate::actions::gate_usage_attempt(&format!("{}:snapshot", t.name), min_interval) {
                         None
                     } else {
                         snapshot_token.as_ref().and_then(|(token, _)| {
                             match crate::actions::oauth_get_checked(token, crate::actions::USAGE_URL) {
-                                crate::actions::FetchOutcome::Ok(body) => {
-                                    cycle_saw_success = true;
-                                    crate::actions::parse_usage_body(&body).ok()
-                                }
+                                crate::actions::FetchOutcome::Ok(body) => crate::actions::parse_usage_body(&body).ok(),
                                 crate::actions::FetchOutcome::RateLimited => {
                                     cycle_saw_rate_limited = true;
                                     None
@@ -891,15 +918,6 @@ pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
             }
             None => results.push(to_account_usage(&t.name, t.cache.as_ref(), true, now)),
         }
-    }
-
-    // R-3: グローバルなバックオフ状態の更新はループ末尾でまとめて一度だけ行う（ループ順に
-    // 依存しないようにするため）。判定自体は純粋関数 resolve_cycle_backoff_action に切り出し
-    // テストで守る（T-3）
-    match resolve_cycle_backoff_action(cycle_saw_rate_limited, cycle_saw_success) {
-        CycleBackoffAction::Record => crate::actions::usage_backoff_record_rate_limited(),
-        CycleBackoffAction::Reset => crate::actions::usage_backoff_reset(),
-        CycleBackoffAction::None => {}
     }
 
     // フェーズ3（ロック区間）: 取得できた分だけ meta を読み直して書き戻す。フェーズ1〜2の間に
@@ -3096,9 +3114,9 @@ mod tests {
 
     #[test]
     fn cache_is_fresh_enough_within_window() {
-        // ライブアカウント: 45秒閾値（2026-08-22、R-5: ポーリング周期60秒より意図的に短くした）
-        assert!(cache_is_fresh_enough(1_000, 1_044, true));
-        assert!(!cache_is_fresh_enough(1_000, 1_045, true));
+        // ライブアカウント: 300秒閾値（2026-08-22、第4ラウンド S-1）
+        assert!(cache_is_fresh_enough(1_000, 1_299, true));
+        assert!(!cache_is_fresh_enough(1_000, 1_300, true));
     }
 
     #[test]
@@ -3120,12 +3138,14 @@ mod tests {
         assert!(cache_is_fresh_enough(1_000, 1_060, false));
     }
 
-    // usage_backoff_wait / usage_backoff_pending / グローバル状態遷移のテストは
-    // actions.rs（バックオフ状態そのものの置き場、2026-08-22 T-2）に移設済み
+    // 段階的バックオフ（usage_backoff_wait 等）は2026-08-22 第4ラウンド（S-2）で撤去した。
+    // 撤去理由は actions.rs のコメント参照
 
     #[test]
     fn live_error_for_fresh_cache_matches_r7() {
         // T-3 追加テスト項目3: 新鮮キャッシュを返すだけの場合の live_error 代入規則
+        // （第4ラウンドでグローバルバックオフを撤去した後も、「このサイクルで既に429を
+        // 観測したか」という同じ意味の bool に対して同じ規則が成り立つことを確認する）
         assert!(matches!(
             live_error_for_fresh_cache(true, true),
             Some(crate::actions::LiveUsageError::RateLimited)
@@ -3136,12 +3156,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cycle_backoff_action_prefers_record_over_reset() {
-        // T-3 追加テスト項目2: サイクル集計の判定（429優先）
-        assert_eq!(resolve_cycle_backoff_action(true, false), CycleBackoffAction::Record);
-        assert_eq!(resolve_cycle_backoff_action(true, true), CycleBackoffAction::Record);
-        assert_eq!(resolve_cycle_backoff_action(false, true), CycleBackoffAction::Reset);
-        assert_eq!(resolve_cycle_backoff_action(false, false), CycleBackoffAction::None);
+    fn should_skip_usage_source_gates_after_rate_limited_in_cycle() {
+        // 2026-08-22 第4ラウンド（S-2）: サイクル内で429を観測する前は打ってよい（false）、
+        // 観測した後は同一サイクル内で以降のソースを打たない（true）。get_accounts_usage の
+        // ループはこの関数をソースごとに都度呼んで判定するため、これが「429観測後は
+        // 同一サイクル内で以降のソースも `/api/oauth/usage` を叩かない」の実体になる
+        assert!(!should_skip_usage_source(false));
+        assert!(should_skip_usage_source(true));
     }
 
     #[test]

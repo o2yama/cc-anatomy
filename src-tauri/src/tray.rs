@@ -403,10 +403,24 @@ fn reset_suffix(epoch: Option<i64>) -> String {
         .unwrap_or_default()
 }
 
+/// 現在時刻の epoch 秒。usage_advisory が「表示中の値がどれだけ古いか」を判定するのに使う
+/// （2026-08-22、第4ラウンド S-3）
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// live_usage_summary() が失敗したときの第一フォールバック。get_accounts_usage() が
 /// 既に取得済みのライブアカウント分を、追加の HTTP 無しで UsageSummary へ変換できるかを
 /// 判定する（テスト容易性のため I/O から分離。2026-07-27 レビュー M-1）。
-/// five_pct が無ければ（キャッシュ自体が存在しない等）使える値なしとして None を返す
+/// five_pct が無ければ（キャッシュ自体が存在しない等）使える値なしとして None を返す。
+///
+/// fetched_at はバッチ側（AccountUsage.fetched_at）をそのまま引き継ぐ（2026-08-22、S-3）。
+/// ここで得る値は「今取得した」とは限らず（force_skips_freshness_check や
+/// cache_is_fresh_enough によりキャッシュ返しのこともある）、そのキャッシュが実際に
+/// いつ取得されたかを usage_advisory の古さ判定に渡す必要があるため
 fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>) -> Option<crate::actions::UsageSummary> {
     let u = batch_entry?;
     Some(crate::actions::UsageSummary {
@@ -414,6 +428,7 @@ fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>)
         seven_pct: u.seven_pct.unwrap_or(0.0),
         five_reset: u.five_reset,
         seven_reset: u.seven_reset,
+        fetched_at: u.fetched_at,
     })
 }
 
@@ -448,11 +463,13 @@ struct RawStatus {
 /// claude -p を裏起動しても解決しない上、余計なリクエストを増やすだけのため）。
 /// `#[cfg(target_os = "macos")]` のインライン判定のままだとテストできなかったため切り出した
 ///
-/// T-6（2026-08-22、既知の副作用として意図的に許容）: バックオフ中は live_error が
-/// RateLimited 固定になるため（`live_error_for_fresh_cache`）、その間に token が本当に
-/// 期限切れになっても、バックオフが解けて次に LiveOauth を実際に試すまで（最長60分）
-/// ここが true にならず issue #5 の自動復帰が遅れる。429 で埋まっている最中に
-/// `claude -p` を裏起動して余計なリクエストを増やす方が有害と判断し、この遅延を許容する
+/// T-6（2026-08-22、既知の副作用として意図的に許容）: 同一サイクル内で既に429を観測している
+/// と live_error が RateLimited 固定になるため（`live_error_for_fresh_cache`）、その間に
+/// token が本当に期限切れになっても、次のサイクル（5分後、S-1）で LiveOauth を実際に
+/// 試すまでここが true にならず issue #5 の自動復帰がわずかに遅れる。429 で埋まっている
+/// 最中に `claude -p` を裏起動して余計なリクエストを増やす方が有害と判断し、この遅延を
+/// 許容する（第4ラウンドでグローバルバックオフ（最長60分）を撤去したため、この遅延も
+/// 「次のサイクルまで」に短縮されている）
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn should_nudge_token_refresh(live_error: Option<&crate::actions::LiveUsageError>) -> bool {
     matches!(live_error, Some(crate::actions::LiveUsageError::Expired))
@@ -481,12 +498,35 @@ fn should_nudge_token_refresh(live_error: Option<&crate::actions::LiveUsageError
 /// これは「キャッシュが無くて five_pct が None なだけ」（バッチは試行済み）とは区別する:
 /// 後者は二重取得の禁止（B-1）を優先し、ここでは呼ばない
 ///
-/// T-2（要修正、2026-08-22）: このフォールバックは `accounts::get_accounts_usage` の中を
-/// 通らないため、素朴に呼ぶと `usage_backoff_active` を見ず 429 を受けても記録もしない。
-/// 未登録ライブ・has_credentials=false、そして **Windows/Linux ではこの経路が唯一の取得経路**
-/// なので、ここでバックオフ判定・記録をスキップすると非 macOS では 429 に永久に張り付いて
-/// バックオフが一度も効かないことになる。`crate::actions::usage_backoff_*`（全プラットフォーム
-/// 共通でコンパイルされる actions.rs に置いてある。T-2 の doc 参照）をここでも使う
+/// T-2（2026-08-22 導入、第4ラウンド S-2 で撤去）: このフォールバックには一時期
+/// グローバルバックオフのゲートを効かせていたが、段階的バックオフそのものを撤去した
+/// （撤去理由は actions.rs のバックオフ撤去コメント参照）。
+///
+/// U-1（2026-08-22、第5ラウンド）で訂正: 撤去後の一時期、この経路は
+/// 「USAGE_MIN_REFETCH_SECS を5分に緩めたこと自体が主なスロットルであり、この
+/// フォールバック単独の追加ゲートは不要」という想定で `live_usage_summary()` を
+/// 無条件に呼んでいた。これは誤りだった。USAGE_MIN_REFETCH_SECS は
+/// `accounts::get_accounts_usage` 内のキャッシュ新鮮判定にしか効いておらず、
+/// **この経路（バッチにライブが存在しないケース。未取り込み初回起動・ライブ org_id が
+/// 登録済みのどれとも一致しない・登録済みだが has_credentials == false、そして
+/// Windows/Linux 全体）はその判定を一度も通らない**ため、実際には無条件で
+/// 60秒ごとに `/api/oauth/usage` を叩いていた。特に Windows/Linux ではこの経路が
+/// `/api/oauth/usage` の唯一の取得経路のため、影響が直接出る。
+///
+/// V-1（2026-08-22、第6ラウンド）でさらに訂正: U-1 で追加したゲートは
+/// `actions::gate_usage_attempt` を `actions::live_usage_summary()`（資格情報の読み取り→
+/// 期限チェック→HTTP の順で処理する）の**手前**にかけていた。この経路には
+/// `accounts::get_accounts_usage` 側のような usage_cache が無いため、ゲートに塞がれると
+/// そのまま数値が消えてエラー画面になる（トレイは60秒周期・自動経路の間隔は300秒のため、
+/// 5〜6サイクルに1回しか数値が出ない）。加えて、ゲートが資格情報チェックより手前にあるため、
+/// 未ログイン・期限切れという HTTP を伴わない失敗でもゲートを消費してしまい、一度も通信して
+/// いないのに「取得が一時的に制限されています」と表示していた（事実と違う原因の表示）。
+/// 現在は `actions::live_usage_summary_gated` が資格情報チェックを通過した後にだけゲートを
+/// かけ（accounts.rs の LiveOauth 経路と同じ順序）、`actions::resolve_gated_live_usage` が
+/// 塞がれたときはこの経路専用の保持値（`actions::store_tray_live_fallback_last_ok` /
+/// `tray_live_fallback_last_ok`。成功時にのみ更新）へフォールバックすることで、数値を
+/// 出し続けたまま RateLimited を誤って名乗らないようにしている（詳細は下記のフォールバック
+/// 分岐内のコメント参照）
 fn fetch_raw_status(force: bool) -> RawStatus {
     // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す
     let registered = crate::accounts::registered_accounts();
@@ -536,26 +576,45 @@ fn fetch_raw_status(force: bool) -> RawStatus {
                 });
             (result, batch.live_error)
         } else {
-            // R-1: バッチにライブが存在しないので、ここで唯一 live_usage_summary() を呼ぶ。
-            // T-2: get_accounts_usage の外を通るこの経路にもバックオフを効かせる
-            // （Windows/Linux ではこれが唯一の /api/oauth/usage 取得経路のため必達）
-            let now = std::time::SystemTime::now();
-            let live_result = if crate::actions::usage_backoff_active(now) {
-                Err(crate::actions::LiveUsageError::RateLimited)
-            } else {
-                let r = crate::actions::live_usage_summary();
-                match &r {
-                    Ok(_) => crate::actions::usage_backoff_reset(),
-                    Err(crate::actions::LiveUsageError::RateLimited) => crate::actions::usage_backoff_record_rate_limited(),
-                    Err(_) => {}
-                }
-                r
-            };
+            // R-1: バッチにライブが存在しないので、ここで唯一ライブ側の /api/oauth/usage を叩く。
+            // S-2（2026-08-22、第4ラウンド）: ここに掛けていたバックオフのゲートは撤去した
+            // （撤去理由は actions.rs のバックオフ撤去コメント参照）。この呼び出しは1サイクル
+            // につき1回だけなので、429を観測しても同一サイクル内で叩き直すことはなく、
+            // 「同一サイクル内で無駄打ちしない」というローカルフラグの出番自体が無い。
+            //
+            // V-1（2026-08-22、第6ラウンド。U-1 が作った退行の修正）: U-1 は、当時の
+            // `actions::live_usage_summary()`（内部で「資格情報の読み取り→期限チェック→HTTP」
+            // の順に処理していた。V-1 で `live_usage_summary_gated` に置き換えて削除済み）の
+            // **手前**にゲートを置いていたため、(1) この経路には usage_cache のような永続
+            // キャッシュが無く、ゲートで塞ぐと数値が消えてエラー画面になる、(2) 未ログイン・
+            // 期限切れという HTTP を伴わない失敗でもゲートを消費してしまい、一度も通信して
+            // いないのに「レート制限」と誤表示する、という2つの退行を生んでいた。
+            // `live_usage_summary_gated` は資格情報チェックを通過した後にだけゲートをかけ
+            // （accounts.rs の LiveOauth 経路と同じ順序）、ゲートに塞がれたことは
+            // `LiveUsageError::RateLimited` とは別の `GatedLiveUsageOutcome::Gated` として返す。
+            // `resolve_gated_live_usage` が、塞がれたときはこの経路専用の保持値
+            // （`TRAY_LIVE_FALLBACK_LAST_OK`。成功時にのみ更新）へフォールバックする。
+            //
+            // W-1（2026-08-22、第7ラウンド）: 保持値（UsageSummary）が無い場合、以前は
+            // ここで `Other`（＝「Claude Code でログインしてください」）を決め打ちしていたが、
+            // `Gated` を返す時点で資格情報チェックは既に通過している＝ログイン済み・期限内が
+            // 型レベルで確定しているのに矛盾した案内をしていた。`last_usage_error` で
+            // `USAGE_LAST_ERROR` から「直近に実際に試行して分かった失敗理由」を取り出し、
+            // `resolve_gated_live_usage` に渡す（記録・消去は `live_usage_summary_gated` 内で
+            // 同じ key に対して行う）
+            let min_interval = crate::actions::usage_attempt_min_interval(true, force);
+            let outcome = crate::actions::live_usage_summary_gated(crate::actions::TRAY_LIVE_FALLBACK_KEY, min_interval);
+            if let crate::actions::GatedLiveUsageOutcome::Ok(u) = &outcome {
+                crate::actions::store_tray_live_fallback_last_ok(u.clone());
+            }
+            let held = crate::actions::tray_live_fallback_last_ok();
+            let held_error = crate::actions::last_usage_error(crate::actions::TRAY_LIVE_FALLBACK_KEY);
+            let live_result = crate::actions::resolve_gated_live_usage(outcome, held, held_error);
             let live_error = live_result.as_ref().err().cloned();
             let result = match live_result {
                 Ok(u) => Ok(u),
                 // 最後の手段: 監視トークン直接照会（従来どおり残す。/v1/messages 経由で
-                // /api/oauth/usage を叩かないため、バックオフ中でも試してよい）
+                // /api/oauth/usage を叩かないため、試行間隔ゲート中でも試してよい）
                 Err(_) => crate::accounts::live_account_monitor_token()
                     .ok_or_else(|| "監視トークンなし".to_string())
                     .and_then(|token| crate::actions::usage_via_monitor_token(&token)),
@@ -606,38 +665,52 @@ fn reset_logged_usage_error() {
     *last = None;
 }
 
-/// live_error の分類に応じた案内文言。usage_result が Err のとき（Blocking）は画面全体を
-/// 置き換える2行（原因＋回復手段）、Ok でも live_error が Some のとき（Note）は
-/// ゲージの下に添える1行（表示中の値が最新でない可能性がある旨）を返す。トレイ・アプリ内
-/// ポップオーバー（usage_overview）共通で使う（2026-07-31 決定「表示を1箇所に集約する」の
-/// 延長）。2026-08-08 issue #4 再レビュー: バッチキャッシュ（accounts.json の usage_cache、
-/// 無期限に残る）にフォールバックできると usage_result が Ok になり、期限切れ・通信不能で
-/// あることが一切伝わらない問題があったため、Ok 側にも Note を出せるよう拡張した
+/// 使用量表示に添える案内。usage_result が Err のとき（Blocking）は画面全体を
+/// 置き換える2行（原因＋回復手段）、Ok のとき（Note）はゲージの下に添える注記
+/// （表示している値が古いことと、その取得時刻）を返す。トレイ・アプリ内ポップオーバー
+/// （usage_overview）共通で使う（2026-07-31 決定「表示を1箇所に集約する」の延長）。
+///
+/// Note の判定基準を「live_error があるか」から「表示に使った値の古さ（fetched_at）」に
+/// 変えた（2026-08-22、第4ラウンド S-3）。経緯: 従来は live_error（ライブ OAuth 直叩きの
+/// 失敗有無）を根拠にしていたが、ライブが失敗しても監視トークン等の別ソースが同じ周期内に
+/// 新鮮な値を取れていることがあり、その場合「最新でない可能性」という注記が事実と
+/// 食い違って出てしまっていた（表示中の値は実際には今取得したばかり）。
+/// `now - fetched_at` が `USAGE_STALE_NOTE_SECS` を超えて古いときだけ、事実として古いと
+/// 言える場合にだけ出す。
+///
+/// 注記の内容も原因（レート制限・通信不能等）は出さず取得時刻だけにする
+/// （ユーザーに対処のしようがない原因を説明しても意味がないため）。例外は Expired
+/// （token 期限切れ）だけ: これは「Claude Code を一度実行すれば直る」という対処可能な
+/// 案内なので、復帰案内の行を追加する。
+///
+/// usage_is_ok=false（表示できる値がまったく無い）ときの2行案内（Blocking）は変更しない
+#[derive(Debug)]
 enum UsageAdvisory {
     Blocking(&'static str, &'static str),
-    Note(&'static str),
+    /// \n を含む場合は複数行（Expired のときだけ復帰案内の行が付く）
+    Note(String),
 }
 
-fn usage_advisory(usage_is_ok: bool, live_error: Option<&crate::actions::LiveUsageError>) -> Option<UsageAdvisory> {
+fn usage_advisory(
+    usage_is_ok: bool,
+    live_error: Option<&crate::actions::LiveUsageError>,
+    fetched_at: Option<i64>,
+    now: i64,
+) -> Option<UsageAdvisory> {
     if usage_is_ok {
-        return match live_error {
-            // 「前回取得値を表示中」は誤り: バッチのフォールバックが今まさに取得した最新値の
-            // こともあるため、「古い値だ」と断定しない言い回しに緩める（2026-08-08 再レビュー）
-            Some(crate::actions::LiveUsageError::Expired) => Some(UsageAdvisory::Note(
-                "token 期限切れ（最新でない可能性）。Claude Code を一度実行すると復帰します",
-            )),
-            Some(crate::actions::LiveUsageError::Network) => {
-                Some(UsageAdvisory::Note("接続できません（最新でない可能性）"))
-            }
-            // 429（レート制限）。2026-08-22 追加: A. のバグ修正で Expired から分離した分類の
-            // 表示側。今表示中の値は直近の成功値（キャッシュ）で、最新ではない可能性がある旨を出す
-            Some(crate::actions::LiveUsageError::RateLimited) => {
-                Some(UsageAdvisory::Note("取得が一時的に制限されています（最新でない可能性）"))
-            }
-            // Other（本来起きないはずの失敗）でもバッチにフォールバックできた＝実害が薄いため、
-            // 注記までは出さず現在値をそのまま出す（既存挙動を維持）
-            Some(crate::actions::LiveUsageError::Other(_)) | None => None,
-        };
+        // fetched_at が無ければ古さを判定できないため注記を出さない（本来は usage_is_ok=true
+        // なら常に Some のはずだが、防御的に安全側＝注記なしへ倒す）
+        let fetched_at = fetched_at?;
+        if now - fetched_at <= crate::actions::USAGE_STALE_NOTE_SECS {
+            return None;
+        }
+        let time = reset_local(fetched_at).unwrap_or_else(|| "不明".to_string());
+        let mut note = format!("{time} 時点");
+        if matches!(live_error, Some(crate::actions::LiveUsageError::Expired)) {
+            note.push('\n');
+            note.push_str("Claude Code を一度実行すると復帰します");
+        }
+        return Some(UsageAdvisory::Note(note));
     }
     let (line1, line2) = match live_error {
         Some(crate::actions::LiveUsageError::Expired) => (
@@ -664,6 +737,7 @@ fn fetch_status(force: bool) -> StatusData {
     let raw = fetch_raw_status(force);
     let live_name = raw.live_name;
     let live_error = raw.live_error;
+    let now = now_epoch();
     let mut usage_lines = Vec::new();
     let (live_header, title) = match raw.usage_result {
         Ok(u) => {
@@ -677,8 +751,11 @@ fn fetch_status(force: bool) -> StatusData {
                 label: format!("週次 {s}%{}", reset_suffix(u.seven_reset)),
                 pct: s,
             });
-            if let Some(UsageAdvisory::Note(note)) = usage_advisory(true, live_error.as_ref()) {
-                usage_lines.push(InfoLine::Plain(note.into()));
+            if let Some(UsageAdvisory::Note(note)) = usage_advisory(true, live_error.as_ref(), u.fetched_at, now) {
+                // Note は Expired のときだけ \n で2行になる。Blocking と同じく1行1メニュー項目にする
+                for line in note.split('\n') {
+                    usage_lines.push(InfoLine::Plain(line.to_string()));
+                }
             }
             let header = match &live_name {
                 Some(name) => format!("ログイン中: {name}"),
@@ -687,7 +764,7 @@ fn fetch_status(force: bool) -> StatusData {
             (header, format!("{}%", u.five_pct.max(u.seven_pct).round() as i64))
         }
         Err(_) => {
-            if let Some(UsageAdvisory::Blocking(line1, line2)) = usage_advisory(false, live_error.as_ref()) {
+            if let Some(UsageAdvisory::Blocking(line1, line2)) = usage_advisory(false, live_error.as_ref(), None, now) {
                 usage_lines.push(InfoLine::Plain(line1.into()));
                 usage_lines.push(InfoLine::Plain(line2.into()));
             }
@@ -710,10 +787,11 @@ fn fetch_status(force: bool) -> StatusData {
 pub fn usage_overview(force: bool) -> UsageOverview {
     let raw = fetch_raw_status(force);
     let live_error_detail = raw.live_error;
+    let now = now_epoch();
     let (live, live_error, live_note) = match raw.usage_result {
         Ok(u) => {
-            let note = match usage_advisory(true, live_error_detail.as_ref()) {
-                Some(UsageAdvisory::Note(n)) => Some(n.to_string()),
+            let note = match usage_advisory(true, live_error_detail.as_ref(), u.fetched_at, now) {
+                Some(UsageAdvisory::Note(n)) => Some(n),
                 _ => None,
             };
             (
@@ -729,7 +807,7 @@ pub fn usage_overview(force: bool) -> UsageOverview {
         }
         // トレイの2行分の案内文言（InfoLine::Plain）と同じ内容を改行区切りで渡す
         Err(_) => {
-            let error = match usage_advisory(false, live_error_detail.as_ref()) {
+            let error = match usage_advisory(false, live_error_detail.as_ref(), None, now) {
                 Some(UsageAdvisory::Blocking(line1, line2)) => Some(format!("{line1}\n{line2}")),
                 _ => None,
             };
@@ -1062,8 +1140,8 @@ mod tests {
     #[test]
     fn usage_advisory_blocking_expired_names_the_cause_and_recovery() {
         // issue #4: 固定文言「Claude Code でログインしてください」のままだと、期限切れが
-        // 原因であることが伝わらない
-        match usage_advisory(false, Some(&crate::actions::LiveUsageError::Expired)) {
+        // 原因であることが伝わらない。usage_is_ok=false（Blocking）は S-3 で変更していない
+        match usage_advisory(false, Some(&crate::actions::LiveUsageError::Expired), None, 0) {
             Some(UsageAdvisory::Blocking(line1, line2)) => {
                 assert_eq!(line1, "token 期限切れ");
                 assert!(line2.contains("Claude Code を一度実行すると"));
@@ -1074,7 +1152,7 @@ mod tests {
 
     #[test]
     fn usage_advisory_blocking_network_is_distinguished_from_expired() {
-        match usage_advisory(false, Some(&crate::actions::LiveUsageError::Network)) {
+        match usage_advisory(false, Some(&crate::actions::LiveUsageError::Network), None, 0) {
             Some(UsageAdvisory::Blocking(line1, line2)) => {
                 assert_ne!(line1, "token 期限切れ");
                 assert!(line2.contains("接続"));
@@ -1086,11 +1164,11 @@ mod tests {
     #[test]
     fn usage_advisory_blocking_other_and_none_fall_back_to_legacy_wording() {
         // Other・情報なし（None）は従来どおりの固定文言を維持する（既存挙動を変えない）
-        let none_lines = match usage_advisory(false, None) {
+        let none_lines = match usage_advisory(false, None, None, 0) {
             Some(UsageAdvisory::Blocking(l1, l2)) => (l1, l2),
             _ => panic!("Blocking を期待した"),
         };
-        let other_lines = match usage_advisory(false, Some(&crate::actions::LiveUsageError::Other("x".into()))) {
+        let other_lines = match usage_advisory(false, Some(&crate::actions::LiveUsageError::Other("x".into())), None, 0) {
             Some(UsageAdvisory::Blocking(l1, l2)) => (l1, l2),
             _ => panic!("Blocking を期待した"),
         };
@@ -1099,58 +1177,83 @@ mod tests {
     }
 
     #[test]
-    fn usage_advisory_ok_with_expired_or_network_adds_a_stale_note() {
-        // issue #4 再レビュー: バッチキャッシュで usage_result が Ok になっても、
-        // 期限切れ・通信不能であることは注記1行で伝える
-        match usage_advisory(true, Some(&crate::actions::LiveUsageError::Expired)) {
-            Some(UsageAdvisory::Note(note)) => {
-                assert!(note.contains("期限切れ"));
-                // 「前回取得値を表示中」＝古い値だと断定する言い回しはしない
-                // （バッチ側が今取得した最新値のこともあるため）
-                assert!(!note.contains("前回取得値"));
-                assert!(note.contains("最新でない可能性"));
-            }
-            _ => panic!("Note を期待した"),
-        }
-        match usage_advisory(true, Some(&crate::actions::LiveUsageError::Network)) {
-            Some(UsageAdvisory::Note(note)) => {
-                assert!(!note.contains("前回取得値"));
-                assert!(note.contains("最新でない可能性"));
-            }
-            _ => panic!("Note を期待した"),
-        }
-    }
-
-    #[test]
-    fn usage_advisory_ok_without_live_error_or_other_has_no_note() {
-        // 正常取得（live_error なし）や、フォールバックできた Other は注記不要（既存挙動）
-        assert!(usage_advisory(true, None).is_none());
-        assert!(usage_advisory(true, Some(&crate::actions::LiveUsageError::Other("x".into()))).is_none());
-    }
-
-    /// A. 429 の誤分類修正の表示側。usage_is_ok=true（バッチキャッシュ等で埋まった）でも
-    /// レート制限中は「最新でない可能性」の注記を出す
-    #[test]
-    fn usage_advisory_ok_with_rate_limited_adds_a_stale_note() {
-        match usage_advisory(true, Some(&crate::actions::LiveUsageError::RateLimited)) {
-            Some(UsageAdvisory::Note(note)) => {
-                assert!(note.contains("制限"));
-                assert!(note.contains("最新でない可能性"));
-            }
-            _ => panic!("Note を期待した"),
-        }
-    }
-
-    /// usage_is_ok=false（表示できる値が無い）ときは、token 期限切れとは違う文言で
-    /// 「一時的な制限」であることを案内する（「再ログインが必要」と誤読させない）
-    #[test]
     fn usage_advisory_blocking_rate_limited_is_distinguished_from_expired() {
-        match usage_advisory(false, Some(&crate::actions::LiveUsageError::RateLimited)) {
+        // usage_is_ok=false（表示できる値が無い）ときは、token 期限切れとは違う文言で
+        // 「一時的な制限」であることを案内する（「再ログインが必要」と誤読させない）。
+        // Blocking 側の文言は S-3 で変更していない
+        match usage_advisory(false, Some(&crate::actions::LiveUsageError::RateLimited), None, 0) {
             Some(UsageAdvisory::Blocking(line1, line2)) => {
                 assert_ne!(line1, "token 期限切れ");
                 assert!(line2.contains("制限"));
             }
             _ => panic!("Blocking を期待した"),
+        }
+    }
+
+    /// S-3（2026-08-22、第4ラウンド）: 表示に使った値が新鮮（USAGE_STALE_NOTE_SECS 以内）
+    /// なら、live_error の種類にかかわらず注記は出ない
+    #[test]
+    fn usage_advisory_ok_within_freshness_has_no_note() {
+        let now = 10_000;
+        let fetched_at = now - crate::actions::USAGE_STALE_NOTE_SECS; // ちょうど境界（超えていない）
+        assert!(usage_advisory(true, None, Some(fetched_at), now).is_none());
+        assert!(usage_advisory(true, Some(&crate::actions::LiveUsageError::RateLimited), Some(fetched_at), now).is_none());
+        assert!(usage_advisory(true, Some(&crate::actions::LiveUsageError::Expired), Some(fetched_at), now).is_none());
+    }
+
+    /// fetched_at が無い（＝古さを判定できない）ときは注記を出さない防御的な既定動作
+    #[test]
+    fn usage_advisory_ok_without_fetched_at_has_no_note() {
+        assert!(usage_advisory(true, Some(&crate::actions::LiveUsageError::RateLimited), None, 10_000).is_none());
+    }
+
+    /// S-3: 表示に使った値が USAGE_STALE_NOTE_SECS を超えて古いときだけ、取得時刻の注記を出す。
+    /// 原因（レート制限・通信不能等）は文言に出さない（対処のしようがないため）
+    #[test]
+    fn usage_advisory_ok_stale_shows_fetched_time_without_cause() {
+        let now = 10_000;
+        let fetched_at = now - crate::actions::USAGE_STALE_NOTE_SECS - 1; // 境界を1秒超える
+        for live_error in [
+            None,
+            Some(crate::actions::LiveUsageError::Network),
+            Some(crate::actions::LiveUsageError::RateLimited),
+            Some(crate::actions::LiveUsageError::Other("x".into())),
+        ] {
+            match usage_advisory(true, live_error.as_ref(), Some(fetched_at), now) {
+                Some(UsageAdvisory::Note(note)) => {
+                    // U-2（2026-08-22、第5ラウンド）: 「時点」を含むだけの緩い検査だと、
+                    // reset_local(fetched_at) を reset_local(now) に取り違えても全テストが
+                    // 通ってしまう。fetched_at を実際に整形した文字列と厳密一致させることで、
+                    // 注記の時刻が fetched_at 由来であることを固定する
+                    // （期待値もタイムゾーン非依存になるよう reset_local を通して作る）
+                    let expected_time = reset_local(fetched_at).expect("fetched_at の整形に失敗した");
+                    let first_line = note.split('\n').next().unwrap_or_default();
+                    assert_eq!(first_line, format!("{expected_time} 時点"), "取得時刻の行が fetched_at 由来であることを確認: {note}");
+                    // 原因固有の語（レート制限「制限」・通信不能「接続」）は出さない
+                    assert!(!note.contains("制限") && !note.contains("接続"), "原因は出さない: {note}");
+                    // Expired 以外は復帰案内の行も付かない
+                    assert!(!note.contains("復帰"), "Expired 以外に復帰案内は付かない: {note}");
+                }
+                other => panic!("Note を期待した（live_error={live_error:?}）: {other:?}"),
+            }
+        }
+    }
+
+    /// S-3: 古くて、かつ原因が Expired のときだけ「対処可能」な復帰案内の行を追加する
+    #[test]
+    fn usage_advisory_ok_stale_with_expired_adds_recovery_line() {
+        let now = 10_000;
+        let fetched_at = now - crate::actions::USAGE_STALE_NOTE_SECS - 1;
+        match usage_advisory(true, Some(&crate::actions::LiveUsageError::Expired), Some(fetched_at), now) {
+            Some(UsageAdvisory::Note(note)) => {
+                // U-2: 1行目が fetched_at 由来の時刻であることを厳密一致で確認する
+                let expected_time = reset_local(fetched_at).expect("fetched_at の整形に失敗した");
+                let mut lines = note.split('\n');
+                assert_eq!(lines.next(), Some(format!("{expected_time} 時点")).as_deref());
+                assert_eq!(lines.next(), Some("Claude Code を一度実行すると復帰します"));
+                assert_eq!(note.matches('\n').count(), 1, "取得時刻の行＋復帰案内の行の2行のはず: {note}");
+            }
+            other => panic!("Note を期待した: {other:?}"),
         }
     }
 
@@ -1291,6 +1394,8 @@ mod tests {
         assert_eq!(u.seven_pct, 12.0);
         assert_eq!(u.five_reset, Some(1_000));
         assert_eq!(u.seven_reset, Some(2_000));
+        // S-3: fetched_at はバッチ側（AccountUsage.fetched_at）をそのまま引き継ぐ
+        assert_eq!(u.fetched_at, Some(500));
     }
 
     #[test]
