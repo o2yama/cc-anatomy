@@ -62,6 +62,18 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 ---
 
+### 2026-08-22 の決定
+
+- **使用量が更新されない不具合を修正**（未リリース）: 症状「アカウント切替後も使用量が更新されない・全アカウント token 切れ表示・復活日時が古いまま」の実体は **HTTP 429 を「token 期限切れ」と誤分類していたバグ**だった（`oauth_get_checked_blocking` が HTTP ステータスを 401 しか見ず、本文に `error` フィールドがあれば全部 Expired と判定していた。429 の本文は `{"error":{"type":"rate_limit_error"}}`）。429 を起こしていたのはアプリ自身で、60秒サイクルごとに約4リクエスト/分（ライブは同じ1分に2回）を12日間連続で出していた。修正内容: ①HTTP ステータス優先の純粋関数 `classify_oauth_response` で 429/401/`authentication_error`/`rate_limit_error` を分離 ②ライブの二重取得を廃止（`get_accounts_usage` が `UsageBatch { accounts, live_error }` を返し、`fetch_raw_status` は `live_usage_summary()` を**ライブがバッチに存在しないときだけ**呼ぶ）③キャッシュ閾値をライブ45秒・非ライブ600秒に分離 ④429 で指数バックオフ（5→10→20→40→60分）。詳細と根拠は `docs/dev-log.md`
+- **バックオフ状態は `actions.rs`（全プラットフォーム共通）に置く**: macOS 限定の `accounts.rs` に置くと、Windows/Linux の唯一の使用量取得経路（`tray::fetch_raw_status` のフォールバック）がバックオフの管轄外になる。`accounts_stub.rs` への複製実装も不要になる
+- **`live_usage_summary()` のフォールバックは条件付きで必ず残す**: ライブがバッチに存在しないケース（CC Anatomy 未登録の初回起動・org_id 不一致・`has_credentials=false`・**Windows/Linux 全体**）で使用量表示が全滅し、「Claude Code でログインしてください」という誤案内が出る。無条件に削除してはいけない（一度やって退行を出した）
+- **429 は `OwnerError::NetworkError` に落とす（`Other` にしない）**: `Other` だと「持ち主未確認でも切り替える」確認ダイアログが出ず切り替え自体が失敗する。修正前は 429 が Expired に化けていたおかげで続行できていたため、`Other` にすると退行になる
+- **非ライブアカウントの使用量は原理的に最新化できない**: スナップショットの access token は最後にライブだった時刻から約8時間で切れ、refresh token は Claude Code 本体しか触らない設計のため。旧「監視用長期トークン」方式（`claude setup-token` の長期トークンで `/v1/messages` のレスポンスヘッダ `anthropic-ratelimit-unified-*` から読む）ならこの制約が無かったが、2026-07-25 に全廃済み。`usage_via_monitor_token` のコード自体は残っているので復活は容易
+- **レート制限は `/api/oauth/usage` 側に固有**: 同時刻に同じライブトークンで `/v1/messages` を叩くと 200 が返り、ヘッダから同じ数値が取れる（2026-08-22 実測）
+- **未対応（スコープ外）**: `stale` / `fetched_at` の UI 表示。バックエンドは返しているのにトレイ（`compact_usage_segments`）もフロント（`App.tsx`）も見ておらず、取得失敗時にキャッシュ値を最新のように描く。「常に最新」を構造上保証できない経路がある以上、鮮度表示は本来必須
+- **実機未検証**: バックオフの突入・解除、429 が実際に解消するか、「取得が一時的に制限されています」表示、Windows 実機でのフォールバック経路。残存事項の一覧は `tmp/2026-08-22-residual.md`（git 管理外）
+- **プロセス上の未達**: ルールでは大きいタスクに Codex クロスベンダーレビューが必須だが、Codex が使用量上限（8/27 復帰）のため Claude 側レビュー3巡で代替した。ユーザー承認済み
+
 ### 2026-07-31 の決定
 
 - **ドロワー内ドキュメント編集機能を実装・main マージ済み**: プロジェクト概要でファイル名クリック → 右ドロワー（`DetailDrawer`）内の `DocEditor.tsx`（CodeMirror 6）で CLAUDE.md 等を直接編集・Cmd+S 保存できる。保存は `write_doc`（`env.rs`）の楽観ロック（modified_epoch）で外部変更と競合検出し、conflict 時は専用 UI で再読込を促す。path が null / truncated のコンテンツは読み取り専用。日本語 IME はスパイク（SpikeEditor、削除済み）で CodeMirror 6 の問題なしを確認してから採用

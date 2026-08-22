@@ -153,3 +153,48 @@ macOS universal（Apple Silicon + Intel）と Windows（監視機能のみ）に
   - Rust（コマンド境界を越えない経路。tray のネイティブダイアログ等）: `src-tauri/src/accounts.rs` の `strip_owner_error_tag`。`tray.rs::switch_from_tray` が使う
 - 2つの消費者は独立実装だが「既知の kind 一覧」を暗黙に共有している。`OwnerError::kind()` に kind を増減したら、`strip_owner_error_tag` の `KNOWN_KINDS` と `api.ts` の `OWNER_ERROR_PREFIXES` の両方を揃えること（自動同期の仕組みは無い）
 - `OwnerMismatch` は一度 variant として追加したが、`resolve_live_owner` が実際には送出しない（mismatched は既存の `LiveOwner.mismatched` で表現済み・NeedsImport 導線に流れる）ため YAGNI で撤去した。必要になったら kind を1つ増やす形で足す
+
+## 使用量が更新されない不具合の修正（2026-08-22）
+
+ユーザー報告「アカウントを切り替えても使用量が更新されない。全アカウント token 切れと表示され、復活日時も古いまま」の実機診断と修正。
+
+### 診断で判明した事実
+
+- 表示は誤り。ライブ（share3）も share1 も access token は期限内で、`/api/oauth/usage` は 200 を返す状態だった
+- 実体は **HTTP 429（レート制限）を「token 期限切れ」と誤分類していたバグ**。`oauth_get_checked_blocking` は HTTP ステータスを 401 しか見ず、「本文に `error` フィールドがあれば全部 Expired」と判定していた。429 の本文は `{"error":{"type":"rate_limit_error"}}` なので丸ごと期限切れに化けていた
+- 429 を起こしていたのはアプリ自身。60秒サイクルごとに `get_accounts_usage`（登録3件分）＋ `live_usage_summary`（ライブをもう1回）で約4リクエスト/分を12日間連続で出していた。ライブは同じ1分に2回同じエンドポイントを叩いていた
+- 副作用として、429 のたびに issue #5 の自動復帰が発火し、10分おきに `claude -p --model haiku` を裏起動していた（直りもしないのに使用量を消費）
+- 「復活日時が古いまま」は `AccountUsage.stale` / `fetched_at` をトレイもフロントも見ていないため。取得失敗時にキャッシュ値を最新のように描いていた
+- share2 は本当に期限切れ（8/11 18:27 に expire、401 が返る）。非ライブのスナップショット access token は約8時間で切れ、refresh token は Claude Code 本体しか触らない設計なので、原理的に最終既知値しか出せない
+- `/v1/messages` は同時刻に 200 を返し、`anthropic-ratelimit-unified-*` ヘッダから同じ数値が取れた。レート制限は `/api/oauth/usage` 側に固有
+
+### 実装した修正
+
+| 決定 | 理由 |
+|---|---|
+| HTTP ステータスを優先して分類する純粋関数 `classify_oauth_response(status, body)` を新設。429→RateLimited、401→Expired、本文の `error.type` で `authentication_error`→Expired / `rate_limit_error`→RateLimited / それ以外→Other | 「本文に error があれば Expired」という旧判定が誤表示の直接原因。ステータスを見ずに本文だけで判定してはいけない |
+| `FetchOutcome` / `UsageFetch` / `LiveUsageError` に `RateLimited` を追加し、トレイの案内文言を分離 | 「token 期限切れ / Claude Code を一度実行すると復帰します」は 429 に対しては嘘。ユーザーが何をしても消えない案内になっていた |
+| `spawn_token_refresh_nudge` の発火判定を `should_nudge_token_refresh` に切り出し、Expired のときだけ true | 429 起因の `claude -p` 裏起動を止める。テストで守れるようにするための切り出し |
+| `get_accounts_usage` の戻りを `UsageBatch { accounts, live_error }` に変え、`fetch_raw_status` から `live_usage_summary()` の無条件呼び出しを削除 | ライブの `/api/oauth/usage` を1サイクルに2回叩いていた二重取得の解消 |
+| ただしライブがバッチに存在しないとき（未登録ライブ・org_id 不一致・`has_credentials=false`・**Windows/Linux 全体**）だけ `live_usage_summary()` にフォールバック | 無条件に削除するとこれらのケースで使用量表示が全滅し、「Claude Code でログインしてください」という誤案内が出る。Windows は `registered_accounts()` が常に空なのでこの経路が唯一の取得手段 |
+| キャッシュ閾値をライブ45秒・非ライブ600秒に分離。`force` はライブの閾値だけをスキップする | 旧 60秒はポーリング周期と同値で、到達時刻の揺れで1周期スキップしていた。非ライブは切り替え前に眺めるだけなので鮮度要求が低い |
+| 429 で指数バックオフ（5→10→20→40→60分で頭打ち）。バックオフ中は `force=true` でも HTTP を打たない。`retry-after` は実測で常に 0 が返るため使わない | レート制限に張り付いたまま叩き続けるのを止める |
+| バックオフの記録・解除は**1サイクル単位でまとめて判定**（429を観測したら record、429が無く成功があれば reset） | アカウントごとに record/reset を呼ぶと、accounts.json の並び順（ユーザーが D&D で変更可能）で指数バックオフが成立しなくなる |
+| バックオフ状態は「終端時刻」ではなく「記録時刻 + 待ち時間」で持ち、`now.duration_since(recorded_at)` 方向で判定 | 終端時刻からの `duration_since` の Err は「普通に経過した」を意味し、時計巻き戻しの保護にならない |
+| バックオフ状態を macOS 限定の `accounts.rs` ではなく全プラットフォーム共通の `actions.rs` に置く | Windows/Linux の唯一の取得経路（tray のフォールバック）もバックオフの管轄下に入れるため。`accounts_stub.rs` への複製実装も不要になる |
+| `resolve_live_owner` で 429 は `OwnerError::NetworkError` に落とす（`Other` にしない） | `Other` だと「持ち主未確認でも切り替える」確認ダイアログが出ず、切り替え自体が失敗する。修正前は 429 が Expired に化けていたおかげで続行できていたため、`Other` にすると退行になる。`NetworkError` の文言は通信障害とレート制限の両方に当てはまる中立表現に変更した |
+
+### 打鍵数（コード読解による算出。実機実測ではない）
+
+登録3件（ライブ1 + 非ライブ2）で、修正前 約4/分 → 正常時 1.0〜1.2/分、バックオフ中 0/分、429を受けたサイクル 1/分。
+
+### 意図的に許容した副作用
+
+- バックオフ中は `live_error` が RateLimited 固定になるため、その間に token が本当に期限切れになっても issue #5 の自動復帰が最大60分遅れる。429 中に `claude -p` を撃つほうが有害なので許容
+- バックオフはプロセス内グローバル1本のため、非ライブの429がライブ表示も止める。レート制限が実際にアカウント単位かは未確認
+
+### スコープ外（未対応）
+
+`stale` / `fetched_at` の UI 表示。取得に失敗するとキャッシュ値を最新のように描く問題は残っている。「常に最新」を構造上保証できない経路（非ライブの8時間期限）がある以上、鮮度表示は本来必須。
+
+残存事項・実機未検証項目の一覧は `tmp/2026-08-22-residual.md`（git 管理外）。

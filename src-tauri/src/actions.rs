@@ -124,37 +124,9 @@ static HTTP: std::sync::LazyLock<reqwest::blocking::Client> = std::sync::LazyLoc
 /// 「Cannot drop a runtime in a context where blocking is not allowed」でパニックする
 /// （実機で `switch_account` 押下時に発生・確認済み）。
 /// `tokio::task::spawn_blocking` も同じブロッキングプール＝ランタイム配下なので効果が無く、
-/// ランタイムの文脈を一切持たない素の OS スレッドで実行する必要がある
-pub fn oauth_get_with_token(token: &str, url: &str) -> Result<String, String> {
-    let token = token.to_string();
-    let url = url.to_string();
-    std::thread::spawn(move || oauth_get_with_token_blocking(&token, &url))
-        .join()
-        .map_err(|_| "API 呼び出し中に内部エラーが発生しました".to_string())?
-}
-
-fn oauth_get_with_token_blocking(token: &str, url: &str) -> Result<String, String> {
-    let resp = HTTP
-        .get(url)
-        .bearer_auth(token)
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .map_err(|_| "API への接続に失敗しました".to_string())?;
-    // access token の期限切れは正常な状態（Claude Code が次回利用時に自動 refresh する）。
-    // 「再ログインが必要」という誤った不安を与えないよう専用の文言にする
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("取得できませんでした（Claude Code を一度使うと更新されます）".into());
-    }
-    let body = resp.text().map_err(|e| e.to_string())?;
-    let parsed: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| "API の応答が不正です".to_string())?;
-    if parsed.get("error").is_some() {
-        return Err("API がエラーを返しました（再ログインが必要かもしれません）".into());
-    }
-    Ok(body)
-}
-
+/// ランタイムの文脈を一切持たない素の OS スレッドで実行する必要がある。
+/// この理由から `oauth_get_checked`（後述）・`probe_headers` もすべて素の std::thread へ逃がす
+///
 /// `/api/oauth/usage` のエンドポイント。ライブアカウントの使用量表示（actions.rs）と
 /// 登録済み全アカウントの使用率一括取得（accounts::get_accounts_usage）の両方から使うため公開する
 pub const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
@@ -173,25 +145,74 @@ pub enum UsageFetch {
     Ok { body: String },
     #[serde(rename = "expired")]
     Expired,
+    /// 429（レート制限）。2026-08-22 追加: 以前は Expired に誤って合流していた
+    #[serde(rename = "rate_limited")]
+    RateLimited,
     #[serde(rename = "network")]
     Network,
     #[serde(rename = "error")]
     Error { message: String },
 }
 
-/// 期限切れ相当（401 or 応答本文の error フィールド）、通信不能（接続失敗・タイムアウト等）、
-/// それ以外の予期しない失敗（応答の構文エラー等）を区別する。Network を Other から分離した
-/// のは accounts::resolve_live_owner が「通信を確認して再試行」と「その他のエラー」を
+/// 期限切れ相当（401 or 応答本文の authentication_error）、レート制限（429 or 応答本文の
+/// rate_limit_error）、通信不能（接続失敗・タイムアウト等）、それ以外の予期しない失敗
+/// （応答の構文エラー等）を区別する。Network を Other から分離したのは
+/// accounts::resolve_live_owner が「通信を確認して再試行」と「その他のエラー」を
 /// 別文言で案内する必要があるため（2026-08-08、issue #1/#2 対応）。fetch_live_usage_status は
-/// 従来どおり両方を同じ Error 表示にまとめるため、ここでの分離は表示側の挙動を変えない
+/// 従来どおり両方を同じ Error 表示にまとめるため、ここでの分離は表示側の挙動を変えない。
+/// RateLimited は 2026-08-22 追加: 従来は HTTP ステータスを一切見ず「本文に error フィールドが
+/// あれば全部期限切れ」と判定していたため、429（レート制限。実測: 本文
+/// `{"error":{"type":"rate_limit_error",...}}`）が「token 期限切れ」と誤表示されていた
 pub(crate) enum FetchOutcome {
     Ok(String),
     Expired,
+    RateLimited,
     Network,
     Other(String),
 }
 
-/// oauth_get_with_token と同じ理由でランタイムコンテキストの無い素の OS スレッドへ逃がす。
+/// HTTP ステータスと応答本文の文字列だけで FetchOutcome を判定する純粋関数。HTTP を打たずに
+/// 単体テストできるよう、ネットワーク I/O（oauth_get_checked_blocking）から分離した
+/// （2026-08-22）。判定順序:
+/// 1. status 429 → RateLimited / status 401 → Expired（実測ベース、最優先）
+/// 2. 本文に error フィールドがあれば error.type を見る
+///    （authentication_error→Expired、rate_limit_error→RateLimited、それ以外→Other。
+///    実測: 期限切れの access token は 401 ではなく 200 + error 本文で返ることがあるため、
+///    ステータス判定だけでは拾いきれずこの経路を残す）
+/// 3. それ以外の非 2xx → Other
+pub(crate) fn classify_oauth_response(status: u16, body: &str) -> FetchOutcome {
+    if status == 429 {
+        return FetchOutcome::RateLimited;
+    }
+    if status == 401 {
+        return FetchOutcome::Expired;
+    }
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(error) = parsed.get("error") {
+            let err_type = error.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            return match err_type {
+                "authentication_error" => FetchOutcome::Expired,
+                "rate_limit_error" => FetchOutcome::RateLimited,
+                _ => {
+                    let message = error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("API がエラーを返しました（HTTP {status}）"));
+                    FetchOutcome::Other(message)
+                }
+            };
+        }
+        if (200..300).contains(&status) {
+            return FetchOutcome::Ok(body.to_string());
+        }
+    } else if (200..300).contains(&status) {
+        return FetchOutcome::Other("API の応答が不正です".to_string());
+    }
+    FetchOutcome::Other(format!("API がエラーを返しました（HTTP {status}）"))
+}
+
+/// reqwest::blocking のランタイムパニック回避のため、上記と同じ理由で素の OS スレッドへ逃がす。
 /// fetch_live_usage_status（使用量取得）と accounts::resolve_live_owner（持ち主確認）が共有する
 pub(crate) fn oauth_get_checked(token: &str, url: &str) -> FetchOutcome {
     let token = token.to_string();
@@ -213,24 +234,12 @@ fn oauth_get_checked_blocking(token: &str, url: &str) -> FetchOutcome {
         Ok(r) => r,
         Err(_) => return FetchOutcome::Network,
     };
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        return FetchOutcome::Expired;
-    }
+    let status = resp.status().as_u16();
     let body = match resp.text() {
         Ok(b) => b,
         Err(e) => return FetchOutcome::Other(e.to_string()),
     };
-    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => return FetchOutcome::Other("API の応答が不正です".to_string()),
-    };
-    if parsed.get("error").is_some() {
-        // 実測: 期限切れの access token は 401 ではなく 200 + error フィールドで
-        // 返ってくることがある。「再ログインが必要」という誤誘導な文言は出さず、
-        // 期限切れと同列（Expired）に扱う
-        return FetchOutcome::Expired;
-    }
-    FetchOutcome::Ok(body)
+    classify_oauth_response(status, &body)
 }
 
 fn now_ms() -> i64 {
@@ -266,6 +275,7 @@ fn fetch_live_usage_status(url: &str) -> UsageFetch {
     match oauth_get_checked(&token, url) {
         FetchOutcome::Ok(body) => UsageFetch::Ok { body },
         FetchOutcome::Expired => UsageFetch::Expired,
+        FetchOutcome::RateLimited => UsageFetch::RateLimited,
         FetchOutcome::Network => UsageFetch::Network,
         FetchOutcome::Other(message) => UsageFetch::Error { message },
     }
@@ -319,7 +329,7 @@ pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
 /// スコープ外で拒否される。ヘッダには `anthropic-ratelimit-unified-*`（そのトークンの
 /// アカウントの使用率）が入っている。429（枠を使い切った状態）でもヘッダは返るので
 /// ステータスでは弾かない。reqwest::blocking のランタイムパニック回避のため、
-/// oauth_get_with_token と同様に素の std::thread へ逃がす
+/// oauth_get_checked と同様に素の std::thread へ逃がす
 fn probe_headers(token: &str) -> Result<(u16, reqwest::header::HeaderMap), String> {
     let token = token.to_string();
     std::thread::spawn(move || probe_headers_blocking(&token))
@@ -414,6 +424,8 @@ pub fn usage_via_monitor_token(token: &str) -> Result<UsageSummary, String> {
 #[derive(Debug, Clone)]
 pub enum LiveUsageError {
     Expired,
+    /// 429（レート制限）。2026-08-22 追加: A. 429 の誤分類修正で Expired から分離した
+    RateLimited,
     Network,
     Other(String),
 }
@@ -425,9 +437,87 @@ pub fn live_usage_summary() -> Result<UsageSummary, LiveUsageError> {
     match fetch_live_usage_status(USAGE_URL) {
         UsageFetch::Ok { body } => parse_usage_body(&body).map_err(LiveUsageError::Other),
         UsageFetch::Expired => Err(LiveUsageError::Expired),
+        UsageFetch::RateLimited => Err(LiveUsageError::RateLimited),
         UsageFetch::Network => Err(LiveUsageError::Network),
         UsageFetch::Error { message } => Err(LiveUsageError::Other(message)),
     }
+}
+
+/// FetchOutcome（HTTP から得た生の判定）を LiveUsageError 系の Result へ変換する純粋関数。
+/// `accounts::get_accounts_usage` の LiveOauth 経路が使う（2026-08-22、R-3・追加テスト項目1:
+/// 「成功→None、429→RateLimited、期限切れ→Expired」の3分岐を HTTP を打たずにテストできるよう、
+/// get_accounts_usage 内にインラインしていた match をここへ抽出した）
+pub(crate) fn live_oauth_outcome_to_result(outcome: FetchOutcome) -> Result<UsageSummary, LiveUsageError> {
+    match outcome {
+        FetchOutcome::Ok(body) => parse_usage_body(&body).map_err(LiveUsageError::Other),
+        FetchOutcome::Expired => Err(LiveUsageError::Expired),
+        FetchOutcome::RateLimited => Err(LiveUsageError::RateLimited),
+        FetchOutcome::Network => Err(LiveUsageError::Network),
+        FetchOutcome::Other(msg) => Err(LiveUsageError::Other(msg)),
+    }
+}
+
+/// 429（レート制限）を受けた後に `/api/oauth/usage` への照会を控える期間の管理。
+/// プロセス内グローバル1本で持つ（同一エンドポイントへの過剰打鍵を確実に止めることを
+/// 最優先にしたため）。
+///
+/// accounts.rs ではなくここ（actions.rs）に置く理由（2026-08-22、T-2）: `/api/oauth/usage` を
+/// 叩く経路は accounts::get_accounts_usage（LiveOauth/SnapshotOauth）だけでなく、
+/// tray::fetch_raw_status がライブをバッチから拾えなかったときに直接呼ぶ
+/// `live_usage_summary()`（未登録ライブ・has_credentials=false、および **Windows/Linux では
+/// これが唯一の取得経路**）もある。accounts.rs は macOS でしかコンパイルされないため、
+/// そちらにバックオフ状態を置くと非 macOS ビルドの `live_usage_summary()` 経由の打鍵が
+/// バックオフの管轄外のまま 429 に張り付き続けてしまう。actions.rs は全プラットフォームで
+/// 無条件にコンパイルされるため、両方の経路から同じグローバル状態を共有できる。
+///
+/// 「終端時刻（until）」ではなく「記録時刻＋待ち時間」で持つ（2026-08-22、R-4）。終端時刻方式は
+/// `until.duration_since(now)` が Err になるのを巻き戻り検知に使うつもりだったが、Err になるのは
+/// until < now（＝普通に経過しただけ）のときで、想定していた「now が過去へ飛んで
+/// until - now が巨大になる」ケースの保護になっていなかった。記録時刻からの経過方向
+/// （`now.duration_since(recorded_at)`）で測れば、時計が巻き戻って now < recorded_at に
+/// なった場合は Err になり、そこを「経過扱い」にして再開を許せる
+static USAGE_BACKOFF_SINCE: std::sync::Mutex<Option<(std::time::SystemTime, std::time::Duration)>> =
+    std::sync::Mutex::new(None);
+/// 連続 429 回数。バックオフ時間を指数的に伸ばすのに使う
+static USAGE_BACKOFF_STREAK: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+/// バックオフ待ち時間 = min(5分 * 2^streak, 60分)。HTTP を打たずにテストできるよう
+/// 純粋関数として切り出す
+pub(crate) fn usage_backoff_wait(streak: u32) -> std::time::Duration {
+    let minutes = 5u64.saturating_mul(1u64.checked_shl(streak).unwrap_or(u64::MAX));
+    std::time::Duration::from_secs(minutes.min(60) * 60)
+}
+
+/// recorded_at・wait・now だけから「まだバックオフの途中か」を判定する純粋関数。
+/// now.duration_since(recorded_at) が Err になるのは now < recorded_at（＝時計が過去へ
+/// 巻き戻った）ときで、この場合は経過扱いにして再開を許す（R-4）
+pub(crate) fn usage_backoff_pending(
+    recorded_at: std::time::SystemTime,
+    wait: std::time::Duration,
+    now: std::time::SystemTime,
+) -> bool {
+    now.duration_since(recorded_at).is_ok_and(|elapsed| elapsed < wait)
+}
+
+/// 現在バックオフ中か（HTTP を打つ前に必ず確認する）
+pub(crate) fn usage_backoff_active(now: std::time::SystemTime) -> bool {
+    let since = USAGE_BACKOFF_SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    since.is_some_and(|(recorded_at, wait)| usage_backoff_pending(recorded_at, wait, now))
+}
+
+/// 429 を受けたのでバックオフを延長し、連続回数を+1する
+pub(crate) fn usage_backoff_record_rate_limited() {
+    let now = std::time::SystemTime::now();
+    let mut streak = USAGE_BACKOFF_STREAK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let wait = usage_backoff_wait(*streak);
+    *USAGE_BACKOFF_SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((now, wait));
+    *streak = streak.saturating_add(1);
+}
+
+/// 照会に成功したのでバックオフを解除する
+pub(crate) fn usage_backoff_reset() {
+    *USAGE_BACKOFF_SINCE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *USAGE_BACKOFF_STREAK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = 0;
 }
 
 #[cfg(test)]
@@ -442,6 +532,179 @@ mod tests {
         let u = super::live_usage_summary().expect("ライブ使用量の取得に失敗");
         assert!((0.0..=100.0).contains(&u.five_pct), "5h 使用率が範囲外: {}", u.five_pct);
         assert!(u.five_reset.is_some(), "5h リセット時刻が取れていない");
+    }
+
+    /// 実測: 429 のとき本文は `{"error":{"type":"rate_limit_error",...}}`、
+    /// ヘッダ `retry-after: 0`（このテストでは本文とステータスだけを見る）で返る。
+    /// 修正前は本文に error フィールドがあるだけで Expired に分類されていた
+    /// （このバグを直すのが今回の主目的）
+    #[test]
+    fn classify_oauth_response_429_is_rate_limited() {
+        let outcome = super::classify_oauth_response(
+            429,
+            r#"{"error":{"type":"rate_limit_error","message":"rate limited"}}"#,
+        );
+        assert!(matches!(outcome, super::FetchOutcome::RateLimited));
+    }
+
+    #[test]
+    fn classify_oauth_response_401_is_expired() {
+        let outcome = super::classify_oauth_response(401, "");
+        assert!(matches!(outcome, super::FetchOutcome::Expired));
+    }
+
+    /// 実測: 期限切れの access token は 401 ではなく 200 + error 本文で返ることがある
+    #[test]
+    fn classify_oauth_response_200_with_authentication_error_is_expired() {
+        let outcome = super::classify_oauth_response(
+            200,
+            r#"{"error":{"type":"authentication_error","message":"invalid token"}}"#,
+        );
+        assert!(matches!(outcome, super::FetchOutcome::Expired));
+    }
+
+    #[test]
+    fn classify_oauth_response_200_with_other_error_is_other_with_message() {
+        let outcome = super::classify_oauth_response(
+            200,
+            r#"{"error":{"type":"invalid_request_error","message":"boom"}}"#,
+        );
+        match outcome {
+            super::FetchOutcome::Other(message) => assert_eq!(message, "boom"),
+            _ => panic!("Other になるはず"),
+        }
+    }
+
+    #[test]
+    fn classify_oauth_response_2xx_without_error_field_is_ok() {
+        let outcome = super::classify_oauth_response(200, r#"{"five_hour":{"utilization":1.0}}"#);
+        assert!(matches!(outcome, super::FetchOutcome::Ok(_)));
+    }
+
+    #[test]
+    fn classify_oauth_response_other_non_2xx_is_other() {
+        let outcome = super::classify_oauth_response(500, "not json");
+        assert!(matches!(outcome, super::FetchOutcome::Other(_)));
+    }
+
+    /// 追加テスト項目4: ステータスが 429/401 以外でも、本文の error.type が
+    /// rate_limit_error なら RateLimited に分類する（実測: 500 + rate_limit_error 本文の
+    /// 組み合わせも観測されている）
+    #[test]
+    fn classify_oauth_response_500_with_rate_limit_error_body_is_rate_limited() {
+        let outcome = super::classify_oauth_response(
+            500,
+            r#"{"error":{"type":"rate_limit_error","message":"rate limited"}}"#,
+        );
+        assert!(matches!(outcome, super::FetchOutcome::RateLimited));
+    }
+
+    /// 追加テスト項目4: 200 + error オブジェクトはあるが type フィールドが無いケース。
+    /// 旧実装は「本文に error フィールドがあれば全部 Expired」だったため、この経路は
+    /// 現在は Other になる（Expired への誤判定に戻っていないことを明示的に固定する）
+    #[test]
+    fn classify_oauth_response_200_with_error_missing_type_is_other() {
+        let outcome = super::classify_oauth_response(200, r#"{"error":{"message":"something"}}"#);
+        assert!(matches!(outcome, super::FetchOutcome::Other(_)));
+    }
+
+    /// 追加テスト項目1: get_accounts_usage の LiveOauth 経路が使う変換の3分岐を、
+    /// 抽出した純粋関数 `live_oauth_outcome_to_result` で直接検証する
+    #[test]
+    fn live_oauth_outcome_to_result_success_is_ok() {
+        let result = super::live_oauth_outcome_to_result(super::FetchOutcome::Ok(
+            r#"{"five_hour":{"utilization":0.5}}"#.to_string(),
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn live_oauth_outcome_to_result_rate_limited_is_rate_limited_error() {
+        let result = super::live_oauth_outcome_to_result(super::FetchOutcome::RateLimited);
+        assert!(matches!(result, Err(super::LiveUsageError::RateLimited)));
+    }
+
+    #[test]
+    fn live_oauth_outcome_to_result_expired_is_expired_error() {
+        let result = super::live_oauth_outcome_to_result(super::FetchOutcome::Expired);
+        assert!(matches!(result, Err(super::LiveUsageError::Expired)));
+    }
+
+    #[test]
+    fn usage_backoff_wait_grows_exponentially_capped_at_60min() {
+        assert_eq!(super::usage_backoff_wait(0), std::time::Duration::from_secs(5 * 60));
+        assert_eq!(super::usage_backoff_wait(1), std::time::Duration::from_secs(10 * 60));
+        assert_eq!(super::usage_backoff_wait(2), std::time::Duration::from_secs(20 * 60));
+        assert_eq!(super::usage_backoff_wait(3), std::time::Duration::from_secs(40 * 60));
+        // 5分*2^3=40分 の次で60分に張り付く（80分にはならない）
+        assert_eq!(super::usage_backoff_wait(4), std::time::Duration::from_secs(60 * 60));
+        assert_eq!(super::usage_backoff_wait(10), std::time::Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn usage_backoff_pending_true_within_window() {
+        let recorded_at = std::time::SystemTime::now();
+        let wait = std::time::Duration::from_secs(60);
+        let now = recorded_at + std::time::Duration::from_secs(30);
+        assert!(super::usage_backoff_pending(recorded_at, wait, now));
+    }
+
+    #[test]
+    fn usage_backoff_pending_false_after_elapsed() {
+        let recorded_at = std::time::SystemTime::now();
+        let wait = std::time::Duration::from_secs(60);
+        // wait を過ぎていれば経過済み
+        let now = recorded_at + std::time::Duration::from_secs(61);
+        assert!(!super::usage_backoff_pending(recorded_at, wait, now));
+        // ちょうど wait 経過（残り0秒）も「経過済み」扱い
+        assert!(!super::usage_backoff_pending(recorded_at, wait, recorded_at + wait));
+    }
+
+    #[test]
+    fn usage_backoff_pending_false_on_clock_rewind() {
+        // R-4: 時計が過去へ巻き戻った（now < recorded_at）ケースを実際に検証する。
+        // 旧実装（until 方式）はこのケースで until - now が巨大になり、
+        // 巻き戻り保護のつもりが逆にバックオフを解除できなくなっていた
+        let recorded_at = std::time::SystemTime::now();
+        let wait = std::time::Duration::from_secs(60);
+        let now = recorded_at - std::time::Duration::from_secs(3600);
+        assert!(!super::usage_backoff_pending(recorded_at, wait, now));
+    }
+
+    /// T-3 追加テスト項目4: usage_backoff_active/record/reset のグローバル状態遷移。
+    /// プロセス内グローバル1本を直接操作するため、他のテストと並行に走って干渉しないよう
+    /// 1つのテスト関数にまとめて直列に検証する
+    #[test]
+    fn usage_backoff_global_state_machine() {
+        super::usage_backoff_reset();
+        assert!(!super::usage_backoff_active(std::time::SystemTime::now()), "初期状態は非バックオフ");
+
+        super::usage_backoff_record_rate_limited();
+        assert!(super::usage_backoff_active(std::time::SystemTime::now()), "1回目の429でバックオフ中になる");
+        {
+            let since = super::USAGE_BACKOFF_SINCE.lock().unwrap();
+            let (_, wait) = since.expect("バックオフ中は記録されているはず");
+            assert_eq!(wait, std::time::Duration::from_secs(5 * 60), "1回目の待ち時間は5分");
+        }
+
+        // streak が加算前の値で wait 計算されていることを固定する（2回目は10分）
+        super::usage_backoff_record_rate_limited();
+        {
+            let since = super::USAGE_BACKOFF_SINCE.lock().unwrap();
+            let (_, wait) = since.expect("バックオフ中は記録されているはず");
+            assert_eq!(wait, std::time::Duration::from_secs(10 * 60), "2回目の待ち時間は10分");
+        }
+
+        super::usage_backoff_reset();
+        assert!(!super::usage_backoff_active(std::time::SystemTime::now()), "reset 後は非バックオフ");
+
+        super::usage_backoff_record_rate_limited();
+        {
+            let since = super::USAGE_BACKOFF_SINCE.lock().unwrap();
+            let (_, wait) = since.expect("バックオフ中は記録されているはず");
+            assert_eq!(wait, std::time::Duration::from_secs(5 * 60), "reset 後に再び429を受けたら5分に戻る");
+        }
+        super::usage_backoff_reset();
     }
 }
 

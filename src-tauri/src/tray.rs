@@ -417,6 +417,17 @@ fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>)
     })
 }
 
+/// R-1 の分岐述語（2026-08-22、T-3・追加テスト項目1）: `live_usage_summary()` への
+/// フォールバックが必要かどうかを HTTP を打たずに判定する純粋関数。
+/// 未登録（`live_internal_name` が None）、または名前はあっても `usage` バッチの中に
+/// 対応エントリが無い（has_credentials=false・空バッチ等）場合に true を返す
+fn should_use_live_fallback(live_internal_name: Option<&str>, usage: &[crate::accounts::AccountUsage]) -> bool {
+    match live_internal_name {
+        None => true,
+        Some(name) => !usage.iter().any(|u| u.name == name),
+    }
+}
+
 /// トレイ・アプリ内ポップオーバー（`get_usage_overview`）の両方が土台にする生データ。
 /// 表示専用の整形（メニュー文字列・ゲージ描画）は呼び出し側でそれぞれ行う
 struct RawStatus {
@@ -431,10 +442,52 @@ struct RawStatus {
     live_error: Option<crate::actions::LiveUsageError>,
 }
 
+/// live_error の値から「claude CLI を裏起動して自動復帰させるべきか」を判定する純粋関数
+/// （issue #5 / R-8、2026-08-22）。Expired（token 期限切れ）のときだけ true。
+/// RateLimited では絶対に発火させない（429 は Claude Code 側の自動 refresh とは無関係で、
+/// claude -p を裏起動しても解決しない上、余計なリクエストを増やすだけのため）。
+/// `#[cfg(target_os = "macos")]` のインライン判定のままだとテストできなかったため切り出した
+///
+/// T-6（2026-08-22、既知の副作用として意図的に許容）: バックオフ中は live_error が
+/// RateLimited 固定になるため（`live_error_for_fresh_cache`）、その間に token が本当に
+/// 期限切れになっても、バックオフが解けて次に LiveOauth を実際に試すまで（最長60分）
+/// ここが true にならず issue #5 の自動復帰が遅れる。429 で埋まっている最中に
+/// `claude -p` を裏起動して余計なリクエストを増やす方が有害と判断し、この遅延を許容する
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn should_nudge_token_refresh(live_error: Option<&crate::actions::LiveUsageError>) -> bool {
+    matches!(live_error, Some(crate::actions::LiveUsageError::Expired))
+}
+
 /// 登録アカウント一覧・使用率一括照会・ライブ使用率の取得元フォールバックをまとめて行う
-/// （2026-07-31: `fetch_status`/`usage_overview` の共有ロジックとして抽出。
-/// 元は `fetch_status` に直接書かれていたトレイ専用ロジックで、ロジック自体は変更していない）
-fn fetch_raw_status() -> RawStatus {
+/// （2026-07-31: `fetch_status`/`usage_overview` の共有ロジックとして抽出）。
+///
+/// `force` は `accounts::get_accounts_usage` へそのまま引き回す。トレイの60秒定期更新は
+/// false（キャッシュ新鮮判定を効かせる）、「ステータス更新」メニューやフロントからの
+/// 手動更新・アカウント画面表示は true（キャッシュ新鮮判定をスキップして必ず照会する）
+/// にする（2026-08-22、B-2）。
+///
+/// 2026-08-22（B-1）: 以前はここで `accounts::get_accounts_usage()` と
+/// `actions::live_usage_summary()` の両方を無条件に呼んでおり、ライブアカウントの
+/// `/api/oauth/usage` を1サイクルに2回叩いていた。`get_accounts_usage` が返す
+/// `UsageBatch::live_error`（ライブアカウントに対する LiveOauth 経路の試行結果）を
+/// 使うことで、バッチにライブが居るときは `live_usage_summary()` を呼ばずに済ませる。
+///
+/// R-1（ブロッカー、2026-08-22）: ただし「ライブがバッチに存在しない」ケースが複数ある
+/// （未取り込み初回起動・ライブ org_id が登録済みのどれとも一致しない・登録済みだが
+/// has_credentials == false・Windows/Linux 全体（accounts_stub は常に空））。この場合に
+/// `live_usage_summary()` を無条件に削除すると使用量表示が死んでしまうため、
+/// 「バッチにライブが存在するか（live_usage_from_batch が Some か）」で分岐し、
+/// 存在しないときだけ `live_usage_summary()` を直接呼ぶフォールバックを残す。
+/// これは「キャッシュが無くて five_pct が None なだけ」（バッチは試行済み）とは区別する:
+/// 後者は二重取得の禁止（B-1）を優先し、ここでは呼ばない
+///
+/// T-2（要修正、2026-08-22）: このフォールバックは `accounts::get_accounts_usage` の中を
+/// 通らないため、素朴に呼ぶと `usage_backoff_active` を見ず 429 を受けても記録もしない。
+/// 未登録ライブ・has_credentials=false、そして **Windows/Linux ではこの経路が唯一の取得経路**
+/// なので、ここでバックオフ判定・記録をスキップすると非 macOS では 429 に永久に張り付いて
+/// バックオフが一度も効かないことになる。`crate::actions::usage_backoff_*`（全プラットフォーム
+/// 共通でコンパイルされる actions.rs に置いてある。T-2 の doc 参照）をここでも使う
+fn fetch_raw_status(force: bool) -> RawStatus {
     // 登録アカウント一覧からライブ（現在ログイン中）を判定し、見出しに実名を出す
     let registered = crate::accounts::registered_accounts();
     let live_name = registered.iter().find(|a| a.is_live).map(|a| a.display_name.clone());
@@ -443,13 +496,14 @@ fn fetch_raw_status() -> RawStatus {
     let live_internal_name = registered.iter().find(|a| a.is_live).map(|a| a.name.clone());
 
     // 一括照会はここ（トレイの定期更新・手動更新）とアカウント画面を開いた時だけに絞る
-    // （レート配慮。get_accounts_usage 自身も前回取得から60秒未満はキャッシュ返しにする）。
-    // 監視用長期トークンは復活させず、保存済みスナップショットの access token をそのまま使う
-    let usage = crate::accounts::get_accounts_usage().unwrap_or_default();
-    // ライブアカウント分を後段のフォールバックで再利用するため先に引いておく
-    // （get_accounts_usage は is_live のアカウントにもライブOAuth→監視トークン→
-    // スナップショットの順で既に試行済みなので、ここでもう一度 HTTP を打つ必要は無い）
-    let live_usage_from_batch = live_internal_name.as_ref().and_then(|name| usage.iter().find(|u| &u.name == name));
+    // （レート配慮。get_accounts_usage 自身も force=false のときは前回取得から
+    // 一定秒数未満ならキャッシュ返しにする）。監視用長期トークンは復活させず、
+    // 保存済みスナップショットの access token をそのまま使う
+    let batch = crate::accounts::get_accounts_usage(force).unwrap_or(crate::accounts::UsageBatch {
+        accounts: Vec::new(),
+        live_error: None,
+    });
+    let usage = batch.accounts;
 
     let other_accounts: Vec<_> = registered
         .into_iter()
@@ -465,44 +519,63 @@ fn fetch_raw_status() -> RawStatus {
         })
         .collect();
 
-    // ライブ OAuth を最優先で試す。失敗したら（典型的には切り替え直後で、スナップショット
-    // 由来のライブトークンが期限切れ。リフレッシュは Claude Code 起動時にしか起きない）、
-    // まず上の get_accounts_usage() がこのライブアカウント分について既に試行済みの結果
-    // （ライブOAuth→監視トークン→スナップショットのフォールバック連鎖）を再利用する
-    // （追加の HTTP なし）。それでも使える値が無いとき（例: 初回でキャッシュも無く
-    // バッチ側の照会も失敗した）だけ、最後の手段として監視トークンへ直接照会する。
-    // 2026-07-27 レビュー M-1: 従来はここで無条件にもう一度監視トークンへ POST しており、
-    // 「ライブトークン期限切れ＋監視トークンあり」のケースで毎サイクル /v1/messages への
-    // 実リクエストが2回（get_accounts_usage 内と、ここ）走っていた
-    let live_result = crate::actions::live_usage_summary();
-    // 表示用の原因分類（token 期限切れ／通信エラー）は「ライブ OAuth 直叩き」の結果だけを見る
-    // （issue #4）。バッチ・監視トークンのフォールバックはあくまで数値を埋めるための代替経路で、
-    // その失敗理由（「バッチ結果に使える値なし」等）は「現在ログイン中のアカウントの token
-    // 状態」を説明しないため使わない
-    let live_error = live_result.as_ref().err().cloned();
+    let (usage_result, live_error): (Result<crate::actions::UsageSummary, String>, Option<crate::actions::LiveUsageError>) =
+        if !should_use_live_fallback(live_internal_name.as_deref(), &usage) {
+            // バッチにライブが居る: 表示用の原因分類は get_accounts_usage が内部で行った
+            // 「ライブ OAuth 直叩き」の試行結果（UsageBatch::live_error）をそのまま使う
+            // （issue #4 の方針を踏襲。バッチのフォールバックはあくまで数値を埋めるための
+            // 代替経路で、その失敗理由は「現在ログイン中のアカウントの token 状態」を
+            // 説明しないため使わない）。二重取得の禁止（B-1）により live_usage_summary() は呼ばない
+            let entry = live_internal_name.as_ref().and_then(|name| usage.iter().find(|u| &u.name == name));
+            let result = usage_summary_from_batch(entry)
+                .ok_or_else(|| "バッチ結果に使える値なし".to_string())
+                .or_else(|_| {
+                    crate::accounts::live_account_monitor_token()
+                        .ok_or_else(|| "監視トークンなし".to_string())
+                        .and_then(|token| crate::actions::usage_via_monitor_token(&token))
+                });
+            (result, batch.live_error)
+        } else {
+            // R-1: バッチにライブが存在しないので、ここで唯一 live_usage_summary() を呼ぶ。
+            // T-2: get_accounts_usage の外を通るこの経路にもバックオフを効かせる
+            // （Windows/Linux ではこれが唯一の /api/oauth/usage 取得経路のため必達）
+            let now = std::time::SystemTime::now();
+            let live_result = if crate::actions::usage_backoff_active(now) {
+                Err(crate::actions::LiveUsageError::RateLimited)
+            } else {
+                let r = crate::actions::live_usage_summary();
+                match &r {
+                    Ok(_) => crate::actions::usage_backoff_reset(),
+                    Err(crate::actions::LiveUsageError::RateLimited) => crate::actions::usage_backoff_record_rate_limited(),
+                    Err(_) => {}
+                }
+                r
+            };
+            let live_error = live_result.as_ref().err().cloned();
+            let result = match live_result {
+                Ok(u) => Ok(u),
+                // 最後の手段: 監視トークン直接照会（従来どおり残す。/v1/messages 経由で
+                // /api/oauth/usage を叩かないため、バックオフ中でも試してよい）
+                Err(_) => crate::accounts::live_account_monitor_token()
+                    .ok_or_else(|| "監視トークンなし".to_string())
+                    .and_then(|token| crate::actions::usage_via_monitor_token(&token)),
+            };
+            (result, live_error)
+        };
+
     match &live_error {
         Some(crate::actions::LiveUsageError::Other(msg)) => log_unexpected_usage_error_once(msg),
-        // Other 以外（正常復帰、または Expired/Network という「原因が分かっている」失敗）に
-        // 戻ったら dedup 状態をリセットする。しないと、一度ログした Other が回復を挟んで
+        // Other 以外（正常復帰、または Expired/RateLimited/Network という「原因が分かっている」
+        // 失敗）に戻ったら dedup 状態をリセットする。しないと、一度ログした Other が回復を挟んで
         // 再発しても「直前と同じ」判定で再ログされなくなる（2026-08-08 再レビュー minor-3）
         _ => reset_logged_usage_error(),
     }
     // 期限切れなら claude CLI の裏起動で自動復帰を試みる（issue #5）。別スレッドに投げるだけで
     // トレイ更新はブロックしない。復帰すれば次の60秒ポーリングで表示が正常に戻る
     #[cfg(target_os = "macos")]
-    if matches!(&live_error, Some(crate::actions::LiveUsageError::Expired)) {
+    if should_nudge_token_refresh(live_error.as_ref()) {
         crate::actions::spawn_token_refresh_nudge();
     }
-    let usage_result = match live_result {
-        Ok(u) => Ok(u),
-        Err(_) => usage_summary_from_batch(live_usage_from_batch)
-            .ok_or_else(|| "バッチ結果に使える値なし".to_string())
-            .or_else(|_| {
-                crate::accounts::live_account_monitor_token()
-                    .ok_or_else(|| "監視トークンなし".to_string())
-                    .and_then(|token| crate::actions::usage_via_monitor_token(&token))
-            }),
-    };
 
     RawStatus { live_name, other_accounts, usage_result, live_error }
 }
@@ -556,6 +629,11 @@ fn usage_advisory(usage_is_ok: bool, live_error: Option<&crate::actions::LiveUsa
             Some(crate::actions::LiveUsageError::Network) => {
                 Some(UsageAdvisory::Note("接続できません（最新でない可能性）"))
             }
+            // 429（レート制限）。2026-08-22 追加: A. のバグ修正で Expired から分離した分類の
+            // 表示側。今表示中の値は直近の成功値（キャッシュ）で、最新ではない可能性がある旨を出す
+            Some(crate::actions::LiveUsageError::RateLimited) => {
+                Some(UsageAdvisory::Note("取得が一時的に制限されています（最新でない可能性）"))
+            }
             // Other（本来起きないはずの失敗）でもバッチにフォールバックできた＝実害が薄いため、
             // 注記までは出さず現在値をそのまま出す（既存挙動を維持）
             Some(crate::actions::LiveUsageError::Other(_)) | None => None,
@@ -565,6 +643,10 @@ fn usage_advisory(usage_is_ok: bool, live_error: Option<&crate::actions::LiveUsa
         Some(crate::actions::LiveUsageError::Expired) => (
             "token 期限切れ",
             "Claude Code を一度実行すると復帰します",
+        ),
+        Some(crate::actions::LiveUsageError::RateLimited) => (
+            "使用量を取得できません",
+            "取得が一時的に制限されています。しばらくお待ちください",
         ),
         Some(crate::actions::LiveUsageError::Network) => (
             "使用量を取得できません",
@@ -578,8 +660,8 @@ fn usage_advisory(usage_is_ok: bool, live_error: Option<&crate::actions::LiveUsa
     Some(UsageAdvisory::Blocking(line1, line2))
 }
 
-fn fetch_status() -> StatusData {
-    let raw = fetch_raw_status();
+fn fetch_status(force: bool) -> StatusData {
+    let raw = fetch_raw_status(force);
     let live_name = raw.live_name;
     let live_error = raw.live_error;
     let mut usage_lines = Vec::new();
@@ -622,9 +704,11 @@ fn fetch_status() -> StatusData {
 }
 
 /// アプリ内使用量ポップオーバー（`get_usage_overview` コマンド）向け。トレイと同じ
-/// `fetch_raw_status` を使うため、数値・フォールバック優先順位はトレイと完全に一致する
-pub fn usage_overview() -> UsageOverview {
-    let raw = fetch_raw_status();
+/// `fetch_raw_status` を使うため、数値・フォールバック優先順位はトレイと完全に一致する。
+/// フロントからの呼び出しはアカウント画面表示・手動更新に該当するため、呼び出し元
+/// （lib.rs の `get_usage_overview` コマンド）は常に force=true で呼ぶ
+pub fn usage_overview(force: bool) -> UsageOverview {
+    let raw = fetch_raw_status(force);
     let live_error_detail = raw.live_error;
     let (live, live_error, live_note) = match raw.usage_result {
         Ok(u) => {
@@ -796,8 +880,10 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
 }
 
 /// 取得（別スレッド）→ メニュー反映（メインスレッド）。
-/// アカウント切り替え直後にも外部から呼べるよう公開する（m7: 切り替え後の即時反映）
-pub fn refresh<R: Runtime>(app: AppHandle<R>) {
+/// アカウント切り替え直後にも外部から呼べるよう公開する（m7: 切り替え後の即時反映）。
+/// `force` は `fetch_status`/`get_accounts_usage` へそのまま引き回す。60秒定期更新は false、
+/// 「ステータス更新」メニュー・切り替え直後の即時反映は true にする（2026-08-22、B-2）
+pub fn refresh<R: Runtime>(app: AppHandle<R>, force: bool) {
     std::thread::spawn(move || {
         // 手動「セッション更新」ボタンの廃止に伴う自動化（2026-07-26）。定期更新のたびに
         // ライブセッションを確認し、登録済みアカウントかつスナップショットに変化があれば
@@ -820,7 +906,7 @@ pub fn refresh<R: Runtime>(app: AppHandle<R>) {
             Err(e) => eprintln!("auto_sync_live failed (will retry next cycle): {e}"),
         }
 
-        let data = fetch_status();
+        let data = fetch_status(force);
         let handle = app.clone();
         let _ = app.run_on_main_thread(move || {
             if let Some(tray) = handle.tray_by_id(TRAY_ID) {
@@ -852,7 +938,7 @@ fn info_dialog<R: Runtime>(app: &AppHandle<R>, title: &str, message: &str) {
 ///
 /// switch_account は Keychain 読み書き・profile API 呼び出し等のブロッキング処理を含むため、
 /// tokio ランタイムのコンテキストを持つスレッド（NSMenu イベントハンドラ）から直接呼ばず、
-/// oauth_get_with_token と同様に素の std::thread::spawn へ逃がす
+/// actions::oauth_get_checked と同様に素の std::thread::spawn へ逃がす
 /// （reqwest::blocking をランタイムコンテキスト内で呼ぶと過去に tokio パニックを踏んでいる）
 /// trust_unverified は常に false（2026-08-08 issue #3, major-3）: 持ち主未確認のまま
 /// 続行するかどうかは影響がユーザーに見える形（確認ダイアログ）で問うべきで、確認ダイアログを
@@ -862,7 +948,7 @@ fn info_dialog<R: Runtime>(app: &AppHandle<R>, title: &str, message: &str) {
 fn switch_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
     std::thread::spawn(move || match crate::accounts::switch_account(&name, true, false) {
         Ok(crate::accounts::SwitchOutcome::Switched { warning }) => {
-            refresh(app.clone());
+            refresh(app.clone(), true);
             if let Some(w) = warning {
                 info_dialog(&app, "CC Anatomy", &w);
             }
@@ -924,7 +1010,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 return;
             }
             match id {
-                "refresh" => refresh(app.clone()),
+                "refresh" => refresh(app.clone(), true),
                 "check-update" => crate::updater::check(app.clone(), true),
                 "open" => {
                     if let Some(win) = app.get_webview_window("main") {
@@ -951,7 +1037,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // 初回取得 + REFRESH_INTERVAL（1分）ごとの自動更新
     let handle = app.clone();
     std::thread::spawn(move || loop {
-        refresh(handle.clone());
+        refresh(handle.clone(), false);
         std::thread::sleep(REFRESH_INTERVAL);
     });
     Ok(())
@@ -1040,6 +1126,43 @@ mod tests {
         // 正常取得（live_error なし）や、フォールバックできた Other は注記不要（既存挙動）
         assert!(usage_advisory(true, None).is_none());
         assert!(usage_advisory(true, Some(&crate::actions::LiveUsageError::Other("x".into()))).is_none());
+    }
+
+    /// A. 429 の誤分類修正の表示側。usage_is_ok=true（バッチキャッシュ等で埋まった）でも
+    /// レート制限中は「最新でない可能性」の注記を出す
+    #[test]
+    fn usage_advisory_ok_with_rate_limited_adds_a_stale_note() {
+        match usage_advisory(true, Some(&crate::actions::LiveUsageError::RateLimited)) {
+            Some(UsageAdvisory::Note(note)) => {
+                assert!(note.contains("制限"));
+                assert!(note.contains("最新でない可能性"));
+            }
+            _ => panic!("Note を期待した"),
+        }
+    }
+
+    /// usage_is_ok=false（表示できる値が無い）ときは、token 期限切れとは違う文言で
+    /// 「一時的な制限」であることを案内する（「再ログインが必要」と誤読させない）
+    #[test]
+    fn usage_advisory_blocking_rate_limited_is_distinguished_from_expired() {
+        match usage_advisory(false, Some(&crate::actions::LiveUsageError::RateLimited)) {
+            Some(UsageAdvisory::Blocking(line1, line2)) => {
+                assert_ne!(line1, "token 期限切れ");
+                assert!(line2.contains("制限"));
+            }
+            _ => panic!("Blocking を期待した"),
+        }
+    }
+
+    /// R-8: 429起因の claude -p 裏起動を止めることが今回の目的の1つのため、
+    /// Expired だけが true になることを単体テストで守る
+    #[test]
+    fn should_nudge_token_refresh_only_for_expired() {
+        assert!(should_nudge_token_refresh(Some(&crate::actions::LiveUsageError::Expired)));
+        assert!(!should_nudge_token_refresh(Some(&crate::actions::LiveUsageError::RateLimited)));
+        assert!(!should_nudge_token_refresh(Some(&crate::actions::LiveUsageError::Network)));
+        assert!(!should_nudge_token_refresh(Some(&crate::actions::LiveUsageError::Other("x".into()))));
+        assert!(!should_nudge_token_refresh(None));
     }
 
     #[test]
@@ -1143,8 +1266,12 @@ mod tests {
     }
 
     fn account_usage(five_pct: Option<f64>) -> crate::accounts::AccountUsage {
+        account_usage_named("acct", five_pct)
+    }
+
+    fn account_usage_named(name: &str, five_pct: Option<f64>) -> crate::accounts::AccountUsage {
         crate::accounts::AccountUsage {
-            name: "acct".into(),
+            name: name.into(),
             five_pct,
             seven_pct: Some(12.0),
             five_reset: Some(1_000),
@@ -1178,6 +1305,29 @@ mod tests {
         // キャッシュ自体が存在しない（five_pct が None）なら「使える値なし」として
         // 呼び出し側（fetch_status）を最後の手段（監視トークン直接照会）へ進ませる
         assert!(usage_summary_from_batch(Some(&account_usage(None))).is_none());
+    }
+
+    /// R-1 / T-3 追加テスト項目1: フォールバックの発火条件そのもの
+    #[test]
+    fn should_use_live_fallback_when_unregistered() {
+        // 未登録（live_internal_name が None）: 未取り込み初回起動・ライブが登録のどれとも一致しない
+        assert!(should_use_live_fallback(None, &[account_usage(Some(10.0))]));
+    }
+
+    #[test]
+    fn should_use_live_fallback_when_missing_from_batch() {
+        // 名前はあるが usage バッチに対応エントリが無い（has_credentials=false・空バッチ等）
+        let usage = vec![account_usage_named("other", Some(10.0))];
+        assert!(should_use_live_fallback(Some("live"), &usage));
+        assert!(should_use_live_fallback(Some("live"), &[]));
+    }
+
+    #[test]
+    fn should_use_live_fallback_false_when_present_in_batch() {
+        // 名前があり usage バッチにも対応エントリがある: 二重取得を避けフォールバックしない
+        // （five_pct が None のキャッシュ無しエントリでも「試行済み」なので false のまま）
+        let usage = vec![account_usage_named("live", None)];
+        assert!(!should_use_live_fallback(Some("live"), &usage));
     }
 
     #[test]

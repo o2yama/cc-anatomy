@@ -204,7 +204,7 @@ fn switch_account(
 ) -> Result<accounts::SwitchOutcome, String> {
     let outcome = accounts::switch_account(&name, force, trust_unverified)?;
     if matches!(outcome, accounts::SwitchOutcome::Switched { .. }) {
-        tray::refresh(app);
+        tray::refresh(app, true);
     }
     Ok(outcome)
 }
@@ -227,18 +227,25 @@ fn reorder_accounts(names: Vec<String>) -> Result<(), String> {
 }
 
 /// 登録済み全アカウントの使用率一括取得。Keychain 読み取り・ネットワーク呼び出しを
-/// 伴うため async にし、一覧表示（get_accounts）をブロックしない別コマンドにする
+/// 伴うため async にし、一覧表示（get_accounts）をブロックしない別コマンドにする。
+/// フロントからの呼び出しはアカウント画面表示（手動更新扱い）のため force=true で呼ぶ
+/// （2026-08-22、B-2: 定期更新はトレイの60秒ループだけが担い、force=false で叩く）。
+/// ただし force=true の効果はライブアカウントのキャッシュ新鮮判定をスキップすることに
+/// 限定される（R-6）: 非ライブは常に600秒（NON_LIVE_MIN_REFETCH_SECS）の閾値が適用され、
+/// このコマンドを何度呼んでも登録アカウント全件へ毎回強制照会が走るわけではない
 #[tauri::command(async)]
 fn get_accounts_usage() -> Result<Vec<accounts::AccountUsage>, String> {
-    accounts::get_accounts_usage()
+    accounts::get_accounts_usage(true).map(|batch| batch.accounts)
 }
 
 /// アプリ内右上の使用量ポップオーバー向け。トレイと同じ土台（`tray::fetch_raw_status`）から
 /// 組み立てるため、表示内容・数値の優先順位はトレイと完全に一致する。
-/// ライブ OAuth への HTTP を含むため async にする
+/// ライブ OAuth への HTTP を含むため async にする。ポップオーバーを開く操作は手動更新扱いなので
+/// force=true で呼ぶ（2026-08-22、B-2。force の効果範囲は `get_accounts_usage` と同じく
+/// ライブアカウントのキャッシュ新鮮判定に限定される。R-6）
 #[tauri::command(async)]
 fn get_usage_overview() -> tray::UsageOverview {
-    tray::usage_overview()
+    tray::usage_overview(true)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -185,6 +185,13 @@ pub fn reorder_accounts(_names: &[String]) -> Result<(), String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
-pub fn get_accounts_usage() -> Result<Vec<AccountUsage>, String> {
+/// accounts.rs の同名構造体と型を合わせるだけの存在（#1〜#3 に続き、2026-08-22 の
+/// B-1 でシグネチャ変更した get_accounts_usage(force: bool) に追従）
+pub struct UsageBatch {
+    pub accounts: Vec<AccountUsage>,
+    pub live_error: Option<crate::actions::LiveUsageError>,
+}
+
+pub fn get_accounts_usage(_force: bool) -> Result<UsageBatch, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
