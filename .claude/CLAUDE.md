@@ -41,12 +41,12 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 - 環境診断は `claude -p` headless を read-only 許可リストで実行、修正は Terminal.app で対話起動（配布アプリ自身はユーザーファイルに書き込まない）
 - **アカウント切替は Keychain スワップ方式**（2026-07-25 実装、`accounts.rs` 参照）: ライブ Keychain の `Claude Code-credentials` をアカウント別スナップショット（`CC Anatomy-cred-<name>`）で保管し、切替時にライブ Keychain エントリ自体を書き換えて PC 全体のログインを差し替える。`~/.claude.json` の `oauthAccount` も同時に置換（他のキーは触らない）。refresh token が one-time use のため、切替・追加（`claude auth login`）の直前に必ず sync-back（現在ログイン中アカウントの最新資格情報をスナップショットへ書き戻す）を行う。外部セッション（シェルの claude セッション）が1件以上ある場合は「確認 + force」方式でユーザーに続行確認を挟む（ハードブロックにするとユーザー環境で機能自体が使えなくなったため2026-07-25に緩和。本アプリ自身の診断/タスク抽出プロセスはこれとは別に常時ハードブロック）。sync-back はベストエフォートにせず、読み取り失敗や部分適用の失敗（ロールバックも失敗した場合）は `meta.inconsistent` フラグで検出し、明示的な取り込み/再ログインまで以後の sync-back を止める。さらに `meta.last_live_hash`（SHA-256）で前回把握したライブ資格情報からの外部書き換えを検知し、ズレていれば `/api/oauth/profile` で実際の持ち主を確認してから sync-back する（実行中セッションの自動 refresh によるなりすまし帰属を防止）
   - **旧方式（2026-07-25 撤去済み）**: `claude setup-token` の長期トークンを Keychain に保管し `CLAUDE_CODE_OAUTH_TOKEN` 経由で `.zshrc` 注入する方式。環境変数がターミナル限定で PC 全体のログインを書き換えられない上、`CLAUDE_CODE_OAUTH_TOKEN` は Keychain より優先されるため新方式と競合し撤去。旧 `.zshrc` 注入ブロックはアプリ起動時に自動撤去される
-- **監視用長期トークンの仕組みは全廃**（2026-07-25 ユーザー決定）: 切替が Keychain スワップで簡単になったため、複数アカウントの使用量を並べて見る機能自体を廃止した。`CC Anatomy-token-<name>` / `CC Anatomy-active`（Keychain）、setup-token 登録フロー（`add_account_in_terminal`/`claim_pending_account`）、`accounts_usage_detail`/`AccountUsageDetail`、UI の「使用量監視用トークン」セクションを削除。使用量は常に「現在ライブのアカウントのみ」を `/api/oauth/usage`・`/api/oauth/profile`（ライブ access token 直叩き）で表示する一本道にした（トレイ・ツールバーとも）。起動時マイグレーション `remove_legacy_monitor_tokens()` が旧 Keychain エントリを一度だけ削除する（冪等）。`accounts.json` は旧フィールドが残っていても読める後方互換を維持
+- **監視用長期トークンは 2026-07-25 に全廃 → 翌 2026-07-26 に任意機能として復活**（2026-08-22 にコードと Keychain の実地確認で判明）: 07-25 に「複数アカウントの使用量を並べて見る機能自体を廃止する」と決めて `CC Anatomy-token-<name>` / `CC Anatomy-active`・setup-token 登録フロー・`accounts_usage_detail` 等を削除したが、**翌日 07-26 に監視用長期トークンが任意機能として復活しており、現在も稼働している**（`actions.rs` 冒頭コメント参照）。実地確認（2026-08-22）: Keychain に `CC Anatomy-token-share1/2/3` が実在し、`has_monitor_token()` は3件とも true を返す。**起動時マイグレーション `remove_legacy_monitor_tokens()` は現在のコードに存在しない**（07-25 当時の記述が残っていたもの）。使用量取得の優先順位は `resolve_usage_source_order()`（`accounts.rs`）が持ち、**ライブ**は `/api/oauth/usage` →（失敗時）監視トークンで `/v1/messages` → スナップショットで `/api/oauth/usage`、**非ライブは監視トークンの `/v1/messages` が最優先** → スナップショット。したがって「使用量は現在ライブのアカウントのみ・一本道」という旧記述も誤り。`/v1/messages` は `max_tokens:1` の実リクエストなので**使用量を消費する**。`accounts.json` は旧フィールドが残っていても読める後方互換を維持
 
 ### 未検証事項
 
 - アカウント切替（Keychain スワップ方式）: 取り込み→切替→`claude auth status`確認、A→B→A往復、`.zshrc`撤去、`~/.claude.json`の`oauthAccount`以外不変、Keychain ACL 保持、同一アカウント再ログイン後の切替、「確認+force」フロー・profile 確認による同一性検証、いずれも実機の Keychain 書き換えを伴うため未検証（詳細は `docs/specs/2026-07-25-account-switch-keychain-swap.md` の検証項目）
-- 監視用長期トークン全廃後のトレイ・ツールバー表示（ライブアカウントのみ表示、他アカウントは名前のみ列挙）の実機確認
+- 監視用長期トークン（2026-07-26 復活分）の残存期限。`docs/dev-log.md` には `claude setup-token` は「サブスク用・1年・ローテートなし」とあるが、現物3本の発行日・失効日は未確認
 
 ## 既知の落とし穴
 
@@ -64,11 +64,15 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 ### 2026-08-22 の決定
 
+- **使用量取得まわりの現行仕様は `docs/usage-polling-spec.md` に集約**（2026-08-22 作成）: 定期実行の間隔・全 HTTP 経路とそれぞれが使うトークン・トークン4種の有効期限と更新主体・Keychain とファイルの読み書き・バックオフのゲート範囲・キャッシュ閾値・切り替えの処理順を `file:line` と［確認］/［未確認］付きで記載。CLAUDE.md の記述と実装がずれていた場合はこちらが実地確認済みの正
+- **`/v1/messages` はバックオフの対象外**（`accounts.rs` の `UsageSource::MonitorToken` 経路）: 429 バックオフ中も監視トークン経由の推論リクエストは止まらない。バックオフ中のライブは毎分1回 `max_tokens:1` の実リクエストを投げ続ける。意図的な設計ではなく、429 対応時に見落としていた箇所
+- **アカウント切り替え時の refresh token 巻き戻しリスク**: 切り替えは Keychain の `Claude Code-credentials` をスナップショット JSON でまるごと上書きする（refresh token 込み）。refresh token は one-time use のため、スナップショット取得後に Claude Code がそれを消費していた場合、書き戻すとそのアカウントは refresh 不能になり再ログインが必要になる。防止策が切り替え直前の sync-back だが、持ち主を確認できないと飛ばされる。**2026-08-22 の変更で 429 も「持ち主未確認だが続行可」側に倒れるようになった**ため、続行を選ぶとこのリスクを踏みうる（そうしないと切り替え自体が不能になるため意図的）
+
 - **使用量が更新されない不具合を修正**（未リリース）: 症状「アカウント切替後も使用量が更新されない・全アカウント token 切れ表示・復活日時が古いまま」の実体は **HTTP 429 を「token 期限切れ」と誤分類していたバグ**だった（`oauth_get_checked_blocking` が HTTP ステータスを 401 しか見ず、本文に `error` フィールドがあれば全部 Expired と判定していた。429 の本文は `{"error":{"type":"rate_limit_error"}}`）。429 を起こしていたのはアプリ自身で、60秒サイクルごとに約4リクエスト/分（ライブは同じ1分に2回）を12日間連続で出していた。修正内容: ①HTTP ステータス優先の純粋関数 `classify_oauth_response` で 429/401/`authentication_error`/`rate_limit_error` を分離 ②ライブの二重取得を廃止（`get_accounts_usage` が `UsageBatch { accounts, live_error }` を返し、`fetch_raw_status` は `live_usage_summary()` を**ライブがバッチに存在しないときだけ**呼ぶ）③キャッシュ閾値をライブ45秒・非ライブ600秒に分離 ④429 で指数バックオフ（5→10→20→40→60分）。詳細と根拠は `docs/dev-log.md`
 - **バックオフ状態は `actions.rs`（全プラットフォーム共通）に置く**: macOS 限定の `accounts.rs` に置くと、Windows/Linux の唯一の使用量取得経路（`tray::fetch_raw_status` のフォールバック）がバックオフの管轄外になる。`accounts_stub.rs` への複製実装も不要になる
 - **`live_usage_summary()` のフォールバックは条件付きで必ず残す**: ライブがバッチに存在しないケース（CC Anatomy 未登録の初回起動・org_id 不一致・`has_credentials=false`・**Windows/Linux 全体**）で使用量表示が全滅し、「Claude Code でログインしてください」という誤案内が出る。無条件に削除してはいけない（一度やって退行を出した）
 - **429 は `OwnerError::NetworkError` に落とす（`Other` にしない）**: `Other` だと「持ち主未確認でも切り替える」確認ダイアログが出ず切り替え自体が失敗する。修正前は 429 が Expired に化けていたおかげで続行できていたため、`Other` にすると退行になる
-- **非ライブアカウントの使用量は原理的に最新化できない**: スナップショットの access token は最後にライブだった時刻から約8時間で切れ、refresh token は Claude Code 本体しか触らない設計のため。旧「監視用長期トークン」方式（`claude setup-token` の長期トークンで `/v1/messages` のレスポンスヘッダ `anthropic-ratelimit-unified-*` から読む）ならこの制約が無かったが、2026-07-25 に全廃済み。`usage_via_monitor_token` のコード自体は残っているので復活は容易
+- **非ライブアカウントの使用量は原理的に最新化できない**: スナップショットの access token は最後にライブだった時刻から約8時間で切れ、refresh token は Claude Code 本体しか触らない設計のため。ただし「監視用長期トークン」方式（`claude setup-token` の長期トークンで `/v1/messages` のレスポンスヘッダ `anthropic-ratelimit-unified-*` から読む）にはこの制約が無く、**この方式は 2026-07-26 に復活していて現在も動いている**（非ライブの使用量が取れているのはこの経路のおかげ）。2026-08-22 当初「全廃済み」と記述したのは誤りで、実地確認により訂正
 - **レート制限は `/api/oauth/usage` 側に固有**: 同時刻に同じライブトークンで `/v1/messages` を叩くと 200 が返り、ヘッダから同じ数値が取れる（2026-08-22 実測）
 - **未対応（スコープ外）**: `stale` / `fetched_at` の UI 表示。バックエンドは返しているのにトレイ（`compact_usage_segments`）もフロント（`App.tsx`）も見ておらず、取得失敗時にキャッシュ値を最新のように描く。「常に最新」を構造上保証できない経路がある以上、鮮度表示は本来必須
 - **実機検証済み（2026-08-22 10:26〜10:50、開発ビルド）**: ①非ライブの照会間隔600秒（10:38:45→10:48:45 でちょうど600秒後に再照会。ライブは60秒ごと）②429 でバックオフ突入し5分間まったく照会しない（2回とも再現）③バックオフ明けに自動復帰 ④**429 中に `claude -p` の裏起動が発火しない**（バックオフ中、アプリの子プロセスがゼロであることを `ps` で確認）
@@ -90,7 +94,7 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 - **ゴール再定義**: 「Claude Code の活動データを1ダッシュボードで俯瞰する」から「PC の環境を Claude Code が最も効果的に動けるようにセットアップする」に最終ゴールを拡大（ユーザー決定）。可視化（ダッシュボード）は最終ゴールの手段・土台という位置づけに変わる。メニューバーから見える要素は現状維持
 - **アカウント切替方式の変更**: 「setup-token 長期トークン + `CLAUDE_CODE_OAUTH_TOKEN` 注入」方式から「Keychain の `Claude Code-credentials` をアカウント別スナップショットでスワップし PC 全体のログインを書き換える」方式に変更・**実装済み**（詳細は上記「現在有効な設計決定」および `docs/specs/2026-07-25-account-switch-keychain-swap.md`）。実機での Keychain 書き換え検証は未実施
-- **監視用長期トークンの全廃**: 切替が Keychain スワップで簡単になったため、複数アカウントの使用量を並べて見る機能自体を廃止。使用量は現在ライブのアカウントのみ表示する方式に変更・**実装済み**（詳細は上記「現在有効な設計決定」および `docs/specs/2026-07-25-account-switch-keychain-swap.md`）
+- **監視用長期トークンの全廃**（※この決定は翌 2026-07-26 に覆され、任意機能として復活している。現行仕様は上記「現在有効な設計決定」を参照）: 切替が Keychain スワップで簡単になったため、複数アカウントの使用量を並べて見る機能自体を廃止。使用量は現在ライブのアカウントのみ表示する方式に変更・実装（詳細は `docs/specs/2026-07-25-account-switch-keychain-swap.md`）
 - **セッションガードの緩和**: 実運用でシェルセッションが常時複数開いており「0件」を前提としたハードブロックでは切替・追加・再ログインが一切できなくなったため、「確認 + force」方式に緩和・**実装済み**
 - **sync-back の同一性検証**: 実機観測でセッションが期限の数時間前でも自動 refresh してライブ Keychain を書き換えることが判明したため、`last_live_hash` + profile API 確認による同一性検証を追加・**実装済み**
 
