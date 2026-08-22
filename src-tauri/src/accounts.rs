@@ -503,7 +503,7 @@ pub fn registered_accounts() -> Vec<TrayAccount> {
 }
 
 /// ライブアカウントに対応する登録アカウントの監視トークンを読む（無ければ None）。
-/// トレイのタイトル表示（`live_usage_summary` の失敗時）専用のフォールバック。
+/// トレイのタイトル表示（`live_usage_summary_gated` の失敗時）専用のフォールバック。
 /// ライブトークンはスナップショット由来で、久しぶりに切り替えたアカウントほど期限切れに
 /// なりやすく、リフレッシュは Claude Code 起動時にしか起きないため、切り替え直後は
 /// メニューバーの使用量が「-」のまま見えなくなっていた（2026-07-27）。
@@ -678,7 +678,7 @@ struct UsageTarget {
 
 /// `get_accounts_usage` の戻り値。従来はアカウント一覧だけを返していたが、ライブアカウントに
 /// 対する LiveOauth 経路の試行結果（`live_error`）も一緒に返すようにした（2026-08-22、B-1）。
-/// これにより `tray::fetch_raw_status` は `actions::live_usage_summary()` を別途呼ばずに済み、
+/// これにより `tray::fetch_raw_status` は `actions::live_usage_summary_gated()` を別途呼ばずに済み、
 /// ライブアカウントの `/api/oauth/usage` への打鍵が1サイクルあたり2回→1回に減る。
 ///
 /// `live_error` の規約（2026-08-22、第4ラウンド S-2 でグローバルバックオフを撤去したことに
@@ -1562,7 +1562,7 @@ struct LiveOwner {
 
 /// ライブの持ち主を解決する。ハッシュが前回記録と一致していれば「外部からの書き換えなし」と
 /// みなし oauthAccount をそのまま信じる。不一致（または前回記録が無い）なら、まず
-/// `expires_at` の事前チェックで期限切れを検出し（actions::fetch_live_usage_status と同じ
+/// `expires_at` の事前チェックで期限切れを検出し（actions::is_token_expired と同じ
 /// ロジックを共有。無駄な401リクエストを避ける。2026-08-08 issue #1 対応）、期限内なら
 /// `fetch_profile`（実装は profile API 呼び出し。テストでは差し替える）で実際の持ち主を
 /// 確認してから帰属を決める。確認できなければ Err で中断する（推測で書き込まない）。

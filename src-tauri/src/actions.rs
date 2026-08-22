@@ -255,7 +255,7 @@ static USAGE_LAST_ATTEMPT: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// `tray.rs` のフォールバック経路（`live_usage_summary()` を直接呼ぶ側）専用の固定キー。
+/// `tray.rs` のフォールバック経路（`live_usage_summary_gated` を直接呼ぶ側）専用の固定キー。
 /// 登録アカウントの `name` ベースのキー（`<name>:live` 等）と衝突しない文字列にする
 pub(crate) const TRAY_LIVE_FALLBACK_KEY: &str = "__live_fallback__";
 
@@ -676,7 +676,8 @@ pub(crate) enum GatedLiveUsageOutcome {
 
 /// tray.rs のフォールバック経路（バッチにライブアカウントが存在しないとき＝未ログイン・
 /// 未登録ライブ・`has_credentials=false`・非 macOS 全体）専用の取得関数（V-1(a)）。
-/// `live_usage_summary()` と違い、「資格情報の読み取り → 期限チェック → ゲート → HTTP」の
+/// 旧 `live_usage_summary()`（ゲート無し版。V-1 で本関数に統合し削除済み）と違い、
+/// 「資格情報の読み取り → 期限チェック → ゲート → HTTP」の
 /// 順で処理し、ゲートは資格情報チェックを通過した後にだけかける（accounts.rs の
 /// LiveOauth 経路と同じ順序に揃えた）。これにより、資格情報が無い・期限切れという時点で
 /// 判明する失敗はゲートを一切消費せず、実際の理由がそのまま呼び出し側へ渡る

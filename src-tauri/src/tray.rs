@@ -412,7 +412,7 @@ fn now_epoch() -> i64 {
         .unwrap_or(0)
 }
 
-/// live_usage_summary() が失敗したときの第一フォールバック。get_accounts_usage() が
+/// live_usage_summary_gated() が失敗したときの第一フォールバック。get_accounts_usage() が
 /// 既に取得済みのライブアカウント分を、追加の HTTP 無しで UsageSummary へ変換できるかを
 /// 判定する（テスト容易性のため I/O から分離。2026-07-27 レビュー M-1）。
 /// five_pct が無ければ（キャッシュ自体が存在しない等）使える値なしとして None を返す。
@@ -432,7 +432,7 @@ fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>)
     })
 }
 
-/// R-1 の分岐述語（2026-08-22、T-3・追加テスト項目1）: `live_usage_summary()` への
+/// R-1 の分岐述語（2026-08-22、T-3・追加テスト項目1）: `live_usage_summary_gated()` への
 /// フォールバックが必要かどうかを HTTP を打たずに判定する純粋関数。
 /// 未登録（`live_internal_name` が None）、または名前はあっても `usage` バッチの中に
 /// 対応エントリが無い（has_credentials=false・空バッチ等）場合に true を返す
@@ -487,14 +487,14 @@ fn should_nudge_token_refresh(live_error: Option<&crate::actions::LiveUsageError
 /// `actions::live_usage_summary()` の両方を無条件に呼んでおり、ライブアカウントの
 /// `/api/oauth/usage` を1サイクルに2回叩いていた。`get_accounts_usage` が返す
 /// `UsageBatch::live_error`（ライブアカウントに対する LiveOauth 経路の試行結果）を
-/// 使うことで、バッチにライブが居るときは `live_usage_summary()` を呼ばずに済ませる。
+/// 使うことで、バッチにライブが居るときは `live_usage_summary_gated()` を呼ばずに済ませる。
 ///
 /// R-1（ブロッカー、2026-08-22）: ただし「ライブがバッチに存在しない」ケースが複数ある
 /// （未取り込み初回起動・ライブ org_id が登録済みのどれとも一致しない・登録済みだが
 /// has_credentials == false・Windows/Linux 全体（accounts_stub は常に空））。この場合に
-/// `live_usage_summary()` を無条件に削除すると使用量表示が死んでしまうため、
+/// `live_usage_summary_gated()` を無条件に削除すると使用量表示が死んでしまうため、
 /// 「バッチにライブが存在するか（live_usage_from_batch が Some か）」で分岐し、
-/// 存在しないときだけ `live_usage_summary()` を直接呼ぶフォールバックを残す。
+/// 存在しないときだけ `live_usage_summary_gated()` を直接呼ぶフォールバックを残す。
 /// これは「キャッシュが無くて five_pct が None なだけ」（バッチは試行済み）とは区別する:
 /// 後者は二重取得の禁止（B-1）を優先し、ここでは呼ばない
 ///
@@ -565,7 +565,7 @@ fn fetch_raw_status(force: bool) -> RawStatus {
             // 「ライブ OAuth 直叩き」の試行結果（UsageBatch::live_error）をそのまま使う
             // （issue #4 の方針を踏襲。バッチのフォールバックはあくまで数値を埋めるための
             // 代替経路で、その失敗理由は「現在ログイン中のアカウントの token 状態」を
-            // 説明しないため使わない）。二重取得の禁止（B-1）により live_usage_summary() は呼ばない
+            // 説明しないため使わない）。二重取得の禁止（B-1）により live_usage_summary_gated() は呼ばない
             let entry = live_internal_name.as_ref().and_then(|name| usage.iter().find(|u| &u.name == name));
             let result = usage_summary_from_batch(entry)
                 .ok_or_else(|| "バッチ結果に使える値なし".to_string())
