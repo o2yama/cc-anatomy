@@ -366,6 +366,30 @@ pub(crate) fn oauth_get_checked(token: &str, url: &str) -> FetchOutcome {
     }
 }
 
+/// JSON ボディの POST（OAuth トークンエンドポイント用。accounts::refresh_snapshot_credentials
+/// が使う）。素の OS スレッドへ逃がす理由は oauth_get_checked と同じ。
+/// 戻り値の本文にはトークンが含まれうるため、呼び出し側はログ・エラーメッセージへ
+/// 本文をそのまま載せないこと
+pub(crate) fn post_json_checked(url: &str, body: serde_json::Value) -> Result<(u16, String), String> {
+    let url = url.to_string();
+    std::thread::spawn(move || {
+        let resp = HTTP
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .map_err(|_| "ネットワークエラーが発生しました".to_string())?;
+        let status = resp.status().as_u16();
+        let text = resp
+            .text()
+            .map_err(|_| "API 応答の読み取りに失敗しました".to_string())?;
+        Ok((status, text))
+    })
+    .join()
+    .map_err(|_| "API 呼び出し中に内部エラーが発生しました".to_string())?
+}
+
 fn oauth_get_checked_blocking(token: &str, url: &str) -> FetchOutcome {
     let resp = match HTTP
         .get(url)

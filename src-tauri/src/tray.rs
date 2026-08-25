@@ -984,6 +984,14 @@ pub fn refresh<R: Runtime>(app: AppHandle<R>, force: bool) {
             Err(e) => eprintln!("auto_sync_live failed (will retry next cycle): {e}"),
         }
 
+        // ダイアログはユーザー応答まで戻らないため、トレイ更新（この後の fetch_status）を
+        // 待たせないよう専用スレッドで出す。多重表示は REFRESH_PROMPT_ACTIVE が防ぐ
+        #[cfg(target_os = "macos")]
+        {
+            let prompt_app = app.clone();
+            std::thread::spawn(move || prompt_snapshot_refresh(&prompt_app));
+        }
+
         let data = fetch_status(force);
         let handle = app.clone();
         let _ = app.run_on_main_thread(move || {
@@ -1000,6 +1008,66 @@ pub fn refresh<R: Runtime>(app: AppHandle<R>, force: bool) {
             }
         });
     });
+}
+
+/// スナップショットの refresh token 期限確認ダイアログの多重表示ガード。
+/// refresh() は60秒ごとに新しいスレッドを spawn するため、ダイアログが未応答のまま
+/// 次サイクルが来ると同じ確認が積み重なってしまうのを防ぐ
+#[cfg(target_os = "macos")]
+static REFRESH_PROMPT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 非ライブアカウントのスナップショットの refresh token 期限が近いとき、OS ダイアログで
+/// 確認して同意されたら refresh を実行する（設計と規約リスク受容の経緯は
+/// accounts.rs の「スナップショットの refresh token 期限対策」コメント参照）。
+/// 1サイクルにつき1件だけ確認する（複数接近していても連打しない。残りは次サイクル以降）
+#[cfg(target_os = "macos")]
+fn prompt_snapshot_refresh<R: Runtime>(app: &AppHandle<R>) {
+    use std::sync::atomic::Ordering;
+    use tauri_plugin_dialog::MessageDialogButtons;
+
+    if REFRESH_PROMPT_ACTIVE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    struct ActiveFlag;
+    impl Drop for ActiveFlag {
+        fn drop(&mut self) {
+            REFRESH_PROMPT_ACTIVE.store(false, Ordering::SeqCst);
+        }
+    }
+    let _flag = ActiveFlag;
+
+    let Some(c) = crate::accounts::snapshot_refresh_candidate() else {
+        return;
+    };
+    // 「はい」「いいえ」どちらでも24時間は再確認しない。応答前に記録することで、
+    // ダイアログ放置中のプロセス再起動でも連打にならない
+    crate::accounts::mark_refresh_prompted(&c.name);
+    let yes = app
+        .dialog()
+        .message(format!(
+            "{}の認証情報の期限が切れます。\n自動で更新しますか？",
+            c.email
+        ))
+        .title("CC Anatomy")
+        .buttons(MessageDialogButtons::OkCancelCustom("はい".to_string(), "いいえ".to_string()))
+        .blocking_show();
+    if yes {
+        match crate::accounts::refresh_snapshot_credentials(&c.name) {
+            Ok(()) => info_dialog(app, "CC Anatomy", &format!("{}の認証情報を更新しました。", c.email)),
+            Err(e) => info_dialog(
+                app,
+                "CC Anatomy",
+                &format!("{}の認証情報を更新できませんでした。\n{e}", c.email),
+            ),
+        }
+    } else {
+        // アプリのアカウント画面へ誘導（手動での再ログイン・取り込み操作用）
+        if let Some(win) = app.get_webview_window("main") {
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        let _ = app.emit("open-accounts", ());
+    }
 }
 
 fn info_dialog<R: Runtime>(app: &AppHandle<R>, title: &str, message: &str) {

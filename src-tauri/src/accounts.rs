@@ -210,6 +210,11 @@ struct StoredAccount {
     /// 有効期限内のときだけ照会する。refresh は絶対に行わない）
     #[serde(default)]
     usage_cache: Option<UsageCache>,
+    /// スナップショットの refresh token 期限接近の確認ダイアログを最後に出した時刻
+    /// （epoch ミリ秒）。同じアカウントに毎サイクル聞かないための 24 時間スロットル用。
+    /// 旧バージョンの accounts.json には無いフィールドなので default 必須
+    #[serde(default)]
+    refresh_prompted_at: Option<i64>,
 }
 
 /// 使用率キャッシュ。access token が期限切れ・照会失敗のときはこれをそのまま返し、
@@ -1024,7 +1029,16 @@ struct AccountOpGuard;
 impl AccountOpGuard {
     fn acquire() -> Result<Self, String> {
         ensure_app_not_busy()?;
-        ACCOUNT_OP_IN_PROGRESS.store(true, Ordering::SeqCst);
+        // compare_exchange で「アカウント操作同士」の相互排他も保証する（2026-08-25 レビュー R3）。
+        // 従来の store(true) は診断/分析の開始をブロックするだけで、switch_account と
+        // refresh_snapshot_credentials（バックグラウンド起点）が並走でき、先に終わった側の
+        // Drop がフラグを下ろしてガードが消えていた
+        if ACCOUNT_OP_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("別のアカウント操作が進行中です。完了してから再試行してください。".into());
+        }
         // セットした直後にもう一度確認する。ensure_app_not_busy の判定とこのセットの間に
         // 分析/診断が spawn されていたら、busy 状態のままアカウント操作を進めないよう戻す
         if crate::diagnostics::is_running()
@@ -1292,6 +1306,7 @@ fn import_live_account_locked() -> Result<Account, String> {
             oauth_account: Some(oauth_account),
             has_credentials: true,
             usage_cache: None,
+            refresh_prompted_at: None,
         }),
     }
     sync_active_pointer(&mut meta);
@@ -2544,6 +2559,337 @@ pub fn remove_account(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// スナップショットの refresh token 期限対策（2026-08-25 実装）
+//
+// Keychain 実物確認（2026-08-25）で `claudeAiOauth.refreshTokenExpiresAt` の存在を確認した。
+// refresh token は発行から約30日で失効するため、非ライブのスナップショットを30日以上
+// 放置すると切り替え後に再ログインが必要になる。期限が近づいたら OS ダイアログで確認し、
+// 同意されたときだけアプリ自身が OAuth refresh を実行してスナップショットを更新する。
+//
+// **規約リスクをユーザーが受容済み（2026-08-25 決定）**: このエンドポイント・client_id の
+// アプリからの直接利用は Anthropic の Consumer Terms 上「Claude Code 以外のツールからの
+// OAuth 利用」にあたり、資格情報を失効させられるリスクがある（2026-01 のサーバー側
+// ブロック強化・2026-02 の規約明文化）。調査記録は tmp/2026-08-25-token-refresh-research.md。
+//
+// ライブアカウントは絶対に対象外: Claude Code 本体の自動 refresh と one-time use の
+// refresh token を取り合い、どちらかの世代が消費済みになって資格情報が壊れるため。
+// ---------------------------------------------------------------------------
+
+/// Claude Code の OAuth トークンエンドポイント（非公式利用。OSS 実装3件で確認済み）
+const OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+/// Claude Code の公開 OAuth client_id
+const OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+/// 期限のこれだけ手前から確認ダイアログを出す（30日寿命のうち10日経過相当 = 残り20日）
+const REFRESH_PROMPT_LEAD_MS: i64 = 20 * 24 * 60 * 60 * 1000;
+/// 同一アカウントへの確認ダイアログの最小間隔（24時間）
+const REFRESH_PROMPT_INTERVAL_MS: i64 = 24 * 60 * 60 * 1000;
+/// refresh token の想定寿命のフォールバック。レスポンスに期限フィールドが無い場合に使う。
+/// 実測（2026-08-25 のライブ資格情報）では発行から約30日だったが、ここで実際より長く
+/// 見積もると期限判定が二度と発火しないまま失効しうる（レビュー R5）ため、保守側の
+/// 25日に倒す。短く見積もる分には再確認が5日早まるだけで資格情報は失わない
+const REFRESH_TOKEN_LIFETIME_MS: i64 = 25 * 24 * 60 * 60 * 1000;
+
+/// 確認ダイアログを出すべきか（純粋関数）。
+/// - 期限まで REFRESH_PROMPT_LEAD_MS を切っている
+/// - まだ期限切れではない（切れていたら refresh 自体が失敗するので聞かない。
+///   その場合の救済は既存の「再ログイン」導線）
+/// - 前回の確認から REFRESH_PROMPT_INTERVAL_MS 以上経っている
+fn refresh_prompt_due(refresh_expires_at_ms: i64, last_prompted_ms: Option<i64>, now_ms: i64) -> bool {
+    let approaching =
+        refresh_expires_at_ms > now_ms && refresh_expires_at_ms - now_ms <= REFRESH_PROMPT_LEAD_MS;
+    let throttled = last_prompted_ms.is_some_and(|t| now_ms - t < REFRESH_PROMPT_INTERVAL_MS);
+    approaching && !throttled
+}
+
+/// refresh 成功レスポンスをスナップショット JSON へ反映する（純粋関数）。
+/// claudeAiOauth 配下の4フィールドだけ更新し、scopes 等の他フィールドは保持する。
+/// レスポンスに refresh token の期限に相当するフィールドは確認できていないため、
+/// refreshTokenExpiresAt は now + 30日 のフォールバック値を書く（発行時点からの
+/// 固定寿命という実測に基づく近似。実際より短く見積もる分には再確認が早まるだけで害はない）
+fn apply_refreshed_tokens(
+    mut snapshot: serde_json::Value,
+    access_token: &str,
+    refresh_token: &str,
+    expires_in_secs: i64,
+    now_ms: i64,
+) -> Result<serde_json::Value, String> {
+    let oauth = snapshot
+        .pointer_mut("/claudeAiOauth")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("スナップショットの形式が想定外です")?;
+    oauth.insert("accessToken".into(), serde_json::json!(access_token));
+    oauth.insert("refreshToken".into(), serde_json::json!(refresh_token));
+    oauth.insert("expiresAt".into(), serde_json::json!(now_ms + expires_in_secs * 1000));
+    oauth.insert(
+        "refreshTokenExpiresAt".into(),
+        serde_json::json!(now_ms + REFRESH_TOKEN_LIFETIME_MS),
+    );
+    Ok(snapshot)
+}
+
+/// 期限接近の確認対象1件分（tray.rs のダイアログ表示用）
+pub struct SnapshotRefreshCandidate {
+    /// refresh_snapshot_credentials / mark_refresh_prompted に渡す内部識別子
+    pub name: String,
+    /// ダイアログ文言に使うメールアドレス（空なら表示名で代替済みの文字列）
+    pub email: String,
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// refresh 対象にしてよい「確実に非ライブ」の判定（純粋関数。レビュー R1/M8）。
+/// `!is_live_account(..)` は org_id が空・ライブ org 不明のとき true（＝非ライブ扱い）に
+/// 倒れてしまうが、ここは逆で「ライブでないと確定できなければ対象にしない」が正しい:
+/// org_id が空の旧エントリが実はログイン中だったり、~/.claude.json の一時的な読み取り失敗で
+/// 全アカウントが非ライブ扱いになると、Claude Code 本体と refresh を取り合って資格情報が壊れる
+fn confirmed_non_live(org_id: &str, live_org: Option<&str>) -> bool {
+    !org_id.is_empty() && live_org.is_some_and(|l| l != org_id)
+}
+
+/// accounts.json への書き込みが失敗した場合でも24時間スロットルを守るための
+/// プロセス内の第二スロットル（レビュー R6。name → 最終確認時刻 epoch ms）
+static PROMPTED_IN_MEMORY: Mutex<Option<std::collections::HashMap<String, i64>>> = Mutex::new(None);
+
+fn prompted_in_memory_at(name: &str) -> Option<i64> {
+    let guard = PROMPTED_IN_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.as_ref()?.get(name).copied()
+}
+
+/// refresh token の期限が近づいている非ライブアカウントを1件返す（60秒ループから毎回呼ぶ。
+/// ダイアログは1サイクル1件しか出さないため、複数該当しても先頭で打ち切る）。
+/// 判定に必要な refreshTokenExpiresAt はスナップショット（Keychain）にしか無いため、
+/// 該当が見つかるまでのぶんだけ keychain_read を伴う。
+/// 不整合状態・アカウント操作中・ライブ資格情報が読めない間は None（判断の保留。害がない）
+pub fn snapshot_refresh_candidate() -> Option<SnapshotRefreshCandidate> {
+    if ACCOUNT_OP_IN_PROGRESS.load(Ordering::SeqCst) {
+        return None;
+    }
+    let _guard = lock_meta();
+    let meta = load_meta();
+    if meta.inconsistent {
+        return None;
+    }
+    let live = live_org_id()?;
+    // ライブの refresh token とも突き合わせる（org_id の照合だけでは旧エントリの
+    // 空 org_id をすり抜ける。レビュー R1）。読めなければ判定不能として保留
+    let live_rt = live_credentials_value()
+        .ok()?
+        .pointer("/claudeAiOauth/refreshToken")?
+        .as_str()?
+        .to_string();
+    let now = now_ms();
+    meta.accounts
+        .iter()
+        .filter(|a| a.has_credentials && confirmed_non_live(&a.org_id, Some(&live)))
+        .find_map(|a| {
+            let raw = keychain_read(&cred_svc(&a.name))?;
+            let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            // スナップショットがライブと同じ refresh token を持つ＝実体はライブと同一。
+            // ここで refresh すると Claude Code 本体と one-time use トークンを取り合う
+            if v.pointer("/claudeAiOauth/refreshToken").and_then(|t| t.as_str()) == Some(live_rt.as_str()) {
+                return None;
+            }
+            // 旧スナップショット（refreshTokenExpiresAt を持たない時期の取り込み）は
+            // 期限を判定しようがないためスキップする。次の sync-back / 切り替えで
+            // 最新形式に置き換われば対象に入る
+            let expires = v.pointer("/claudeAiOauth/refreshTokenExpiresAt")?.as_i64()?;
+            let last_prompted = match (a.refresh_prompted_at, prompted_in_memory_at(&a.name)) {
+                (Some(p), Some(m)) => Some(p.max(m)),
+                (p, m) => p.or(m),
+            };
+            if !refresh_prompt_due(expires, last_prompted, now) {
+                return None;
+            }
+            let email = if a.email.is_empty() {
+                resolve_display_name(&a.name, a.display_name.as_deref())
+            } else {
+                a.email.clone()
+            };
+            Some(SnapshotRefreshCandidate { name: a.name.clone(), email })
+        })
+}
+
+/// 確認ダイアログを出した時刻を記録する（「はい」「いいえ」どちらでも呼ぶ。
+/// 毎サイクル再表示しないための 24 時間スロットル）。accounts.json への永続化が
+/// 失敗しても、プロセス内スロットル（PROMPTED_IN_MEMORY）が毎分の再表示を防ぐ
+pub fn mark_refresh_prompted(name: &str) {
+    {
+        let mut guard = PROMPTED_IN_MEMORY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(name.to_string(), now_ms());
+    }
+    let _guard = lock_meta();
+    let mut meta = load_meta();
+    if let Some(a) = meta.accounts.iter_mut().find(|a| a.name == name) {
+        a.refresh_prompted_at = Some(now_ms());
+        let _ = save_meta(&meta);
+    }
+}
+
+/// スナップショットの OAuth refresh 本体（ユーザーが確認ダイアログで「はい」を選んだときだけ
+/// 呼ばれる）。AccountOpGuard で切り替え・追加・診断系と相互排他にする。
+///
+/// refresh token は one-time use のため、POST が成功した瞬間に旧トークンは無効になり、
+/// レスポンスの新トークンが唯一の有効な資格情報になる。したがって書き込み失敗は
+/// 黙って握りつぶせない: 最大3回リトライし、全滅したら Err で呼び出し側（ダイアログ）に
+/// 「再ログインが必要」と伝える
+pub fn refresh_snapshot_credentials(name: &str) -> Result<(), String> {
+    let _op = AccountOpGuard::acquire()?;
+
+    // フェーズ1（ロック区間）: 対象がいまも「確実に非ライブ」であることを確認してから
+    // refresh token を読む。ダイアログ表示中に切り替えが起きてライブ化していた場合、
+    // ここで中断しないと Claude Code 本体の refresh と競合する。
+    // 判定は org_id の照合（確定できなければ中断）に加えて、ライブの refresh token との
+    // 一致も見る（org_id が空の旧エントリのすり抜け防止。レビュー R1）
+    let refresh_token = {
+        let _guard = lock_meta();
+        let meta = load_meta();
+        if meta.inconsistent {
+            return Err("直前の切り替えが中途半端な状態のままです。先に解消してください".into());
+        }
+        let account = meta
+            .accounts
+            .iter()
+            .find(|a| a.name == name)
+            .ok_or("対象のアカウントが見つかりませんでした")?;
+        let live = live_org_id()
+            .ok_or("現在ログイン中のアカウントを確認できないため、安全のため更新を見送りました")?;
+        if !confirmed_non_live(&account.org_id, Some(&live)) {
+            return Err(
+                "このアカウントがログイン中でないことを確認できませんでした。ログイン中のアカウントは Claude Code 本体が自動で更新します".into(),
+            );
+        }
+        let live_rt = live_credentials_value()
+            .ok()
+            .and_then(|v| v.pointer("/claudeAiOauth/refreshToken").and_then(|t| t.as_str()).map(String::from))
+            .ok_or("現在ログイン中の資格情報を確認できないため、安全のため更新を見送りました")?;
+        let raw = keychain_read(&cred_svc(name))
+            .ok_or("スナップショットを読み取れませんでした")?;
+        let v: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|_| "スナップショットの形式が想定外です")?;
+        let rt = v
+            .pointer("/claudeAiOauth/refreshToken")
+            .and_then(|t| t.as_str())
+            .map(String::from)
+            .ok_or("スナップショットに refresh token がありません")?;
+        if rt == live_rt {
+            return Err(
+                "このスナップショットは現在ログイン中の資格情報と同一のため、Claude Code 本体の更新に任せます".into(),
+            );
+        }
+        rt
+    };
+
+    // フェーズ2（ロック外・HTTP）。AccountOpGuard は保持したままなので、この間に
+    // 切り替え等のアカウント操作が始まることはない
+    let body = serde_json::json!({
+        "grant_type": "refresh_token",
+        "client_id": OAUTH_CLIENT_ID,
+        "refresh_token": refresh_token,
+    });
+    let (status, resp_body) = crate::actions::post_json_checked(OAUTH_TOKEN_URL, body)?;
+    if !(200..300).contains(&status) {
+        // 本文にはトークンが含まれうるためエラーメッセージへ載せない
+        return Err(match status {
+            400 | 401 | 403 => format!(
+                "refresh token が受け付けられませんでした（HTTP {status}）。このアカウントは再ログインが必要です"
+            ),
+            429 => "レート制限中です。時間をおいて再試行してください".to_string(),
+            _ => format!("トークン更新に失敗しました（HTTP {status}）"),
+        });
+    }
+    let resp: serde_json::Value = serde_json::from_str(&resp_body)
+        .map_err(|_| "トークン更新の応答を解析できませんでした".to_string())?;
+    let access = resp
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or("応答に access_token がありません")?;
+    let new_refresh = resp
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .ok_or("応答に refresh_token がありません")?;
+    let expires_in = resp.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(8 * 60 * 60);
+    // refresh token 側の期限がレスポンスにあれば優先する（フィールド名は未確認のため
+    // 両候補を見る。無ければ apply_refreshed_tokens が保守側フォールバック25日を書く。
+    // レビュー R5: 実際より長く見積もると期限判定が発火しないまま失効する）
+    let refresh_expires_override = resp
+        .get("refresh_token_expires_in")
+        .or_else(|| resp.get("refresh_expires_in"))
+        .and_then(|v| v.as_i64());
+
+    // フェーズ3（ロック区間・書き込み）: この時点で旧 refresh token は消費済みで、
+    // レスポンスの新トークンが唯一の有効な資格情報。まず TOCTOU 再検証を行う
+    // （レビュー R2。auto_sync_live / poll_monitor_setup と同じ規律）:
+    // HTTP 中に切り替え等でスナップショットが変わっていた（refresh token がフェーズ1と
+    // 不一致）場合、その上に書くと切り替え後の新しい資格情報を巻き戻してしまうため中断する
+    let _guard = lock_meta();
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        // 読み取り・解析・整形も含めてリトライ対象にする（レビュー R4: security コマンドの
+        // 一時失敗ひとつで取得済みの有効トークンを捨ててはいけない）
+        let updated_str = match keychain_read(&cred_svc(name))
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        {
+            Some(snapshot) => {
+                let current_rt = snapshot
+                    .pointer("/claudeAiOauth/refreshToken")
+                    .and_then(|t| t.as_str());
+                if attempt == 0 && current_rt != Some(refresh_token.as_str()) {
+                    return Err(
+                        "更新中にスナップショットが別の内容に置き換わったため、上書きを中止しました。アカウント画面から状態を確認してください".into(),
+                    );
+                }
+                let now = now_ms();
+                let mut v = apply_refreshed_tokens(snapshot, access, new_refresh, expires_in, now)?;
+                if let (Some(secs), Some(o)) = (
+                    refresh_expires_override,
+                    v.pointer_mut("/claudeAiOauth").and_then(|p| p.as_object_mut()),
+                ) {
+                    o.insert("refreshTokenExpiresAt".into(), serde_json::json!(now + secs * 1000));
+                }
+                v.to_string()
+            }
+            // 既存スナップショットが読めない場合でも新トークンは失えないため、
+            // 最小構成で新規に組み立てて書く（scopes 等は失うが資格情報を失うよりよい）
+            None => {
+                let now = now_ms();
+                serde_json::json!({
+                    "claudeAiOauth": {
+                        "accessToken": access,
+                        "refreshToken": new_refresh,
+                        "expiresAt": now + expires_in * 1000,
+                        "refreshTokenExpiresAt": now
+                            + refresh_expires_override.map_or(REFRESH_TOKEN_LIFETIME_MS, |s| s * 1000),
+                    }
+                })
+                .to_string()
+            }
+        };
+        match keychain_write(&cred_svc(name), &updated_str) {
+            Ok(()) => {
+                let mut meta = load_meta();
+                if let Some(a) = meta.accounts.iter_mut().find(|a| a.name == name) {
+                    a.refresh_prompted_at = Some(now_ms());
+                }
+                let _ = save_meta(&meta);
+                return Ok(());
+            }
+            Err(e) => last_err = e,
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+    Err(format!(
+        "新しいトークンの保存に失敗しました（{last_err}）。旧トークンは既に無効化されているため、このアカウントは再ログインが必要です"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2558,6 +2904,7 @@ mod tests {
             oauth_account: None,
             has_credentials: false,
             usage_cache: None,
+            refresh_prompted_at: None,
         }
     }
 
@@ -3210,5 +3557,79 @@ mod tests {
         let c = cache(80.0, 52.0, None, 1_000);
         let usage = to_account_usage("acct", Some(&c), true, 5_000);
         assert!(!usage.five_probably_reset);
+    }
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    #[test]
+    fn refresh_prompt_due_within_lead_window() {
+        // 期限まで残り19日（20日を切っている）・未確認 → 出す
+        assert!(refresh_prompt_due(19 * DAY_MS, None, 0));
+    }
+
+    #[test]
+    fn refresh_prompt_not_due_when_far_from_expiry() {
+        // 期限まで残り25日 → まだ出さない
+        assert!(!refresh_prompt_due(25 * DAY_MS, None, 0));
+    }
+
+    #[test]
+    fn refresh_prompt_not_due_when_already_expired() {
+        // 期限切れは refresh 自体が失敗するので聞かない（再ログイン導線に委ねる）
+        assert!(!refresh_prompt_due(1_000, None, 2_000));
+    }
+
+    #[test]
+    fn refresh_prompt_throttled_within_24h() {
+        let now = 100 * DAY_MS;
+        let expires = now + 5 * DAY_MS;
+        // 12時間前に確認済み → 出さない。25時間前なら出す
+        assert!(!refresh_prompt_due(expires, Some(now - DAY_MS / 2), now));
+        assert!(refresh_prompt_due(expires, Some(now - DAY_MS - 3_600_000), now));
+    }
+
+    #[test]
+    fn apply_refreshed_tokens_updates_only_token_fields() {
+        let snapshot = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "old-at",
+                "refreshToken": "old-rt",
+                "expiresAt": 1,
+                "refreshTokenExpiresAt": 2,
+                "scopes": ["user:inference"],
+                "subscriptionType": "max"
+            }
+        });
+        let now = 1_000_000;
+        let out = apply_refreshed_tokens(snapshot, "new-at", "new-rt", 28_800, now).unwrap();
+        let o = out.pointer("/claudeAiOauth").unwrap();
+        assert_eq!(o.get("accessToken").unwrap(), "new-at");
+        assert_eq!(o.get("refreshToken").unwrap(), "new-rt");
+        assert_eq!(o.get("expiresAt").unwrap().as_i64(), Some(now + 28_800 * 1000));
+        assert_eq!(
+            o.get("refreshTokenExpiresAt").unwrap().as_i64(),
+            Some(now + REFRESH_TOKEN_LIFETIME_MS)
+        );
+        // トークン以外のフィールドは保持される
+        assert_eq!(o.get("subscriptionType").unwrap(), "max");
+        assert!(o.get("scopes").unwrap().is_array());
+    }
+
+    #[test]
+    fn apply_refreshed_tokens_rejects_malformed_snapshot() {
+        assert!(apply_refreshed_tokens(serde_json::json!({}), "a", "r", 1, 0).is_err());
+    }
+
+    /// レビュー R1: 「非ライブと確定できない」ケースはすべて対象外に倒す
+    #[test]
+    fn confirmed_non_live_requires_certainty() {
+        // 通常の非ライブ → 対象
+        assert!(confirmed_non_live("org-a", Some("org-b")));
+        // ライブと一致 → 対象外
+        assert!(!confirmed_non_live("org-a", Some("org-a")));
+        // org_id が空の旧エントリ → 確定できないので対象外
+        assert!(!confirmed_non_live("", Some("org-b")));
+        // ライブ org 不明（~/.claude.json 読み取り失敗等）→ 確定できないので対象外
+        assert!(!confirmed_non_live("org-a", None));
     }
 }

@@ -62,6 +62,15 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 ---
 
+### 2026-08-25 の決定
+
+- **スナップショットの refresh token 自動更新機能を実装**（未リリース・実機未検証）: Keychain 実物確認で `claudeAiOauth.refreshTokenExpiresAt` の存在を確認し、refresh token は発行から約30日で失効すると判明。非ライブのスナップショットを30日放置すると切り替え後に再ログインが必要になるため、期限20日前から OS ネイティブダイアログ（「<email>の認証情報の期限が切れます。自動で更新しますか？」はい/いいえ）で確認し、「はい」でアプリ自身が `https://console.anthropic.com/v1/oauth/token` に POST してスナップショットを更新する。「いいえ」はメインウィンドウ前面化+アカウントモーダル表示（`open-accounts` イベント）。60秒ループから1サイクル1件・アカウント単位24時間スロットル（accounts.json の `refresh_prompted_at` + プロセス内第二スロットル）。macOS 限定
+- **規約リスクをユーザーが受容済み**: このエンドポイント・client_id（Claude Code の公開値）のアプリからの直接利用は Anthropic Consumer Terms 上のグレー〜違反領域で、予告なしの資格情報失効リスクがある（2026-01 サーバー側ブロック強化・2026-02 規約明文化）。通知のみの安全案を提示した上で、ユーザーが自動 refresh を選択（2026-08-25）。調査記録: `tmp/2026-08-25-token-refresh-research.md`（git 管理外）
+- **ライブアカウントは絶対に refresh 対象にしない**: Claude Code 本体の自動 refresh と one-time use の refresh token を取り合い資格情報が壊れるため。判定は「非ライブと確定できなければ対象外」に倒す（`confirmed_non_live`: org_id 空・ライブ org 不明は対象外。さらにライブの refreshToken との一致もチェック）
+- **HTTP 成功後は新トークンが唯一の有効な資格情報**: 書き込み前に TOCTOU 再検証（スナップショットの refreshToken がフェーズ1と一致するか）を行い、読み取り→整形→書き込みの全体をリトライ対象にし、既存スナップショットが読めなければ最小構成 JSON を新規構築してでも書く。全滅時のみ「再ログインが必要」
+- **`AccountOpGuard::acquire` を compare_exchange 化**: 従来は store(true) でアカウント操作同士（switch_account と本機能等）が相互排他になっていなかった（レビュー R3）。既存の switch_account / start_add_account_login にも同じ排他が効くようになる
+- **実機未検証**: refresh POST の実レスポンス形状（`refresh_token_expires_in` の有無は未確認・保守側フォールバック25日）、Keychain 書き換え、ダイアログ表示、「いいえ」導線のモーダル表示。既知の残課題: `refreshTokenExpiresAt` を持たない旧スナップショットは対象外のまま・トークンが `security` の argv 経由で `ps` に露出する既存制約の増幅
+
 ### 2026-08-22 の決定
 
 - **v0.5.4（同日午後）: v0.5.3 の段階的バックオフを撤去し、照会間隔を5分にした**。v0.5.3 配信後「少し時間が経つと『取得が一時的に制限されています』が必ず出る。ただし普通に使えている」という報告を受けた。バックオフがほぼ常時オンになり、その間 `live_error` が RateLimited 固定になる一方、数値は監視トークン経由で毎分更新されていたため、**新鮮な値に対して「最新でない可能性」と表示していた**。詳細と実測は `docs/dev-log.md`

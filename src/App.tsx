@@ -47,6 +47,16 @@ export default function App() {
     return () => window.removeEventListener("keydown", handler);
   }, []);
 
+  // トレイの期限確認ダイアログで「いいえ」を選んだとき、バックエンドがウィンドウを
+  // 前面化した上でこのイベントを送ってくる（macOS のみ）。アカウント画面を開いて
+  // 手動での再ログイン・取り込み操作へ誘導する
+  useEffect(() => {
+    const unlisten = listen("open-accounts", () => setAcctOpen(true));
+    return () => {
+      unlisten.then((un) => un());
+    };
+  }, []);
+
   return (
     <div className="app">
       <header className="topbar">
