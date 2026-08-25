@@ -174,7 +174,7 @@ pub fn analyze_doc(
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| crate::db::home_dir().display().to_string())
     });
-    let prompt = analysis_prompt(&path, &content, has_project.then(|| cwd.as_str()));
+    let prompt = analysis_prompt(&path, &content, has_project.then_some(cwd.as_str()));
 
     let mut cmd = Command::new(claude);
     cmd.current_dir(&cwd)
