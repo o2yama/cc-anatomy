@@ -177,6 +177,15 @@ fn poll_add_account_login(baseline: String) -> Result<accounts::PollResult, Stri
     accounts::poll_add_account_login(&baseline)
 }
 
+/// フロント側のログイン待ちが `poll_add_account_login` を呼ばずに終わるケース
+/// （クライアント側の5分タイムアウト・画面クローズ時のキャンセル）で、
+/// トレイと共有している LOGIN_IN_PROGRESS を明示的に解放する（2026-09-06 レビュー M-1）。
+/// このウィンドウがロックを取得していない状態で呼んでも store(false) の no-op なので安全
+#[tauri::command]
+fn release_login_lock() {
+    accounts::release_login_in_progress();
+}
+
 /// 登録済みアカウントへ「常時監視を設定」（setup-token のみを Terminal で起動する単独フロー）。
 /// 使用量の常時監視は切り替え機能とは完全に独立した任意機能
 #[tauri::command(async)]
@@ -299,6 +308,7 @@ pub fn run() {
             import_live_account,
             start_add_account_login,
             poll_add_account_login,
+            release_login_lock,
             switch_account,
             remove_account,
             rename_account,

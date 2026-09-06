@@ -110,6 +110,12 @@ pub fn open_in_terminal(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// OAuth トークンエンドポイント（`post_json_checked`）だけが Cloudflare の 403 1010 で
+/// 遮断される（2026-09-06 実測）。この値は通過確認済み。使用量ポーリング等の他の経路は
+/// User-Agent 無しで従来どおり動いているため、共有クライアントには設定せず
+/// `post_json_checked` のリクエストヘッダとして個別に付与する（2026-09-06 レビュー L-1）
+const HTTP_USER_AGENT: &str = "claude-cli/2.1.261 (external, cli)";
+
 /// 使用量ポーリングで繰り返し呼ぶため、接続を使い回す共有クライアント。
 /// トークンは Authorization ヘッダで送る（argv に載らないので `ps` から見えない）
 static HTTP: std::sync::LazyLock<reqwest::blocking::Client> = std::sync::LazyLock::new(|| {
@@ -376,6 +382,8 @@ pub(crate) fn post_json_checked(url: &str, body: serde_json::Value) -> Result<(u
         let resp = HTTP
             .post(&url)
             .header("Content-Type", "application/json")
+            // token endpoint だけ Cloudflare 対策の User-Agent が要る（HTTP_USER_AGENT 参照）
+            .header("User-Agent", HTTP_USER_AGENT)
             .body(body.to_string())
             .timeout(std::time::Duration::from_secs(15))
             .send()

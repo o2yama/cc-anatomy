@@ -154,6 +154,8 @@ export interface Account {
   is_live: boolean;
   /** ライブ資格情報のスナップショットが登録済みか。無いと「切り替え」できない */
   has_credentials: boolean;
+  /** スナップショット内の refresh token 有効期限（epoch ミリ秒）。取得不能なら null */
+  refresh_token_expires_at: number | null;
   /** 使用量の常時監視用に claude setup-token の長期トークンが紐づいているか（任意機能）。
    * 切り替え機能とは完全に独立で、これが無くても切り替え・使用量取得は成立する */
   has_monitor_token: boolean;
@@ -202,6 +204,9 @@ export interface AccountUsage {
   stale: boolean;
   /** 5h 枠のリセット時刻を過ぎている想定（実質 0% とみなせる） */
   five_probably_reset: boolean;
+  /** スナップショット内の refresh token 有効期限（epoch ミリ秒）。使用率取得の成否とは
+   * 無関係に読めた値をそのまま返す。取得不能なら null */
+  refresh_token_expires_at: number | null;
 }
 
 /** Flow B: claude auth login の完了検知ポーリング結果。
@@ -333,6 +338,10 @@ export const api = {
     }),
   pollAddAccountLogin: (baseline: string) =>
     invoke<PollResult>("poll_add_account_login", { baseline }),
+  /** クライアント側のタイムアウト・画面クローズ等、pollAddAccountLogin を呼ばずに
+   * ログイン待ちを打ち切るときに、トレイと共有の進行中フラグを明示的に解放する
+   * （2026-09-06 レビュー M-1）。このウィンドウが取得していなくても no-op で安全 */
+  releaseLoginLock: () => invoke<void>("release_login_lock"),
   /** force/trustUnverified の意味は startAddAccountLogin と同じ（独立した引数） */
   switchAccount: (name: string, force = false, trustUnverified = false) =>
     invoke<SwitchOutcome>("switch_account", { name, force, trustUnverified }),
@@ -379,9 +388,14 @@ export interface OtherAccountOverview {
  * 改行区切りで2行になることがある */
 export interface UsageOverview {
   live_name: string | null;
+  /** live_name の内部識別子（startAddAccountLogin に渡すキー）。ライブが未登録なら null */
+  live_internal_name: string | null;
   live: LiveUsage | null;
   live_error: string | null;
   live_note: string | null;
+  /** ライブアカウント自身のスナップショットの refresh token 有効期限（epoch ミリ秒）。
+   * 取得できない/未登録なら null。`refreshExpiryDisplay` と組み合わせて期限警告を出す */
+  live_refresh_token_expires_at: number | null;
   others: OtherAccountOverview[];
 }
 

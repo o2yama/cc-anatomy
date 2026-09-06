@@ -43,6 +43,7 @@ const MISMATCH_RETRY_DELAY_MS = 3000;
 /** 使用量の常時監視（claude setup-token）は完全に任意の後付け機能なので、
  * ログイン待ち（5分）より短いタイムアウトでスキップ扱いにする */
 const MONITOR_TIMEOUT_MS = 90 * 1000;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 /**
  * 「起動中セッションがあります」確認ダイアログの「今後この確認を表示しない」設定。
@@ -95,6 +96,35 @@ function usageText(usage: AccountUsage): string | null {
   return `${five}${seven}`;
 }
 
+export type RefreshExpiryDisplay = {
+  text: string;
+  status: "normal" | "warning" | "expired";
+};
+
+/** refresh token の固定期限を一覧向けに整形する。境界の時刻差で0日表示を飛ばさないよう、
+ * 残日数は切り上げる。期限が壊れた値なら誤案内を避けるため表示しない。
+ * ライブ行は「切り替えると」ではなく「再ログインが必要」と直接案内する（切り替え操作をしていない）。
+ * App.tsx（使用量ポップオーバー）とも共有し、期限判定の規則を1箇所に保つ（2026-09-06） */
+export function refreshExpiryDisplay(
+  expiresAt: number | null,
+  isLive: boolean,
+  now = Date.now(),
+): RefreshExpiryDisplay | null {
+  if (expiresAt == null || !Number.isFinite(expiresAt)) return null;
+  if (expiresAt < now) {
+    return {
+      text: isLive ? "期限切れ（再ログインが必要）" : "期限切れ（切り替えると再ログインが必要）",
+      status: "expired",
+    };
+  }
+
+  const days = Math.ceil((expiresAt - now) / DAY_MS);
+  return {
+    text: `残り ${days} 日`,
+    status: days <= 3 ? "warning" : "normal",
+  };
+}
+
 /** 1行分の名前・email・バッジ・使用率表示。行本体（AccountRow）とドラッグ中のプレビュー
  * （AccountRowPreview）で共有する。編集中はクリック対象の名前が input に差し替わる。
  * 使用率は get_accounts とは別コマンド（get_accounts_usage）で非同期に埋まるため任意（undefined 可） */
@@ -124,6 +154,7 @@ function AccountRowContent({
   onStartMonitor?: () => void;
 }) {
   const usageLine = usage ? usageText(usage) : null;
+  const refreshExpiry = refreshExpiryDisplay(account.refresh_token_expires_at, account.is_live);
   return (
     <div className="acct-info">
       <span className="acct-name-row">
@@ -161,6 +192,9 @@ function AccountRowContent({
         {account.email || "(メール未取得)"}
         {account.plan ? ` ・ ${PLAN_LABEL[account.plan] ?? account.plan}` : ""}
       </span>
+      {refreshExpiry && (
+        <span className={`acct-refresh-expiry ${refreshExpiry.status}`}>{refreshExpiry.text}</span>
+      )}
       {usageLine && <span className="muted acct-usage">{usageLine}</span>}
       {/* 常時監視は切り替え機能とは独立の任意機能。過密にならないよう、未設定のときだけ
           小さなテキストリンクとして出す（設定済みは上のバッジで示すので導線は消える） */}
@@ -247,6 +281,11 @@ function AccountRow({
     transform: CSS.Transform.toString(transform),
     transition,
   };
+  // has_credentials=true でもスナップショットの refresh token が期限切れなら、
+  // スワップしても再ログインが必要になるだけなので「切り替える」を出さず、
+  // has_credentials=false 分岐と同じ再ログイン導線（onRelogin）に合流させる（2026-09-06 H-2）
+  const isExpired =
+    refreshExpiryDisplay(account.refresh_token_expires_at, account.is_live)?.status === "expired";
 
   return (
     <li
@@ -300,14 +339,31 @@ function AccountRow({
         ) : (
           <>
             {account.has_credentials ? (
-              <button
-                className="acct-btn acct-btn-primary"
-                disabled={switchButtonDisabled || account.is_live}
-                title={account.is_live ? "現在ログイン中です" : "このアカウントに切り替える"}
-                onClick={onSwitch}
-              >
-                切り替える
-              </button>
+              isExpired ? (
+                <button
+                  className="acct-btn acct-btn-primary"
+                  disabled={switchButtonDisabled || account.is_live || !account.can_relogin}
+                  title={
+                    account.is_live
+                      ? "資格情報の期限が切れています。ブラウザで再ログインしてください"
+                      : !account.can_relogin
+                        ? "照合に使える情報（組織ID・メールアドレス）が無いため再ログインでは紐づけできません。「＋アカウントを追加」から新規登録してください"
+                        : "資格情報の期限が切れているため、切り替える前にブラウザで再ログインが必要です"
+                  }
+                  onClick={onRelogin}
+                >
+                  再ログイン
+                </button>
+              ) : (
+                <button
+                  className="acct-btn acct-btn-primary"
+                  disabled={switchButtonDisabled || account.is_live}
+                  title={account.is_live ? "現在ログイン中です" : "このアカウントに切り替える"}
+                  onClick={onSwitch}
+                >
+                  切り替える
+                </button>
+              )
             ) : (
               <button
                 className="acct-btn acct-btn-primary"
@@ -418,6 +474,11 @@ export function AccountsOverlay({
   // handleMismatch/settle が二重実行されうる（2026-07-26 レビュー M-A3）。cancelLogin が
   // "idle" に戻すことで、キャンセル済み・画面クローズ後に届く在り来たりの応答も無視される
   const loginPhaseRef = useRef<"idle" | "polling" | "retrying">("idle");
+  // start_add_account_login が成功（Started）した時点で、トレイと共有の LOGIN_IN_PROGRESS を
+  // このウィンドウが握っている。cancelLogin は login 未開始のクローズ等でも呼ばれるため、
+  // このウィンドウが実際に取得済みのときだけ解放する（他ウィンドウ/トレイのロックを
+  // 誤って奪わないため。2026-09-06 レビュー M-1）
+  const loginLockHeldRef = useRef(false);
 
   // 使用量の常時監視（claude setup-token、任意機能）の紐づけ待ち。
   // 「＋アカウントを追加」の統合フロー・ステップ2（monitorFlowName）と、
@@ -491,6 +552,12 @@ export function AccountsOverlay({
     clearMismatchRetry();
     loginPhaseRef.current = "idle";
     setLoginPending(false);
+    // pollAddAccountLogin が Done/Mismatch を返した通常終了ではすでに Rust 側で解放済みだが、
+    // 5分タイムアウト・画面クローズはそれを一切呼ばずに打ち切るため、ここで明示的に解放する
+    if (loginLockHeldRef.current) {
+      loginLockHeldRef.current = false;
+      api.releaseLoginLock().catch(() => {});
+    }
   }, [stopLoginPolling, clearMismatchRetry]);
 
   const stopMonitorFlowPolling = useCallback(() => {
@@ -648,6 +715,7 @@ export function AccountsOverlay({
   const pollForCompletion = (baseline: string, targetName?: string) => {
     setLoginPending(true);
     loginPhaseRef.current = "polling";
+    loginLockHeldRef.current = true;
     const deadline = Date.now() + LOGIN_TIMEOUT_MS;
 
     const startInterval = () => {

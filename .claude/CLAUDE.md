@@ -62,6 +62,20 @@ Claude Code の環境と活動状況を「解剖」して可視化するデス�
 
 ---
 
+### 2026-09-06 の決定
+- OAuth token endpoint は `https://platform.claude.com/v1/oauth/token`。旧 `console.anthropic.com` は 404。
+- HTTP は User-Agent 無しだと Cloudflare の 403（1010）になるため、通過確認済みの Claude CLI 値を共有クライアントへ設定する。
+- refresh token はログインから30日の固定寿命で、refresh 成功だけでは期限は延びない。
+- `refresh_token_expires_in` があれば `now + 秒数`、無ければ既存の `refreshTokenExpiresAt` を保持し、推定期限は書かない。
+- 期限警告は Claude Code 本体と同じ残り3日以下とし、24時間スロットルは維持する。
+- アカウント一覧はスナップショットから期限だけを返し、残日数または期限切れをライブ行にも常時表示する。
+- 自動更新はアクセストークンのみ更新し、期限は延ばせない。ダイアログ文言も「期限までに再ログインが必要」に変更（reviewer 指摘）。既知の残課題: `refreshTokenExpiresAt` を持たないスナップショット（読めずに再構築したものを含む）は候補・残日数表示の対象外
+- **メニューバー・使用量ポップオーバーにも期限表示と1クリック切替の防止を追加**（未リリース・実機未検証）: `AccountUsage`/`UsageOverview` に `refresh_token_expires_at` を通し、非ライブ・ライブとも残り3日以下で「残り N 日」、期限切れで「期限切れ・再ログインが必要」を添える（Accounts.tsx と同じ切り上げ・`now > expires_at` 規則を tray.rs にも純粋関数として複製）。期限切れの非ライブ行は「⇄ 切り替え」の代わりに「🔑 ログイン」、ライブが期限切れなら「🔑 再ログイン」行を出し、いずれも既存の `start_add_account_login`（再ログイン導線）を force 相当で呼ぶ
+- **再ログイン取り込みのマージ先は `target_name` で名前指定して確定する**（2026-09-06 レビュー H-1 で修正）: `find_match_idx`（org_id があれば email へフォールバックしない）だけに頼ると、org_id が空だった旧登録に対する再ログインでマージ先を見つけられず、`share1-2` のような重複行が新規 push されるバグがあった。`import_live_account_locked` に `target_name: Option<&str>` を渡し、`resolve_merge_target_idx` が名前一致を `find_match_idx` より優先してマージ先を確定する（対象が見つからない場合のみ `find_match_idx` にフォールバック）。単体テスト: `resolve_merge_target_idx_relogin_merges_into_target_even_when_org_id_was_empty` ほか（accounts.rs）
+- `start_add_account_login` を `R: tauri::Runtime` ジェネリックにし、tray.rs（`AppHandle<R>` を汎用に扱う）から直接呼べるようにした（accounts_stub.rs も同様に追従）
+- 期限表示のソースはスナップショット（Keychain の `CC Anatomy-cred-<name>`）で、sync-back が止まっている（`meta.inconsistent` 等）とライブの資格情報自体は健全でも期限切れ表示になりうる（表示はスナップショットの鮮度に依存する）
+- `cargo test -- --ignored` に含まれる `oauth_token_endpoint_rejects_invalid_refresh_token` は実在の OAuth トークンエンドポイント（`https://platform.claude.com/v1/oauth/token`）へ偽の refresh_token を送って 400/invalid_grant を確認する疎通テスト。実資格情報は使わないが外部通信を伴う
+
 ### 2026-08-25 の決定
 
 - **スナップショットの refresh token 自動更新機能を実装**（未リリース・実機未検証）: Keychain 実物確認で `claudeAiOauth.refreshTokenExpiresAt` の存在を確認し、refresh token は発行から約30日で失効すると判明。非ライブのスナップショットを30日放置すると切り替え後に再ログインが必要になるため、期限20日前から OS ネイティブダイアログ（「<email>の認証情報の期限が切れます。自動で更新しますか？」はい/いいえ）で確認し、「はい」でアプリ自身が `https://console.anthropic.com/v1/oauth/token` に POST してスナップショットを更新する。「いいえ」はメインウィンドウ前面化+アカウントモーダル表示（`open-accounts` イベント）。60秒ループから1サイクル1件・アカウント単位24時間スロットル（accounts.json の `refresh_prompted_at` + プロセス内第二スロットル）。macOS 限定

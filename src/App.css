@@ -1548,6 +1548,22 @@ main {
   white-space: nowrap;
 }
 
+.acct-refresh-expiry {
+  font-size: 11px;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.acct-refresh-expiry.warning {
+  color: #e8a23a;
+}
+
+.acct-refresh-expiry.expired {
+  color: var(--danger, #d2544b);
+}
+
 /* 切り替え前にどのアカウントが空いているか一目で分かるよう、email 行の下に小さく出す */
 .acct-usage {
   font-size: 11px;
@@ -1798,4 +1814,3 @@ main {
   border-radius: 5px;
   padding: 1px 5px;
 }
-

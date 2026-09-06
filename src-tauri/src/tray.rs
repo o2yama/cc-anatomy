@@ -46,6 +46,10 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// name は validate_name により英数字・ハイフン・アンダースコアのみと保証されるため、
 /// このプレフィックスを剥がすだけで元の name を復元できる
 const SWITCH_ID_PREFIX: &str = "switch-";
+/// クリックでログインを開始するメニュー項目 id のプレフィックス（id は "login-<name>"）。
+/// 期限切れアカウント（ライブ・その他とも）の「⇄ 切り替え」の代わりに出す
+/// （2026-09-06。id 規約は SWITCH_ID_PREFIX と同じ）
+const LOGIN_ID_PREFIX: &str = "login-";
 
 /// メニューに流し込む表示専用データ。ネットワーク取得はワーカースレッドで行い、
 /// メニュー操作（NSMenu）はメインスレッド限定なので文字列だけを渡す
@@ -58,6 +62,17 @@ struct StatusData {
     usage_lines: Vec<InfoLine>,
     /// ライブ以外の登録アカウント。クリックでそのアカウントへ切り替える
     other_accounts: Vec<OtherAccountEntry>,
+    /// ライブアカウントの refresh token が期限切れのとき、`login-<name>` の
+    /// 「🔑 再ログイン」行を出す。true のときだけ `live_internal_name` も Some
+    /// （2026-09-06）
+    live_needs_relogin: bool,
+    /// 「🔑 再ログイン」行のクリック対象。switch_account/start_add_account_login に渡す
+    /// 内部識別子（表示名ではない）
+    live_internal_name: Option<String>,
+    /// ブラウザログインが（トレイ・ポップオーバーのどちらからでも）進行中かどうか
+    /// （accounts::LOGIN_IN_PROGRESS）。true の間は「🔑 ログイン」系の行を
+    /// disabled にし、テキストに「（ログイン中…）」を添える（2026-09-06 レビュー M-1）
+    login_in_progress: bool,
 }
 
 /// メニューの情報行1つ分。ゲージ行はバー画像をアイコンにした `IconMenuItem` 1行で描画し
@@ -102,6 +117,9 @@ pub struct UsageOverview {
     /// ログイン中アカウントの表示名（取得できなければ None。フロントは
     /// 「ログイン中アカウント」にフォールバックする＝トレイの `live_header` と同じ規則）
     pub live_name: Option<String>,
+    /// live_name の内部識別子（表示名ではなく startAddAccountLogin に渡すキー）。
+    /// ライブが未登録なら None（2026-09-06、「🔑 再ログイン」ボタン用に追加）
+    pub live_internal_name: Option<String>,
     pub live: Option<LiveUsage>,
     /// 取得失敗時（live が None）の案内。原因（token 期限切れ／通信不能／その他）に応じて
     /// 文言が変わる2行を改行区切りの1文字列にまとめて渡す（2026-08-08 issue #4:
@@ -111,6 +129,10 @@ pub struct UsageOverview {
     /// ときの注記1行（例: token 期限切れでバッチキャッシュにフォールバックした）。
     /// live_error とは排他（片方が Some ならもう片方は必ず None）
     pub live_note: Option<String>,
+    /// ライブアカウント自身のスナップショットの refresh token 有効期限（epoch ミリ秒）。
+    /// フロントが `refreshExpiryDisplay` と同じ規則で残日数・期限切れを判定する
+    /// （2026-09-06。取得できない/未登録なら None）
+    pub live_refresh_token_expires_at: Option<i64>,
     pub others: Vec<OtherAccountEntry>,
 }
 
@@ -396,11 +418,69 @@ fn reset_local(secs: i64) -> Option<String> {
     }
 }
 
+/// epoch ミリ秒をローカル時刻の "M/D" に変換する（refresh token 期限のダイアログ表示用。
+/// 変換に失敗した場合は元の epoch ミリ秒をそのまま文字列化して表示欠落を避ける）。
+/// 唯一の呼び出し元 prompt_snapshot_refresh と同じ macOS 限定にする
+/// （2026-09-06 レビュー L-5。無いと非 macOS ビルドで未使用関数の警告になる）
+#[cfg(target_os = "macos")]
+fn local_date_md(epoch_ms: i64) -> String {
+    use chrono::{Datelike, Local, TimeZone};
+    match Local.timestamp_millis_opt(epoch_ms).single() {
+        Some(dt) => format!("{}/{}", dt.month(), dt.day()),
+        None => epoch_ms.to_string(),
+    }
+}
+
 fn reset_suffix(epoch: Option<i64>) -> String {
     epoch
         .and_then(reset_local)
         .map(|t| format!("（{t} 復活）"))
         .unwrap_or_default()
+}
+
+/// refresh token の固定期限（30日でログイン時点から失効）に対する表示状態。
+/// メニューバー（ライブ・その他アカウント両方）と使用量ポップオーバーで共通に使う
+/// （2026-09-06）。Accounts.tsx の `refreshExpiryDisplay` と同じ規則
+/// （切り上げ日数・`now > expires_at` で期限切れ）にしてある。ここでは
+/// 「行が長くなるので通常時（残り4日以上）は何も出さない」という一覧表示専用の閾値
+/// （残り3日以下だけ警告）まで含めて判定する
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshExpiryStatus {
+    /// 残り4日以上、または期限が読めない（None）。メニューには何も足さない
+    Ok,
+    /// 残り3日以下（切り上げ）
+    Warning { days: i64 },
+    /// 期限切れ。切り替え/ログイン行の出し分けにも使う
+    Expired,
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+/// この日数以下になったら「残りN日」を出す（それより先はメニューが常時長くなるので出さない）
+const REFRESH_WARNING_DAYS: i64 = 3;
+
+fn refresh_expiry_status(expires_at_ms: Option<i64>, now_ms: i64) -> RefreshExpiryStatus {
+    let Some(expires_at_ms) = expires_at_ms else {
+        return RefreshExpiryStatus::Ok;
+    };
+    if now_ms > expires_at_ms {
+        return RefreshExpiryStatus::Expired;
+    }
+    let days = ((expires_at_ms - now_ms) as f64 / DAY_MS as f64).ceil() as i64;
+    if days <= REFRESH_WARNING_DAYS {
+        RefreshExpiryStatus::Warning { days }
+    } else {
+        RefreshExpiryStatus::Ok
+    }
+}
+
+/// アカウント行に添えるサフィックス文字列（無ければ None）
+fn refresh_expiry_suffix(status: RefreshExpiryStatus) -> Option<String> {
+    match status {
+        RefreshExpiryStatus::Ok => None,
+        // Accounts.tsx::refreshExpiryDisplay と表記を揃える（半角スペースあり。2026-09-06 L-6）
+        RefreshExpiryStatus::Warning { days } => Some(format!("（残り {days} 日）")),
+        RefreshExpiryStatus::Expired => Some("（期限切れ・再ログインが必要）".to_string()),
+    }
 }
 
 /// 現在時刻の epoch 秒。usage_advisory が「表示中の値がどれだけ古いか」を判定するのに使う
@@ -447,6 +527,9 @@ fn should_use_live_fallback(live_internal_name: Option<&str>, usage: &[crate::ac
 /// 表示専用の整形（メニュー文字列・ゲージ描画）は呼び出し側でそれぞれ行う
 struct RawStatus {
     live_name: Option<String>,
+    /// live_name の内部識別子（表示名ではなく switch_account/start_add_account_login に
+    /// 渡すキー）。ライブが未登録なら None（2026-09-06、「🔑 再ログイン」行用に追加）
+    live_internal_name: Option<String>,
     other_accounts: Vec<OtherAccountEntry>,
     usage_result: Result<crate::actions::UsageSummary, String>,
     /// 「ライブ OAuth 直叩き」だけの失敗理由（2026-08-08 issue #4）。usage_result が Err の
@@ -455,6 +538,10 @@ struct RawStatus {
     /// ゲージ下の注記1行（Note）の根拠になる（2026-08-08 再レビュー: 以前は Err 時のみ
     /// 意味を持つとしていたが、Ok 側でも usage_advisory が参照するようになった）
     live_error: Option<crate::actions::LiveUsageError>,
+    /// ライブアカウント自身のスナップショットの refresh token 有効期限（epoch ミリ秒）。
+    /// バッチにライブが存在しない（未登録・has_credentials=false 等）場合は None
+    /// （2026-09-06: メニューバー・使用量ポップオーバーの期限切れ警告に使う）
+    live_refresh_token_expires_at: Option<i64>,
 }
 
 /// live_error の値から「claude CLI を裏起動して自動復帰させるべきか」を判定する純粋関数
@@ -544,6 +631,12 @@ fn fetch_raw_status(force: bool) -> RawStatus {
         live_error: None,
     });
     let usage = batch.accounts;
+    // ライブ自身のスナップショットの refresh token 期限（other_accounts は !is_live で
+    // フィルタするため、ここで別途 usage から拾っておく）
+    let live_refresh_token_expires_at = live_internal_name
+        .as_deref()
+        .and_then(|name| usage.iter().find(|u| u.name == name))
+        .and_then(|u| u.refresh_token_expires_at);
 
     let other_accounts: Vec<_> = registered
         .into_iter()
@@ -636,7 +729,14 @@ fn fetch_raw_status(force: bool) -> RawStatus {
         crate::actions::spawn_token_refresh_nudge();
     }
 
-    RawStatus { live_name, other_accounts, usage_result, live_error }
+    RawStatus {
+        live_name,
+        live_internal_name,
+        other_accounts,
+        usage_result,
+        live_error,
+        live_refresh_token_expires_at,
+    }
 }
 
 /// 直近に stderr へ出した LiveUsageError::Other のメッセージ。連続する同一メッセージの
@@ -738,8 +838,10 @@ fn fetch_status(force: bool) -> StatusData {
     let live_name = raw.live_name;
     let live_error = raw.live_error;
     let now = now_epoch();
+    // ライブの refresh token 期限は使用率取得の成否と無関係に判定する（2026-09-06）
+    let live_refresh_status = refresh_expiry_status(raw.live_refresh_token_expires_at, now * 1000);
     let mut usage_lines = Vec::new();
-    let (live_header, title) = match raw.usage_result {
+    let (live_header_base, title) = match raw.usage_result {
         Ok(u) => {
             let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
@@ -771,12 +873,19 @@ fn fetch_status(force: bool) -> StatusData {
             ("ログイン中アカウント".to_string(), "-".to_string())
         }
     };
+    let live_header = match refresh_expiry_suffix(live_refresh_status) {
+        Some(suffix) => format!("{live_header_base}{suffix}"),
+        None => live_header_base,
+    };
 
     StatusData {
         title,
         live_header,
         usage_lines,
         other_accounts: raw.other_accounts,
+        live_needs_relogin: matches!(live_refresh_status, RefreshExpiryStatus::Expired),
+        live_internal_name: raw.live_internal_name,
+        login_in_progress: crate::accounts::login_in_progress(),
     }
 }
 
@@ -816,9 +925,11 @@ pub fn usage_overview(force: bool) -> UsageOverview {
     };
     UsageOverview {
         live_name: raw.live_name,
+        live_internal_name: raw.live_internal_name,
         live,
         live_error,
         live_note,
+        live_refresh_token_expires_at: raw.live_refresh_token_expires_at,
         others: raw.other_accounts,
     }
 }
@@ -867,15 +978,39 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
     for (i, line) in data.usage_lines.iter().enumerate() {
         append_info_line(app, &menu, format!("info-usage-{i}"), line, true, &palette)?;
     }
+    // ライブ自身の refresh token が期限切れなら、使用率の下に再ログイン行を出す
+    // （切り替え相当の操作が無いライブは、期限情報を live_header の末尾に添えるだけでは
+    // 操作導線にならないため。2026-09-06）。id は他アカウントの「🔑 ログイン」行と
+    // 同じ LOGIN_ID_PREFIX を使い、クリックハンドラを1本化する
+    if data.live_needs_relogin {
+        if let Some(name) = &data.live_internal_name {
+            // ログインが（トレイ・ポップオーバーのどちらからでも）進行中の間は disabled にし、
+            // 二重起動できないことを見た目でも伝える（2026-09-06 レビュー M-1）
+            menu.append(&MenuItem::with_id(
+                app,
+                format!("{LOGIN_ID_PREFIX}{name}"),
+                if data.login_in_progress { "🔑 再ログイン（ログイン中…）" } else { "🔑 再ログイン" },
+                !data.login_in_progress,
+                None::<&str>,
+            )?)?;
+        }
+    }
 
     // その他のアカウントは「名前 → コンパクト1行の使用率 → 切り替え」の3行構成。
     // ライブだけにバーを出して主従を分け、サブは縦の長さを抑える（2026-07-31 デザイン確定）
+    let now_ms = now_epoch() * 1000;
     for a in data.other_accounts.iter() {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
+        let refresh_status =
+            refresh_expiry_status(a.usage.as_ref().and_then(|u| u.refresh_token_expires_at), now_ms);
+        let name_label = match refresh_expiry_suffix(refresh_status) {
+            Some(suffix) => format!("{}{suffix}", a.display_name),
+            None => a.display_name.clone(),
+        };
         menu.append(&MenuItem::with_id(
             app,
             format!("info-other-name-{}", a.name),
-            &a.display_name,
+            &name_label,
             true,
             None::<&str>,
         )?)?;
@@ -901,13 +1036,29 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, data: &StatusData) -> tauri::Resul
                     None::<&str>,
                 )?)?;
             }
-            menu.append(&MenuItem::with_id(
-                app,
-                format!("{SWITCH_ID_PREFIX}{}", a.name),
-                "⇄ このアカウントへ切り替え",
-                true,
-                None::<&str>,
-            )?)?;
+            // 期限切れのスナップショットへ切り替えると Claude Code が再ログインを要求するだけの
+            // 空振りになるため、「⇄ 切り替え」の代わりに「🔑 ログイン」を出す（2026-09-06）
+            if matches!(refresh_status, RefreshExpiryStatus::Expired) {
+                menu.append(&MenuItem::with_id(
+                    app,
+                    format!("{LOGIN_ID_PREFIX}{}", a.name),
+                    if data.login_in_progress {
+                        "🔑 このアカウントでログイン（ログイン中…）"
+                    } else {
+                        "🔑 このアカウントでログイン"
+                    },
+                    !data.login_in_progress,
+                    None::<&str>,
+                )?)?;
+            } else {
+                menu.append(&MenuItem::with_id(
+                    app,
+                    format!("{SWITCH_ID_PREFIX}{}", a.name),
+                    "⇄ このアカウントへ切り替え",
+                    true,
+                    None::<&str>,
+                )?)?;
+            }
         } else {
             // 資格情報スナップショットが無いアカウントは切り替え不可。
             // 使用率も取得しようがないので案内1行だけ出す
@@ -1042,10 +1193,11 @@ fn prompt_snapshot_refresh<R: Runtime>(app: &AppHandle<R>) {
     // 「はい」「いいえ」どちらでも24時間は再確認しない。応答前に記録することで、
     // ダイアログ放置中のプロセス再起動でも連打にならない
     crate::accounts::mark_refresh_prompted(&c.name);
+    let expiry = local_date_md(c.expires_at_ms);
     let yes = app
         .dialog()
         .message(format!(
-            "{}の認証情報の期限が切れます。\n自動で更新しますか？",
+            "{}の認証情報が {expiry} に期限切れになります。\nそれまでに再ログインが必要です。\nアクセストークンだけ今更新しますか？（期限は延びません）",
             c.email
         ))
         .title("CC Anatomy")
@@ -1053,7 +1205,14 @@ fn prompt_snapshot_refresh<R: Runtime>(app: &AppHandle<R>) {
         .blocking_show();
     if yes {
         match crate::accounts::refresh_snapshot_credentials(&c.name) {
-            Ok(()) => info_dialog(app, "CC Anatomy", &format!("{}の認証情報を更新しました。", c.email)),
+            Ok(()) => info_dialog(
+                app,
+                "CC Anatomy",
+                &format!(
+                    "{}のアクセストークンを更新しました。\n認証情報の期限（{expiry}）は変わりません。それまでに再ログインしてください。",
+                    c.email
+                ),
+            ),
             Err(e) => info_dialog(
                 app,
                 "CC Anatomy",
@@ -1131,12 +1290,184 @@ fn switch_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
     });
 }
 
+/// トレイの「🔑 このアカウントでログイン」「🔑 再ログイン」行。refresh token が期限切れの
+/// スナップショットは切り替えても Claude Code に再ログインを求められるだけの空振りになるため、
+/// `start_add_account_login` を呼び、完了をポーリングする（2026-09-06）。
+///
+/// switch_from_tray と違い、この導線はダイアログを出せないわけではない（実際に
+/// `blocking_show` で確認ダイアログを出している）。`force`/`trust_unverified` を最初から
+/// true にしないのはそのため: 外部セッションがある・持ち主が未確認、のどちらも
+/// switch_from_tray とは違って**ここでは確認を挟んでから**続行するかを尋ねる
+/// （2026-09-06 レビュー M-3。旧実装は両方を確認なしで force していた）。
+/// 持ち主未確認かどうかの判定は、返ってきた `String` の中身を見る（文字列一致）のではなく
+/// `check_live_owner` で同じ判定をもう一度型（`OwnerError`）で行って確定させる
+fn login_from_tray<R: Runtime>(app: AppHandle<R>, name: String) {
+    std::thread::spawn(move || attempt_login_from_tray(app, name, false, false));
+}
+
+/// login_from_tray の実処理。`force`/`trust_unverified` は初回呼び出し（両方 false）から
+/// 確認ダイアログで同意が得られるたびに true へ倒して自分自身を呼び直す再帰
+fn attempt_login_from_tray<R: Runtime>(app: AppHandle<R>, name: String, force: bool, trust_unverified: bool) {
+    use tauri_plugin_dialog::MessageDialogButtons;
+
+    match crate::accounts::start_add_account_login(&app, force, trust_unverified, Some(&name)) {
+        Ok(crate::accounts::StartLoginOutcome::Started { baseline, warning }) => {
+            if let Some(w) = warning {
+                info_dialog(&app, "CC Anatomy", &w);
+            }
+            // ログインボタンを disabled にする（🔑 ログイン中…）ため、進行中フラグの
+            // 変化を即座にメニューへ反映する（2026-09-06 レビュー M-1）
+            refresh(app.clone(), false);
+            poll_login_from_tray(app, baseline);
+        }
+        Ok(crate::accounts::StartLoginOutcome::NeedsImport { .. }) => {
+            info_dialog(
+                &app,
+                "CC Anatomy",
+                "現在ログイン中のアカウントが未登録のため、トレイからは開始できません。\
+                 アプリのアカウント画面から操作してください。",
+            );
+        }
+        Ok(crate::accounts::StartLoginOutcome::SessionsRunning { count }) => {
+            let yes = app
+                .dialog()
+                .message(format!(
+                    "起動中の Claude Code セッションが{count}件あります。\n\
+                     続行すると、それらのセッションのログイン情報が正しく保存されない可能性があります。\n続行しますか？"
+                ))
+                .title("CC Anatomy")
+                .buttons(MessageDialogButtons::OkCancelCustom("続行する".to_string(), "やめる".to_string()))
+                .blocking_show();
+            if yes {
+                attempt_login_from_tray(app, name, true, trust_unverified);
+            }
+        }
+        Err(e) => {
+            // 持ち主未確認（TokenExpired/NetworkError）による失敗かを、文字列一致ではなく
+            // check_live_owner で同じ判定を型（OwnerError）でもう一度行って確定させる
+            // （2026-09-06 レビュー M-3）。まだ trust_unverified で同意していない場合だけ確認する
+            if !trust_unverified {
+                if let Err(owner_err) = crate::accounts::check_live_owner(false) {
+                    if crate::accounts::should_skip_unverified_sync_back(&owner_err, true) {
+                        let yes = app
+                            .dialog()
+                            .message(format!(
+                                "現在ログイン中のアカウントを確認できませんでした。\n{}\n\
+                                 そのまま続行しますか？（続行すると現在のログイン情報が正しく保存されない可能性があります）",
+                                crate::accounts::owner_error_message(&owner_err)
+                            ))
+                            .title("CC Anatomy")
+                            .buttons(MessageDialogButtons::OkCancelCustom("続行する".to_string(), "やめる".to_string()))
+                            .blocking_show();
+                        if yes {
+                            attempt_login_from_tray(app, name, force, true);
+                        }
+                        return;
+                    }
+                }
+            }
+            let message = crate::accounts::strip_owner_error_tag(&e);
+            info_dialog(
+                &app,
+                "CC Anatomy",
+                &format!("ログインを開始できませんでした: {message}\nアプリのアカウント画面から操作してください。"),
+            );
+        }
+    }
+}
+
+/// `claude auth login` 完了検知ポーリング（Accounts.tsx::pollForCompletion のトレイ版・簡略化）。
+/// Keychain（完了検知）と `~/.claude.json`（照合）は別々に書き込まれるため、最初の mismatch は
+/// 即確定させず3秒後に1回だけ再確認する（同ファイルの M-6b と同じ緩和）。5分でタイムアウトする。
+///
+/// `poll_add_account_login`（accounts.rs）は Waiting 以外を返した時点で自ら LOGIN_IN_PROGRESS を
+/// 解放するため、Done/Mismatch/Err の各終端では実質すでに解放済みだが、ここでも明示的に呼ぶ
+/// （2026-09-06 レビュー M-1。二重に呼んでも store(false) の no-op）。5分タイムアウトだけは
+/// `poll_add_account_login` を呼ばずに打ち切るため、ここでの明示呼び出しが唯一の解放経路になる。
+/// `on_login_done` はすでに内部で `refresh` を呼ぶため、それ以外の終端（タイムアウト・
+/// mismatch 確定・エラー）でだけ `refresh` を呼び足し、disabled 状態をすぐに解く
+fn poll_login_from_tray<R: Runtime>(app: AppHandle<R>, baseline: String) {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(5 * 60);
+    loop {
+        std::thread::sleep(Duration::from_secs(2));
+        match crate::accounts::poll_add_account_login(&baseline) {
+            Ok(crate::accounts::PollResult::Waiting) => {
+                if Instant::now() > deadline {
+                    crate::accounts::release_login_in_progress();
+                    refresh(app.clone(), false);
+                    info_dialog(&app, "CC Anatomy", "ログインが5分以内に完了しなかったため中止しました。");
+                    return;
+                }
+                continue;
+            }
+            Ok(crate::accounts::PollResult::Mismatch { .. }) => {
+                std::thread::sleep(Duration::from_secs(3));
+                match crate::accounts::poll_add_account_login(&baseline) {
+                    Ok(crate::accounts::PollResult::Done { account }) => {
+                        crate::accounts::release_login_in_progress();
+                        on_login_done(&app, &account);
+                        return;
+                    }
+                    Ok(crate::accounts::PollResult::Mismatch { expected_label, expected_email }) => {
+                        crate::accounts::release_login_in_progress();
+                        refresh(app.clone(), false);
+                        info_dialog(
+                            &app,
+                            "CC Anatomy",
+                            &format!(
+                                "ログインしたアカウントが「{expected_label}」（{expected_email}）と\
+                                 一致しなかったため取り込みませんでした。\nアプリのアカウント画面から操作してください。"
+                            ),
+                        );
+                        return;
+                    }
+                    Ok(crate::accounts::PollResult::Waiting) => continue,
+                    Err(e) => {
+                        crate::accounts::release_login_in_progress();
+                        refresh(app.clone(), false);
+                        info_dialog(&app, "CC Anatomy", &format!("ログイン状況の確認に失敗しました: {e}"));
+                        return;
+                    }
+                }
+            }
+            Ok(crate::accounts::PollResult::Done { account }) => {
+                crate::accounts::release_login_in_progress();
+                on_login_done(&app, &account);
+                return;
+            }
+            Err(e) => {
+                crate::accounts::release_login_in_progress();
+                refresh(app.clone(), false);
+                info_dialog(&app, "CC Anatomy", &format!("ログイン状況の確認に失敗しました: {e}"));
+                return;
+            }
+        }
+    }
+}
+
+fn on_login_done<R: Runtime>(app: &AppHandle<R>, account: &crate::accounts::Account) {
+    // resolve_display_name（accounts.rs）は表示名 → name（内部識別子）の2段フォールバックのみ
+    // （email は見ない）。ここは通知文言にメールアドレスも使いたいので、resolve_display_name
+    // と同じではなく表示名 → email → name の3段にしてある（2026-09-06 レビュー L-4）
+    let label = account
+        .display_name
+        .clone()
+        .filter(|d| !d.is_empty())
+        .unwrap_or_else(|| if account.email.is_empty() { account.name.clone() } else { account.email.clone() });
+    info_dialog(app, "CC Anatomy", &format!("「{label}」でログインしました。"));
+    refresh(app.clone(), true);
+}
+
 pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let placeholder = StatusData {
         title: "…".into(),
         live_header: "取得中…".into(),
         usage_lines: Vec::new(),
         other_accounts: Vec::new(),
+        live_needs_relogin: false,
+        live_internal_name: None,
+        login_in_progress: false,
     };
     let menu = build_menu(app, &placeholder)?;
 
@@ -1153,6 +1484,10 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             let id = event.id.as_ref();
             if let Some(name) = id.strip_prefix(SWITCH_ID_PREFIX) {
                 switch_from_tray(app.clone(), name.to_string());
+                return;
+            }
+            if let Some(name) = id.strip_prefix(LOGIN_ID_PREFIX) {
+                login_from_tray(app.clone(), name.to_string());
                 return;
             }
             match id {
@@ -1450,6 +1785,7 @@ mod tests {
             fetched_at: Some(500),
             stale: true,
             five_probably_reset: false,
+            refresh_token_expires_at: None,
         }
     }
 
@@ -1538,5 +1874,56 @@ mod tests {
         let (buf, width, height) = coretext_line::render_colored_text_pixels(&segments);
         assert!(width > 0 && height > 0);
         assert_eq!(buf.len(), (width * height * 4) as usize);
+    }
+
+    // refresh token 期限表示（2026-09-06）。Accounts.tsx::refreshExpiryDisplay と同じ規則
+    // （切り上げ日数・`now > expires_at` で期限切れ）を Rust 側でも守っていることを固定する
+
+    #[test]
+    fn refresh_expiry_status_none_is_ok() {
+        assert_eq!(refresh_expiry_status(None, 0), RefreshExpiryStatus::Ok);
+    }
+
+    #[test]
+    fn refresh_expiry_status_far_future_is_ok() {
+        // 残り4日（境界の1日先）はまだ警告しない
+        let now = 100 * DAY_MS;
+        assert_eq!(refresh_expiry_status(Some(now + 4 * DAY_MS), now), RefreshExpiryStatus::Ok);
+    }
+
+    #[test]
+    fn refresh_expiry_status_warns_within_three_days_rounding_up() {
+        let now = 100 * DAY_MS;
+        // 残り2日と1ミリ秒 → 切り上げで3日として警告する
+        assert_eq!(
+            refresh_expiry_status(Some(now + 2 * DAY_MS + 1), now),
+            RefreshExpiryStatus::Warning { days: 3 }
+        );
+        // ちょうど3日
+        assert_eq!(
+            refresh_expiry_status(Some(now + 3 * DAY_MS), now),
+            RefreshExpiryStatus::Warning { days: 3 }
+        );
+    }
+
+    #[test]
+    fn refresh_expiry_status_expired_when_now_exceeds_expiry() {
+        let now = 100 * DAY_MS;
+        assert_eq!(refresh_expiry_status(Some(now - 1), now), RefreshExpiryStatus::Expired);
+        // ちょうど一致（now == expires_at）はまだ期限切れではない（Accounts.tsx と同じ `<` 判定）
+        assert_ne!(refresh_expiry_status(Some(now), now), RefreshExpiryStatus::Expired);
+    }
+
+    #[test]
+    fn refresh_expiry_suffix_matches_status() {
+        assert_eq!(refresh_expiry_suffix(RefreshExpiryStatus::Ok), None);
+        assert_eq!(
+            refresh_expiry_suffix(RefreshExpiryStatus::Warning { days: 2 }),
+            Some("（残り 2 日）".to_string())
+        );
+        assert_eq!(
+            refresh_expiry_suffix(RefreshExpiryStatus::Expired),
+            Some("（期限切れ・再ログインが必要）".to_string())
+        );
     }
 }

@@ -129,13 +129,18 @@ v0.5.3 では正常時 1.0〜1.2/分、429 が続く間は 1.0/分（スロッ�
 | トークン | 保管先 | 有効期限 | 誰が更新するか |
 |---|---|---|---|
 | ライブ access token | Keychain `Claude Code-credentials` | **約8時間** | **Claude Code 本体のみ** |
-| ライブ refresh token | 同上（同じ JSON 内） | **ログインから約2週間の絶対期限** | **Claude Code 本体のみ**。one-time use |
-| スナップショット access token | Keychain `CC Anatomy-cred-<name>` | 取得時点から**約8時間** | **誰も更新しない** |
+| ライブ refresh token | 同上（同じ JSON 内） | **ログインから30日の絶対期限** | **Claude Code 本体のみ**。one-time use |
+| スナップショット access token | Keychain `CC Anatomy-cred-<name>` | 取得時点から**約8時間** | sync-back または同意後のアプリ内 refresh |
+| スナップショット refresh token | 同上（同じ JSON 内） | **ログインから30日の絶対期限** | 同意後のみアプリが refresh。期限自体は延びない |
 | 監視用長期トークン | Keychain `CC Anatomy-token-<name>` | 記録上は1年 | 更新の概念なし。失効したら再発行 |
 
-**［確認］アプリが refresh token を使って refresh する箇所は無い。**
+**［確認］アプリは期限が残り3日以下の非ライブスナップショットだけ、ユーザー同意後に refresh token を使う。** ライブ資格情報は Claude Code 本体との競合を避けるため対象外。
 
-**［確認］refresh しても refresh token の期限は延びない。** 同一アカウントで access token が 14:38 → 22:33 に更新された前後で、`refreshTokenExpiresAt` は 08/31 17:01 のまま動かなかった。つまりログイン時点から約2週間の絶対的な締め切りがあり、**それを過ぎたら再ログインが必須**。
+**［確認］refresh しても refresh token の期限は延びない。** これは応答に `refresh_token_expires_in` が無いことが前提で、`now + 秒数`、無ければ既存の `refreshTokenExpiresAt` を保持する。期限はログイン時点から30日の絶対的な締め切りで、**それを過ぎたら再ログインが必須**。
+
+根拠（2026-09-06 実測）: share2 は 09-03 12:49Z に Claude Code 本体が refresh した後も `refreshTokenExpiresAt` が 09-04 00:38Z のままで、その時刻に実際に失効した（token endpoint が `invalid_grant: Refresh token expired`）。ライブ share3 も 09-05 22:31Z の refresh 後に期限 09-23 が動いていない。以前の記述「約2週間」は観測期間が短かったための誤り。
+
+根拠（旧実測）: 同一アカウントで access token が 14:38 → 22:33 に更新された前後で、`refreshTokenExpiresAt` は 08/31 17:01 のまま動かなかった。
 
 ### 認証切れが起きうる箇所
 
@@ -148,7 +153,7 @@ v0.5.3 では正常時 1.0〜1.2/分、429 が続く間は 1.0/分（スロッ�
 防止策が切り替え直前の sync-back。ただし持ち主を確認できない（token 期限切れ・通信不能・**429**）と飛ばされる。**429 は `NetworkError` に分類され「持ち主未確認だが続行可」側に倒れる**ので、続行を選ぶとこのリスクを踏みうる（そうしないと切り替え自体が不能になるため意図的）。
 
 **C. refresh token の絶対期限切れ**
-約2週間切り替えていないアカウントは、access token だけでなく refresh token も切れる。この状態では切り替えても復活せず、`claude auth login` からやり直しになる。
+ログインから30日経ったアカウントは、access token だけでなく refresh token も切れる。この状態では切り替えても復活せず、`claude auth login` からやり直しになる。
 
 ---
 

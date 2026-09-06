@@ -16,6 +16,7 @@ pub struct Account {
     pub plan: String,
     pub is_live: bool,
     pub has_credentials: bool,
+    pub refresh_token_expires_at: Option<i64>,
     pub has_monitor_token: bool,
     pub can_relogin: bool,
 }
@@ -46,6 +47,7 @@ pub struct AccountUsage {
     pub fetched_at: Option<i64>,
     pub stale: bool,
     pub five_probably_reset: bool,
+    pub refresh_token_expires_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -132,8 +134,10 @@ pub fn import_live_account() -> Result<Account, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
-pub fn start_add_account_login(
-    _app: &tauri::AppHandle,
+/// accounts.rs 側と同じく `R: tauri::Runtime` にして、tray.rs から同一の呼び出しで
+/// 両プラットフォームをカバーできるようにする（2026-09-06）
+pub fn start_add_account_login<R: tauri::Runtime>(
+    _app: &tauri::AppHandle<R>,
     _force: bool,
     _trust_unverified: bool,
     _target_name: Option<&str>,
@@ -159,6 +163,16 @@ pub fn poll_add_account_login(_baseline: &str) -> Result<PollResult, String> {
     Err(crate::actions::MAC_ONLY.into())
 }
 
+/// ログイン機能自体が macOS 限定なので、フロントが呼んでも解放するフラグが無い。
+/// 呼び出し自体はコマンド契約を保つため no-op で受ける（2026-09-06）
+pub fn release_login_in_progress() {}
+
+/// 非 macOS ではログインが始まりようが無いので常に false（tray.rs のメニュー描画が
+/// 両プラットフォーム共通コードのため必要。2026-09-06 レビュー M-1）
+pub fn login_in_progress() -> bool {
+    false
+}
+
 pub fn switch_account(
     _name: &str,
     _force: bool,
@@ -171,6 +185,27 @@ pub fn switch_account(
 /// 発生しないため、受け取った文字列をそのまま返す
 pub fn strip_owner_error_tag(message: &str) -> &str {
     message
+}
+
+/// accounts.rs の同名型のスタブ。非 macOS では実際に構築されることが無いため空 enum にして
+/// 型だけ合わせる（tray.rs の login_from_tray が両プラットフォーム共通コードのため必要。
+/// 2026-09-06 レビュー M-3）
+pub enum OwnerError {}
+
+/// 非 macOS ではログイン機能自体が成立しない（start_add_account_login が常に
+/// MAC_ONLY を返す）ため、持ち主未確認の判定をする機会も無い。常に Ok として、
+/// tray.rs 側の「続行確認ダイアログ」を出させない
+pub fn check_live_owner(_trust_unverified: bool) -> Result<(), OwnerError> {
+    Ok(())
+}
+
+/// OwnerError が非 macOS では構築されないため呼ばれることは無いが、型だけ合わせる
+pub fn should_skip_unverified_sync_back(_err: &OwnerError, _trust_unverified: bool) -> bool {
+    false
+}
+
+pub fn owner_error_message(_err: &OwnerError) -> String {
+    String::new()
 }
 
 pub fn remove_account(_name: &str) -> Result<(), String> {

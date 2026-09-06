@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import {
+  accountLabel,
   api,
   AccountUsage,
   AccountsUpdatedEvent,
@@ -24,7 +25,12 @@ import {
 } from "./ProjectTree";
 import { ProjectOverview } from "./ProjectOverview";
 import { DiagnosisOverlay } from "./Diagnosis";
-import { AccountsOverlay, SKIP_SESSIONS_CONFIRM_KEY, skipSessionsConfirmEnabled } from "./Accounts";
+import {
+  AccountsOverlay,
+  refreshExpiryDisplay,
+  SKIP_SESSIONS_CONFIRM_KEY,
+  skipSessionsConfirmEnabled,
+} from "./Accounts";
 import { useIsMac } from "./platform";
 import "./App.css";
 
@@ -199,30 +205,51 @@ function OtherAccountStats({ usage }: { usage: AccountUsage | null }) {
   );
 }
 
-/** その他アカウント1行分（名前・使用率・切り替えボタン）。has_credentials=false は
- * 資格情報スナップショットが無く切り替え不可（tray.rs の「未取り込み（切り替え不可）」と同じ） */
+/** その他アカウント1行分（名前・使用率・切り替え/ログインボタン）。has_credentials=false は
+ * 資格情報スナップショットが無く切り替え不可（tray.rs の「未取り込み（切り替え不可）」と同じ）。
+ * refresh token が期限切れのアカウントは、切り替えても Claude Code に再ログインを求められる
+ * だけの空振りになるため「⇄ 切り替え」の代わりに「🔑 ログイン」を出す（2026-09-06、tray.rs と
+ * 同じ規則。残り3日以下のときだけ警告テキストを添え、それより先は行が長くなるので出さない） */
 function OtherAccountRow({
   account,
   busy,
   onSwitch,
+  onLogin,
 }: {
   account: OtherAccountOverview;
   busy: boolean;
   onSwitch: (name: string) => void;
+  onLogin: (name: string) => void;
 }) {
+  const expiry = refreshExpiryDisplay(account.usage?.refresh_token_expires_at ?? null, false);
   return (
     <div className="other-acct-row">
-      <p className="other-acct-name">{account.display_name}</p>
+      <p className="other-acct-name">
+        {account.display_name}
+        {expiry && expiry.status !== "normal" && (
+          <span className={`acct-refresh-expiry ${expiry.status}`}> {expiry.text}</span>
+        )}
+      </p>
       {account.has_credentials ? (
         <>
           <OtherAccountStats usage={account.usage} />
-          <button
-            className="acct-btn acct-btn-ghost switch-btn"
-            disabled={busy}
-            onClick={() => onSwitch(account.name)}
-          >
-            ⇄ このアカウントへ切り替え
-          </button>
+          {expiry?.status === "expired" ? (
+            <button
+              className="acct-btn acct-btn-ghost switch-btn"
+              disabled={busy}
+              onClick={() => onLogin(account.name)}
+            >
+              🔑 このアカウントでログイン
+            </button>
+          ) : (
+            <button
+              className="acct-btn acct-btn-ghost switch-btn"
+              disabled={busy}
+              onClick={() => onSwitch(account.name)}
+            >
+              ⇄ このアカウントへ切り替え
+            </button>
+          )}
         </>
       ) : (
         <p className="muted">未取り込み（切り替え不可）</p>
@@ -238,12 +265,15 @@ function OtherAccountRow({
  * body 直下へ createPortal し、専用クラスで position: fixed 化する */
 function SessionsConfirmModal({
   name,
+  actionLabel = "切り替えます",
   count,
   busy,
   onCancel,
   onConfirm,
 }: {
   name: string;
+  /** 見出しの動詞部分。「🔑 ログイン」導線からは "ログインします" を渡す（2026-09-06） */
+  actionLabel?: string;
   count: number;
   busy: boolean;
   onCancel: () => void;
@@ -253,7 +283,7 @@ function SessionsConfirmModal({
   return createPortal(
     <div className="acct-modal-overlay usage-sessions-modal-overlay" onClick={onCancel}>
       <div className="acct-modal-card" onClick={(e) => e.stopPropagation()}>
-        <strong>「{name}」に切り替えます</strong>
+        <strong>「{name}」に{actionLabel}</strong>
         <p className="muted">
           起動中の Claude Code セッションがあります。続行すると、実行中セッションが古いトークンを
           書き戻して切り替えが巻き戻ったり、保存済みアカウントが後で「＋
@@ -293,12 +323,15 @@ function SessionsConfirmModal({
  * createPortal する */
 function OwnerConfirmModal({
   name,
+  actionLabel = "切り替えます",
   message,
   busy,
   onCancel,
   onConfirm,
 }: {
   name: string;
+  /** 見出しの動詞部分。「🔑 ログイン」導線からは "ログインします" を渡す（2026-09-06） */
+  actionLabel?: string;
   message: string;
   busy: boolean;
   onCancel: () => void;
@@ -307,9 +340,9 @@ function OwnerConfirmModal({
   return createPortal(
     <div className="acct-modal-overlay usage-sessions-modal-overlay" onClick={onCancel}>
       <div className="acct-modal-card" onClick={(e) => e.stopPropagation()}>
-        <strong>「{name}」に切り替えます</strong>
+        <strong>「{name}」に{actionLabel}</strong>
         <p className="muted">
-          持ち主を確認できませんが切り替えは可能です。直前のセッションのログイン情報は今回同期されません。元のアカウントに戻す際、再ログインが必要になる場合があります。続行しますか？
+          持ち主を確認できませんが続行は可能です。直前のセッションのログイン情報は今回同期されません。元のアカウントに戻す際、再ログインが必要になる場合があります。続行しますか？
         </p>
         <p className="muted acct-owner-confirm-detail">{message}</p>
         <div className="acct-modal-actions">
@@ -326,6 +359,16 @@ function OwnerConfirmModal({
   );
 }
 
+/** ログイン完了検知ポーリングの間隔・タイムアウト。Accounts.tsx::pollForCompletion と
+ * 同じ値（POLL_INTERVAL_MS/LOGIN_TIMEOUT_MS）。ポップオーバーはコンパクトな表示のため
+ * mismatch の3秒再確認（同ファイルの M-6b）までは踏襲せず、初回の mismatch をそのまま
+ * エラー表示する簡略版にしている。setInterval コールバックが前回 invoke の完了を待たず
+ * 発火する問題への in-flight ガード（loginPhaseRef）は Accounts.tsx と同じ方式
+ * （2026-09-06 レビュー M-2。ただしポップオーバーには「retrying」段階が無いため
+ * "idle"/"polling" の2値で足りる） */
+const LOGIN_POLL_INTERVAL_MS = 2000;
+const LOGIN_TIMEOUT_MS = 5 * 60 * 1000;
+
 /** メニューバートレイパネルと同一の表示内容・数値・フォーマットを再現する使用量ポップオーバー
  * （2026-07-31 UsageCard/UsageCardView ベースの独自表示から作り替え）。
  * データは get_usage_overview（tray::fetch_raw_status 共有）から取得するため、
@@ -339,15 +382,42 @@ function UsagePopover() {
   const [switchError, setSwitchError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // trust はこの確認が発生した時点の trustUnverified 値を持ち回る（issue #3 再レビュー:
-  // owner確認→セッション確認と進んだ後の「続行する」で trust を落とさないため）
+  // owner確認→セッション確認と進んだ後の「続行する」で trust を落とさないため）。
+  // kind は「続行する」を doSwitch/doLogin どちらへ繋ぐかの分岐（2026-09-06、Accounts.tsx の
+  // pendingConfirm と同じパターン）
   const [sessionsConfirm, setSessionsConfirm] = useState<
-    { name: string; label: string; count: number; trust: boolean } | null
+    { kind: "switch" | "login"; name: string; label: string; count: number; trust: boolean } | null
   >(null);
   // issue #3: 持ち主未確認（token 期限切れ／通信不能）で続行を選べる確認。
   // force はこの確認が発生した時点の値を持ち回る（force と trustUnverified は独立、major-2）
   const [ownerConfirm, setOwnerConfirm] = useState<
-    { name: string; label: string; message: string; force: boolean } | null
+    { kind: "switch" | "login"; name: string; label: string; message: string; force: boolean } | null
   >(null);
+  // ログイン完了検知ポーリング中の表示用（Accounts.tsx::pollForCompletion のポップオーバー版）
+  const [loginPending, setLoginPending] = useState<{ label: string } | null>(null);
+  const loginPollRef = useRef<number | null>(null);
+  // doLogin の .finally(() => setBusy(false)) は start_add_account_login の応答直後（＝
+  // ポーリング開始時点）で busy を戻すため、busy 単独ではポーリング中の連打を防げない。
+  // loginPending も合わせて見ることでログインボタンをポーリング完了まで disabled にする
+  // （2026-09-06 レビュー M-1）
+  const loginOrBusy = busy || loginPending != null;
+  // pollForLoginCompletion の setInterval コールバックは前回 invoke の完了を待たず
+  // 2秒ごとに発火しうる。in-flight ガードが無いと複数の pollAddAccountLogin 応答が
+  // 混線し得るため、Accounts.tsx::loginPhaseRef と同じ方式で直列化する
+  // （2026-09-06 レビュー M-2）
+  const loginPhaseRef = useRef<"idle" | "polling">("idle");
+
+  const stopLoginPolling = useCallback(() => {
+    if (loginPollRef.current != null) {
+      window.clearInterval(loginPollRef.current);
+      loginPollRef.current = null;
+    }
+  }, []);
+
+  // stopLoginPolling は [] 依存の useCallback で参照が変わらないため、このクリーンアップは
+  // ポップオーバーを閉じるたび（open が false になるたび）には走らない。UsagePopover 自体が
+  // アンマウントされるとき（アプリ終了・再起動等）だけに走る最終防御（2026-09-06 レビュー L-4）
+  useEffect(() => stopLoginPolling, [stopLoginPolling]);
 
   const load = useCallback(() => {
     setError(null);
@@ -410,7 +480,7 @@ function UsagePopover() {
             return doSwitch(name, true, trustUnverified);
           }
           const label = overview?.others.find((a) => a.name === name)?.display_name ?? name;
-          setSessionsConfirm({ name, label, count: outcome.count, trust: trustUnverified });
+          setSessionsConfirm({ kind: "switch", name, label, count: outcome.count, trust: trustUnverified });
           return;
         }
         setSessionsConfirm(null);
@@ -426,7 +496,7 @@ function UsagePopover() {
         // （Other 等、trustUnverified でも解消しない別要因）
         if (!trustUnverified && isForceSwitchEligible(ownerErrorKind(e))) {
           const label = overview?.others.find((a) => a.name === name)?.display_name ?? name;
-          setOwnerConfirm({ name, label, message: describeAccountError(e), force });
+          setOwnerConfirm({ kind: "switch", name, label, message: describeAccountError(e), force });
           return;
         }
         setSwitchError(describeAccountError(e));
@@ -434,12 +504,126 @@ function UsagePopover() {
       .finally(() => setBusy(false));
   };
 
+  /** ダイアログ表示用の表示名解決。他アカウント一覧（overview.others）にあればそれ、
+   * ライブ自身（🔑 再ログイン）なら live_name、どちらでもなければ内部識別子のまま
+   * （2026-09-06） */
+  const resolveAccountLabel = (name: string): string => {
+    const other = overview?.others.find((a) => a.name === name)?.display_name;
+    if (other) return other;
+    if (name === overview?.live_internal_name && overview?.live_name) return overview.live_name;
+    return name;
+  };
+
+  /** 期限切れアカウントの「🔑 ログイン」。doSwitch と同じ確認フローを共有し（sessionsConfirm/
+   * ownerConfirm の kind で分岐）、Accounts.tsx が使う start_add_account_login を呼ぶ
+   * （2026-09-06）。完了は pollForLoginCompletion で検知する */
+  const doLogin = (name: string, force = false, trustUnverified = false): Promise<void> => {
+    setNotice(null);
+    setSwitchError(null);
+    setBusy(true);
+    return api
+      .startAddAccountLogin(force, trustUnverified, name)
+      .then((outcome) => {
+        if (outcome.status === "needs_import") {
+          setNotice(
+            "現在ログイン中のアカウントが未登録のため開始できません。アカウント画面から操作してください。"
+          );
+          return;
+        }
+        if (outcome.status === "sessions_running") {
+          if (skipSessionsConfirmEnabled()) {
+            return doLogin(name, true, trustUnverified);
+          }
+          setSessionsConfirm({
+            kind: "login",
+            name,
+            label: resolveAccountLabel(name),
+            count: outcome.count,
+            trust: trustUnverified,
+          });
+          return;
+        }
+        setSessionsConfirm(null);
+        if (outcome.warning) setNotice(outcome.warning);
+        pollForLoginCompletion(outcome.baseline, resolveAccountLabel(name));
+      })
+      .catch((e) => {
+        if (!trustUnverified && isForceSwitchEligible(ownerErrorKind(e))) {
+          setOwnerConfirm({
+            kind: "login",
+            name,
+            label: resolveAccountLabel(name),
+            message: describeAccountError(e),
+            force,
+          });
+          return;
+        }
+        setSwitchError(describeAccountError(e));
+      })
+      .finally(() => setBusy(false));
+  };
+
+  /** ブラウザでのログイン完了検知（Accounts.tsx::pollForCompletion の簡略版）。
+   * mismatch は Accounts.tsx の3秒再確認までは行わず、そのまま案内する
+   * （ポップオーバーは常設の画面ではなく開いている間だけの一時表示のため、
+   * 誤検知が起きても「アプリのアカウント画面から確認してください」の一言で足りる） */
+  const pollForLoginCompletion = (baseline: string, label: string) => {
+    setLoginPending({ label });
+    stopLoginPolling();
+    loginPhaseRef.current = "polling";
+    const deadline = Date.now() + LOGIN_TIMEOUT_MS;
+    // 終了処理を1箇所にまとめる。5分タイムアウトは pollAddAccountLogin を一度も呼ばずに
+    // 打ち切るため、トレイと共有の LOGIN_IN_PROGRESS はここで明示的に解放する（他の終端は
+    // Rust 側の poll_add_account_login が Waiting 以外を返した時点ですでに解放済みだが、
+    // 再度呼んでも no-op なので毎回呼んで揃える。2026-09-06 レビュー M-1）
+    const settle = () => {
+      stopLoginPolling();
+      loginPhaseRef.current = "idle";
+      setLoginPending(null);
+      api.releaseLoginLock().catch(() => {});
+    };
+    loginPollRef.current = window.setInterval(() => {
+      if (loginPhaseRef.current !== "polling") return;
+      if (Date.now() > deadline) {
+        settle();
+        setSwitchError("ログインが5分以内に完了しなかったため中止しました。");
+        return;
+      }
+      api
+        .pollAddAccountLogin(baseline)
+        .then((result) => {
+          // 前回 invoke がまだ in-flight の間に次の interval tick が発火しうる。
+          // すでに settle 済み（キャンセル・タイムアウト・別応答が先着）ならこの応答は無視する
+          if (loginPhaseRef.current !== "polling") return;
+          if (result.status === "waiting") return;
+          settle();
+          if (result.status === "mismatch") {
+            setSwitchError(
+              `ログインしたアカウントが「${result.expected_label}」（${result.expected_email}）と一致しなかったため取り込みませんでした。`
+            );
+            return;
+          }
+          setNotice(`「${accountLabel(result.account)}」でログインしました。`);
+          load();
+        })
+        .catch((e) => {
+          if (loginPhaseRef.current !== "polling") return;
+          settle();
+          setSwitchError(describeAccountError(e));
+        });
+    }, LOGIN_POLL_INTERVAL_MS);
+  };
+
   /** issue #3: force はこの確認が発生した時点の値をそのまま持ち回る（major-2） */
   const confirmOwnerAndContinue = () => {
     if (!ownerConfirm) return;
     const target = ownerConfirm;
     setOwnerConfirm(null);
-    doSwitch(target.name, target.force, true);
+    if (target.kind === "login") {
+      doLogin(target.name, target.force, true);
+    } else {
+      doSwitch(target.name, target.force, true);
+    }
   };
 
   const confirmSessionsAndContinue = (skipFuture: boolean) => {
@@ -449,7 +633,11 @@ function UsagePopover() {
     setSessionsConfirm(null);
     // target.trust を引き継ぐ（issue #3 再レビュー: owner確認→セッション確認と進んだ場合、
     // ここで trust を落とすと再度 owner確認に戻ってしまう二度手間になる）
-    doSwitch(target.name, true, target.trust);
+    if (target.kind === "login") {
+      doLogin(target.name, true, target.trust);
+    } else {
+      doSwitch(target.name, true, target.trust);
+    }
   };
 
   // tray.rs の live_header と同じ規則：使用量取得が失敗（live_error）した場合は
@@ -459,6 +647,12 @@ function UsagePopover() {
       ? `ログイン中: ${overview.live_name}`
       : "ログイン中アカウント"
     : "取得中…";
+  // ライブ自身の refresh token 期限（2026-09-06、tray.rs と同じ規則）。ライブは既に
+  // ログイン中なので「切り替えると」ではなく「再ログインが必要」の文言を使う
+  const liveExpiry = overview
+    ? refreshExpiryDisplay(overview.live_refresh_token_expires_at, true)
+    : null;
+  const liveInternalName = overview?.live_internal_name ?? null;
 
   return (
     <div className="usage-anchor">
@@ -502,7 +696,21 @@ function UsagePopover() {
               <p className="error-box">{error}</p>
             ) : (
               <>
-                <p className="usage-live-header">{liveHeader}</p>
+                <p className="usage-live-header">
+                  {liveHeader}
+                  {liveExpiry && liveExpiry.status !== "normal" && (
+                    <span className={`acct-refresh-expiry ${liveExpiry.status}`}> {liveExpiry.text}</span>
+                  )}
+                </p>
+                {liveExpiry?.status === "expired" && liveInternalName && (
+                  <button
+                    className="acct-btn acct-btn-ghost switch-btn"
+                    disabled={loginOrBusy}
+                    onClick={() => doLogin(liveInternalName)}
+                  >
+                    🔑 再ログイン
+                  </button>
+                )}
                 {overview?.live ? (
                   <div className="usage-gauges">
                     <div className="usage-gauge-row">
@@ -548,13 +756,19 @@ function UsagePopover() {
                       <OtherAccountRow
                         key={a.name}
                         account={a}
-                        busy={busy}
+                        busy={loginOrBusy}
                         onSwitch={doSwitch}
+                        onLogin={(name) => doLogin(name)}
                       />
                     ))}
                   </>
                 )}
 
+                {loginPending && (
+                  <p className="usage-note muted">
+                    「{loginPending.label}」のログインを待っています…
+                  </p>
+                )}
                 {notice && <p className="usage-note muted">{notice}</p>}
               </>
             )}
@@ -567,6 +781,7 @@ function UsagePopover() {
           {sessionsConfirm && (
             <SessionsConfirmModal
               name={sessionsConfirm.label}
+              actionLabel={sessionsConfirm.kind === "login" ? "ログインします" : "切り替えます"}
               count={sessionsConfirm.count}
               busy={busy}
               onCancel={() => setSessionsConfirm(null)}
@@ -576,6 +791,7 @@ function UsagePopover() {
           {ownerConfirm && (
             <OwnerConfirmModal
               name={ownerConfirm.label}
+              actionLabel={ownerConfirm.kind === "login" ? "ログインします" : "切り替えます"}
               message={ownerConfirm.message}
               busy={busy}
               onCancel={() => setOwnerConfirm(null)}
