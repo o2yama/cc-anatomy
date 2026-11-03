@@ -443,6 +443,13 @@ pub(crate) fn is_token_expired(expires_at: Option<i64>) -> bool {
     expires_at.is_some_and(|exp| exp <= now_ms())
 }
 
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelLimit {
+    pub name: String,
+    pub pct: f64,
+    pub reset: Option<i64>,
+}
+
 /// メニューバー向けの使用量サマリー。使用率は 0〜100、リセットは epoch 秒。
 ///
 /// `fetched_at`（2026-08-22、S-3 追加）: この値が実際にいつ取得されたか（epoch 秒）。
@@ -460,11 +467,12 @@ pub(crate) fn is_token_expired(expires_at: Option<i64>) -> bool {
 /// `Debug` はテストの失敗時アサーションメッセージ（`{result:?}` 等）用
 #[derive(Clone, Debug)]
 pub struct UsageSummary {
-    pub five_pct: f64,
+    pub five_pct: Option<f64>,
     pub seven_pct: f64,
     pub five_reset: Option<i64>,
     pub seven_reset: Option<i64>,
     pub fetched_at: Option<i64>,
+    pub model_limits: Vec<ModelLimit>,
 }
 
 fn iso_to_epoch(s: &str) -> Option<i64> {
@@ -477,14 +485,11 @@ fn iso_to_epoch(s: &str) -> Option<i64> {
 pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|_| "使用量の応答が不正です".to_string())?;
-    let five_pct = v
-        .pointer("/five_hour/utilization")
-        .and_then(|x| x.as_f64())
-        .ok_or("使用量を取得できませんでした")?;
-    let seven_pct = v
-        .pointer("/seven_day/utilization")
-        .and_then(|x| x.as_f64())
-        .unwrap_or(0.0);
+    let five_pct = v.pointer("/five_hour/utilization").and_then(|x| x.as_f64());
+    let seven_pct = v.pointer("/seven_day/utilization").and_then(|x| x.as_f64());
+    if five_pct.is_none() && seven_pct.is_none() {
+        return Err("使用量を取得できませんでした".to_string());
+    }
     let five_reset = v
         .pointer("/five_hour/resets_at")
         .and_then(|x| x.as_str())
@@ -493,12 +498,27 @@ pub fn parse_usage_body(body: &str) -> Result<UsageSummary, String> {
         .pointer("/seven_day/resets_at")
         .and_then(|x| x.as_str())
         .and_then(iso_to_epoch);
+    let model_limits = v
+        .get("limits")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|limit| limit.get("kind").and_then(serde_json::Value::as_str) == Some("weekly_scoped"))
+        .filter_map(|limit| {
+            Some(ModelLimit {
+                name: limit.pointer("/scope/model/display_name")?.as_str()?.to_string(),
+                pct: limit.get("percent")?.as_f64()?,
+                reset: limit.get("resets_at").and_then(serde_json::Value::as_str).and_then(iso_to_epoch),
+            })
+        })
+        .collect();
     Ok(UsageSummary {
         five_pct,
-        seven_pct,
+        seven_pct: seven_pct.unwrap_or(0.0),
         five_reset,
         seven_reset,
         fetched_at: Some(now_epoch_secs()),
+        model_limits,
     })
 }
 
@@ -577,22 +597,33 @@ pub fn usage_via_monitor_token(token: &str) -> Result<UsageSummary, String> {
     if status == 401 {
         return Err("監視トークンが無効です".into());
     }
+    let mut usage = usage_from_monitor_headers(&headers)?;
+    usage.fetched_at = Some(now_epoch_secs());
+    Ok(usage)
+}
+
+fn usage_from_monitor_headers(headers: &reqwest::header::HeaderMap) -> Result<UsageSummary, String> {
     let pct = |prefix: &str| -> Option<f64> {
-        header_value(&headers, &format!("anthropic-ratelimit-unified-{prefix}-utilization"))
+        header_value(headers, &format!("anthropic-ratelimit-unified-{prefix}-utilization"))
             .and_then(|v| v.parse::<f64>().ok())
             .map(|v| v * 100.0)
     };
     let reset = |prefix: &str| -> Option<i64> {
-        header_value(&headers, &format!("anthropic-ratelimit-unified-{prefix}-reset"))
+        header_value(headers, &format!("anthropic-ratelimit-unified-{prefix}-reset"))
             .and_then(|v| v.parse::<i64>().ok())
     };
-    let five_pct = pct("5h").ok_or("使用量を取得できませんでした")?;
+    let five_pct = pct("5h");
+    let seven_pct = pct("7d");
+    if five_pct.is_none() && seven_pct.is_none() {
+        return Err("使用量を取得できませんでした".to_string());
+    }
     Ok(UsageSummary {
         five_pct,
-        seven_pct: pct("7d").unwrap_or(0.0),
+        seven_pct: seven_pct.unwrap_or(0.0),
         five_reset: reset("5h"),
         seven_reset: reset("7d"),
-        fetched_at: Some(now_epoch_secs()),
+        fetched_at: None,
+        model_limits: Vec::new(),
     })
 }
 
@@ -827,7 +858,122 @@ pub(crate) fn resolve_gated_live_usage(
 // まず照会間隔（USAGE_MIN_REFETCH_SECS）の見直しから検討すること。
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn parse_usage_body_accepts_weekly_only_with_scoped_model_limit() {
+        let body = r#"{
+            "five_hour": null,
+            "seven_day": {
+                "utilization": 10.0,
+                "resets_at": "2026-11-09T20:00:00.756254+00:00"
+            },
+            "limits": [
+                {
+                    "kind": "weekly_all",
+                    "group": "weekly",
+                    "percent": 10,
+                    "severity": "normal",
+                    "resets_at": "2026-11-09T20:00:00.756254+00:00",
+                    "scope": null,
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "group": "weekly",
+                    "percent": 10,
+                    "severity": "normal",
+                    "resets_at": "2026-11-09T20:00:00.756422+00:00",
+                    "scope": {
+                        "model": {"id": null, "display_name": "Fable"},
+                        "surface": null
+                    },
+                    "is_active": false
+                }
+            ],
+            "weekly_scoped_shares": [
+                {"limit_index": 1, "used_percent_of_weekly": 5, "allowance_percent_of_weekly": 50}
+            ]
+        }"#;
+
+        let usage = super::parse_usage_body(body).expect("週間枠だけでも取得できるはず");
+
+        assert_eq!(usage.five_pct, None);
+        assert_eq!(usage.seven_pct, 10.0);
+        assert_eq!(
+            usage.model_limits,
+            vec![super::ModelLimit {
+                name: "Fable".to_string(),
+                pct: 10.0,
+                reset: Some(1_794_254_400),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_usage_body_discards_incomplete_scoped_model_limits() {
+        let usage = super::parse_usage_body(
+            r#"{
+                "seven_day":{"utilization":10.0},
+                "limits":[
+                    {"kind":"weekly_scoped","percent":10,"scope":{"model":{}}},
+                    {"kind":"weekly_scoped","scope":{"model":{"display_name":"Fable"}}}
+                ]
+            }"#,
+        )
+        .expect("週間枠を取得できるはず");
+
+        assert!(usage.model_limits.is_empty());
+    }
+
+    #[test]
+    fn parse_usage_body_rejects_when_five_hour_and_seven_day_are_both_missing() {
+        let result = super::parse_usage_body(r#"{"five_hour":null,"seven_day":null}"#);
+        assert_eq!(result.unwrap_err(), "使用量を取得できませんでした");
+    }
+
+    #[test]
+    fn parse_usage_body_keeps_legacy_five_hour_response_working() {
+        let usage = super::parse_usage_body(
+            r#"{
+                "five_hour":{"utilization":42.5,"resets_at":"2026-11-03T12:00:00Z"},
+                "seven_day":{"utilization":12.0,"resets_at":"2026-11-09T20:00:00Z"}
+            }"#,
+        )
+        .expect("従来形式は引き続き取得できるはず");
+
+        assert_eq!(usage.five_pct, Some(42.5));
+        assert_eq!(usage.seven_pct, 12.0);
+        assert!(usage.model_limits.is_empty());
+    }
+
+    #[test]
+    fn monitor_headers_accept_seven_day_without_five_hour() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-utilization",
+            reqwest::header::HeaderValue::from_static("0.1"),
+        );
+        headers.insert(
+            "anthropic-ratelimit-unified-7d-reset",
+            reqwest::header::HeaderValue::from_static("1794254400"),
+        );
+
+        let usage = super::usage_from_monitor_headers(&headers).expect("7dだけでも取得できるはず");
+
+        assert_eq!(usage.five_pct, None);
+        assert_eq!(usage.seven_pct, 10.0);
+        assert_eq!(usage.seven_reset, Some(1_794_254_400));
+        assert!(usage.model_limits.is_empty());
+    }
+
+    #[test]
+    fn monitor_headers_reject_when_five_hour_and_seven_day_are_both_missing() {
+        let result = super::usage_from_monitor_headers(&reqwest::header::HeaderMap::new());
+
+        assert_eq!(result.unwrap_err(), "使用量を取得できませんでした");
+    }
+
     /// 実環境の資格情報とネットワークを使う e2e 検証。
     /// curl → reqwest 置き換え後も、ライブ資格情報 → /api/oauth/usage の
     /// 使用率組み立ての経路が実際に通ることを確かめる。V-1（2026-08-22 第6ラウンド）で
@@ -843,8 +989,12 @@ mod tests {
             super::GatedLiveUsageOutcome::Ok(u) => u,
             other => panic!("ライブ使用量の取得に失敗: {other:?}"),
         };
-        assert!((0.0..=100.0).contains(&u.five_pct), "5h 使用率が範囲外: {}", u.five_pct);
-        assert!(u.five_reset.is_some(), "5h リセット時刻が取れていない");
+        assert!((0.0..=100.0).contains(&u.seven_pct), "7d 使用率が範囲外: {}", u.seven_pct);
+        assert!(u.seven_reset.is_some(), "7d リセット時刻が取れていない");
+        if let Some(five_pct) = u.five_pct {
+            assert!((0.0..=100.0).contains(&five_pct), "5h 使用率が範囲外: {five_pct}");
+            assert!(u.five_reset.is_some(), "5h リセット時刻が取れていない");
+        }
     }
 
     /// 実測: 429 のとき本文は `{"error":{"type":"rate_limit_error",...}}`、
@@ -1044,7 +1194,14 @@ mod tests {
     use super::{GatedLiveUsageOutcome, LiveUsageError, UsageSummary};
 
     fn dummy_summary(fetched_at: i64) -> UsageSummary {
-        UsageSummary { five_pct: 12.0, seven_pct: 3.0, five_reset: None, seven_reset: None, fetched_at: Some(fetched_at) }
+        UsageSummary {
+            five_pct: Some(12.0),
+            seven_pct: 3.0,
+            five_reset: None,
+            seven_reset: None,
+            fetched_at: Some(fetched_at),
+            model_limits: Vec::new(),
+        }
     }
 
     /// Ok は保持値の有無に関わらずそのまま Ok になる

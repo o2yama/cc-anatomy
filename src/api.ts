@@ -190,6 +190,12 @@ export interface AccountsUpdatedEvent {
   warning: string | null;
 }
 
+export interface ModelLimit {
+  name: string;
+  pct: number;
+  reset: number | null;
+}
+
 /** アカウント1件分の使用率。監視用長期トークンは復活させず、保存済みスナップショットの
  * access token（期限内のときだけ）で /api/oauth/usage を照会した結果。
  * stale=true はキャッシュ返し（今回は新規取得できなかった）を示す */
@@ -204,6 +210,7 @@ export interface AccountUsage {
   stale: boolean;
   /** 5h 枠のリセット時刻を過ぎている想定（実質 0% とみなせる） */
   five_probably_reset: boolean;
+  model_limits: ModelLimit[];
   /** スナップショット内の refresh token 有効期限（epoch ミリ秒）。使用率取得の成否とは
    * 無関係に読めた値をそのまま返す。取得不能なら null */
   refresh_token_expires_at: number | null;
@@ -365,14 +372,15 @@ export const api = {
 /** アプリ内使用量ポップオーバー（トレイと共有する `tray::UsageOverview`）向け。
  * ライブアカウントの使用率。トレイの `LiveUsage` と同じ形 */
 export interface LiveUsage {
-  five_pct: number;
+  five_pct: number | null;
   seven_pct: number;
   five_reset: number | null;
   seven_reset: number | null;
+  model_limits: ModelLimit[];
 }
 
 /** その他アカウント1件分（トレイの `OtherAccountEntry` と同じ形）。
- * usage が null、または usage.five_pct が null なら「未取得」表示にする */
+ * usage が null、または利用可能な枠が無ければ「未取得」表示にする */
 export interface OtherAccountOverview {
   name: string;
   display_name: string;

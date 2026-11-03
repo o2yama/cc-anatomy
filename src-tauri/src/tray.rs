@@ -103,10 +103,11 @@ pub struct OtherAccountEntry {
 /// 同じ数値をそのまま渡す（フォーマットはフロント側で `reset_suffix` 相当を再現する）
 #[derive(serde::Serialize, Clone)]
 pub struct LiveUsage {
-    pub five_pct: f64,
+    pub five_pct: Option<f64>,
     pub seven_pct: f64,
     pub five_reset: Option<i64>,
     pub seven_reset: Option<i64>,
+    pub model_limits: Vec<crate::actions::ModelLimit>,
 }
 
 /// アプリ内使用量ポップオーバー（`get_usage_overview` コマンド）向けの表示専用データ。
@@ -144,19 +145,28 @@ pub struct UsageOverview {
 /// サブアカウントはテキスト1行に抑えてメニューが縦に長くなりすぎないようにする
 /// （2026-07-31 デザイン確定）
 fn compact_usage_segments(usage: Option<&crate::accounts::AccountUsage>, palette: &Palette) -> Vec<(String, (u8, u8, u8))> {
-    let Some(u) = usage.filter(|u| u.five_pct.is_some()) else {
+    let Some(u) = usage else {
         return vec![("未取得".to_string(), palette.text_gray)];
     };
-    // リセット時刻を過ぎている想定なら実質 0% とみなす
-    let five_val = if u.five_probably_reset { 0 } else { u.five_pct.unwrap().round() as i64 };
-    let seven_val = u.seven_pct.unwrap_or(0.0).round() as i64;
-    vec![
-        (format!("5h: {five_val}%"), palette.text_white),
-        (reset_suffix(u.five_reset), palette.text_gray),
-        (" / ".to_string(), palette.text_gray),
-        (format!("週次: {seven_val}%"), palette.text_white),
-        (reset_suffix(u.seven_reset), palette.text_gray),
-    ]
+    let mut segments = Vec::new();
+    if let Some(five_pct) = u.five_pct {
+        // リセット時刻を過ぎている想定なら実質 0% とみなす
+        let five_val = if u.five_probably_reset { 0 } else { five_pct.round() as i64 };
+        segments.push((format!("5h: {five_val}%"), palette.text_white));
+        segments.push((reset_suffix(u.five_reset), palette.text_gray));
+    }
+    if let Some(seven_pct) = u.seven_pct {
+        if !segments.is_empty() {
+            segments.push((" / ".to_string(), palette.text_gray));
+        }
+        segments.push((format!("週次: {}%", seven_pct.round() as i64), palette.text_white));
+        segments.push((reset_suffix(u.seven_reset), palette.text_gray));
+    }
+    if segments.is_empty() {
+        vec![("未取得".to_string(), palette.text_gray)]
+    } else {
+        segments
+    }
 }
 
 /// CoreText が使えない OS 向けのフォールバック。色は付けず全セグメントを連結した1文字列にする
@@ -495,7 +505,7 @@ fn now_epoch() -> i64 {
 /// live_usage_summary_gated() が失敗したときの第一フォールバック。get_accounts_usage() が
 /// 既に取得済みのライブアカウント分を、追加の HTTP 無しで UsageSummary へ変換できるかを
 /// 判定する（テスト容易性のため I/O から分離。2026-07-27 レビュー M-1）。
-/// five_pct が無ければ（キャッシュ自体が存在しない等）使える値なしとして None を返す。
+/// 5h/7d のどちらも無ければ使える値なしとして None を返す。
 ///
 /// fetched_at はバッチ側（AccountUsage.fetched_at）をそのまま引き継ぐ（2026-08-22、S-3）。
 /// ここで得る値は「今取得した」とは限らず（force_skips_freshness_check や
@@ -503,12 +513,16 @@ fn now_epoch() -> i64 {
 /// いつ取得されたかを usage_advisory の古さ判定に渡す必要があるため
 fn usage_summary_from_batch(batch_entry: Option<&crate::accounts::AccountUsage>) -> Option<crate::actions::UsageSummary> {
     let u = batch_entry?;
+    if u.five_pct.is_none() && u.seven_pct.is_none() {
+        return None;
+    }
     Some(crate::actions::UsageSummary {
-        five_pct: u.five_pct?,
+        five_pct: u.five_pct,
         seven_pct: u.seven_pct.unwrap_or(0.0),
         five_reset: u.five_reset,
         seven_reset: u.seven_reset,
         fetched_at: u.fetched_at,
+        model_limits: u.model_limits.clone(),
     })
 }
 
@@ -582,7 +596,7 @@ fn should_nudge_token_refresh(live_error: Option<&crate::actions::LiveUsageError
 /// `live_usage_summary_gated()` を無条件に削除すると使用量表示が死んでしまうため、
 /// 「バッチにライブが存在するか（live_usage_from_batch が Some か）」で分岐し、
 /// 存在しないときだけ `live_usage_summary_gated()` を直接呼ぶフォールバックを残す。
-/// これは「キャッシュが無くて five_pct が None なだけ」（バッチは試行済み）とは区別する:
+/// これは「5h 枠が無くて five_pct が None なだけ」（バッチは試行済み）とは区別する:
 /// 後者は二重取得の禁止（B-1）を優先し、ここでは呼ばない
 ///
 /// T-2（2026-08-22 導入、第4ラウンド S-2 で撤去）: このフォールバックには一時期
@@ -843,16 +857,25 @@ fn fetch_status(force: bool) -> StatusData {
     let mut usage_lines = Vec::new();
     let (live_header_base, title) = match raw.usage_result {
         Ok(u) => {
-            let f = u.five_pct.round() as i64;
             let s = u.seven_pct.round() as i64;
-            usage_lines.push(InfoLine::Gauge {
-                label: format!("5H {f}%{}", reset_suffix(u.five_reset)),
-                pct: f,
-            });
+            if let Some(five_pct) = u.five_pct {
+                let f = five_pct.round() as i64;
+                usage_lines.push(InfoLine::Gauge {
+                    label: format!("5H {f}%{}", reset_suffix(u.five_reset)),
+                    pct: f,
+                });
+            }
             usage_lines.push(InfoLine::Gauge {
                 label: format!("週次 {s}%{}", reset_suffix(u.seven_reset)),
                 pct: s,
             });
+            for model in &u.model_limits {
+                let pct = model.pct.round() as i64;
+                usage_lines.push(InfoLine::Gauge {
+                    label: format!("{} {pct}%{}", model.name, reset_suffix(model.reset)),
+                    pct,
+                });
+            }
             if let Some(UsageAdvisory::Note(note)) = usage_advisory(true, live_error.as_ref(), u.fetched_at, now) {
                 // Note は Expired のときだけ \n で2行になる。Blocking と同じく1行1メニュー項目にする
                 for line in note.split('\n') {
@@ -863,7 +886,8 @@ fn fetch_status(force: bool) -> StatusData {
                 Some(name) => format!("ログイン中: {name}"),
                 None => "ログイン中アカウント".to_string(),
             };
-            (header, format!("{}%", u.five_pct.max(u.seven_pct).round() as i64))
+            let max_pct = u.five_pct.map_or(u.seven_pct, |five_pct| five_pct.max(u.seven_pct));
+            (header, format!("{}%", max_pct.round() as i64))
         }
         Err(_) => {
             if let Some(UsageAdvisory::Blocking(line1, line2)) = usage_advisory(false, live_error.as_ref(), None, now) {
@@ -909,6 +933,7 @@ pub fn usage_overview(force: bool) -> UsageOverview {
                     seven_pct: u.seven_pct,
                     five_reset: u.five_reset,
                     seven_reset: u.seven_reset,
+                    model_limits: u.model_limits,
                 }),
                 None,
                 note,
@@ -1783,6 +1808,7 @@ mod tests {
             five_reset: Some(1_000),
             seven_reset: Some(2_000),
             fetched_at: Some(500),
+            model_limits: Vec::new(),
             stale: true,
             five_probably_reset: false,
             refresh_token_expires_at: None,
@@ -1794,7 +1820,7 @@ mod tests {
         // stale（キャッシュ返し）でも値さえあれば使う。fresh かどうかは get_accounts_usage
         // 側の関心事で、ここ（トレイタイトルの表示可否）では問わない
         let u = usage_summary_from_batch(Some(&account_usage(Some(42.0)))).expect("値があるはず");
-        assert_eq!(u.five_pct, 42.0);
+        assert_eq!(u.five_pct, Some(42.0));
         assert_eq!(u.seven_pct, 12.0);
         assert_eq!(u.five_reset, Some(1_000));
         assert_eq!(u.seven_reset, Some(2_000));
@@ -1810,10 +1836,10 @@ mod tests {
     }
 
     #[test]
-    fn usage_summary_from_batch_none_when_five_pct_missing() {
-        // キャッシュ自体が存在しない（five_pct が None）なら「使える値なし」として
-        // 呼び出し側（fetch_status）を最後の手段（監視トークン直接照会）へ進ませる
-        assert!(usage_summary_from_batch(Some(&account_usage(None))).is_none());
+    fn usage_summary_from_batch_converts_when_five_pct_missing() {
+        let u = usage_summary_from_batch(Some(&account_usage(None))).expect("7d値があるはず");
+        assert_eq!(u.five_pct, None);
+        assert_eq!(u.seven_pct, 12.0);
     }
 
     /// R-1 / T-3 追加テスト項目1: フォールバックの発火条件そのもの
@@ -1852,14 +1878,22 @@ mod tests {
     }
 
     #[test]
+    fn compact_usage_segments_omits_five_hour_without_five_pct() {
+        let palette = Palette::dark();
+        assert_eq!(
+            compact_usage_segments(Some(&account_usage(None)), &palette),
+            vec![
+                ("週次: 12%".to_string(), palette.text_white),
+                (reset_suffix(Some(2_000)), palette.text_gray),
+            ]
+        );
+    }
+
+    #[test]
     fn compact_usage_segments_falls_back_to_未取得_without_data() {
         let palette = Palette::dark();
         assert_eq!(
             compact_usage_segments(None, &palette),
-            vec![("未取得".to_string(), palette.text_gray)]
-        );
-        assert_eq!(
-            compact_usage_segments(Some(&account_usage(None)), &palette),
             vec![("未取得".to_string(), palette.text_gray)]
         );
     }

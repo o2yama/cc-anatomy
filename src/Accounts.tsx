@@ -87,13 +87,19 @@ type OwnerConfirm =
   | { kind: "switch"; name: string; message: string; force: boolean }
   | { kind: "login"; message: string; targetName?: string; force: boolean };
 
-/** 使用率の1行分のテキスト（例: "5h 9% ・ 週 52%"）。リセット時刻を過ぎている想定なら
- * 「5h リセット済み」に置き換える。値が無ければ null（呼び出し側は行ごと出さない） */
+/** 使用率の1行分のテキスト。利用できる枠だけを連結し、5h枠が無いアカウントにも対応する。 */
 function usageText(usage: AccountUsage): string | null {
-  if (usage.five_pct == null) return null;
-  const five = usage.five_probably_reset ? "5h リセット済み" : `5h ${Math.round(usage.five_pct)}%`;
-  const seven = usage.seven_pct != null ? ` ・ 週 ${Math.round(usage.seven_pct)}%` : "";
-  return `${five}${seven}`;
+  const parts: string[] = [];
+  if (usage.five_pct != null) {
+    parts.push(usage.five_probably_reset ? "5h リセット済み" : `5h ${Math.round(usage.five_pct)}%`);
+  }
+  if (usage.seven_pct != null) {
+    parts.push(`週 ${Math.round(usage.seven_pct)}%`);
+  }
+  for (const limit of usage.model_limits ?? []) {
+    parts.push(`${limit.name} ${Math.round(limit.pct)}%`);
+  }
+  return parts.length > 0 ? parts.join(" ・ ") : null;
 }
 
 export type RefreshExpiryDisplay = {

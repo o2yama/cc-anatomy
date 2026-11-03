@@ -188,19 +188,34 @@ function resetSuffix(epoch: number | null): string {
 /** その他アカウント1件分の使用率テキスト。tray.rs の compact_usage_segments と同じ内容
  * （白=数値、グレー=リセット時刻）を span の色分けで再現する */
 function OtherAccountStats({ usage }: { usage: AccountUsage | null }) {
-  if (!usage || usage.five_pct == null) {
+  if (!usage) {
     return <p className="other-acct-stats muted">未取得</p>;
   }
-  // リセット時刻を過ぎている想定なら実質 0% とみなす（tray.rs と同じ規則）
-  const fiveVal = usage.five_probably_reset ? 0 : Math.round(usage.five_pct);
-  const sevenVal = Math.round(usage.seven_pct ?? 0);
+  const five = usage.five_pct == null
+    ? null
+    : {
+        value: usage.five_probably_reset ? 0 : Math.round(usage.five_pct),
+        reset: usage.five_reset,
+      };
+  const seven = usage.seven_pct == null ? null : Math.round(usage.seven_pct);
+  if (five == null && seven == null) {
+    return <p className="other-acct-stats muted">未取得</p>;
+  }
   return (
     <p className="other-acct-stats">
-      <span className="stat-value">5h: {fiveVal}%</span>
-      <span className="muted">{resetSuffix(usage.five_reset)}</span>
-      <span className="muted"> / </span>
-      <span className="stat-value">週次: {sevenVal}%</span>
-      <span className="muted">{resetSuffix(usage.seven_reset)}</span>
+      {five && (
+        <>
+          <span className="stat-value">5h: {five.value}%</span>
+          <span className="muted">{resetSuffix(five.reset)}</span>
+        </>
+      )}
+      {seven != null && (
+        <>
+          {five && <span className="muted"> / </span>}
+          <span className="stat-value">週次: {seven}%</span>
+          <span className="muted">{resetSuffix(usage.seven_reset)}</span>
+        </>
+      )}
     </p>
   );
 }
@@ -713,13 +728,15 @@ function UsagePopover() {
                 )}
                 {overview?.live ? (
                   <div className="usage-gauges">
-                    <div className="usage-gauge-row">
-                      <DotGauge pct={Math.round(overview.live.five_pct)} />
-                      <span>
-                        5H {Math.round(overview.live.five_pct)}%
-                        {resetSuffix(overview.live.five_reset)}
-                      </span>
-                    </div>
+                    {overview.live.five_pct != null && (
+                      <div className="usage-gauge-row">
+                        <DotGauge pct={Math.round(overview.live.five_pct)} />
+                        <span>
+                          5H {Math.round(overview.live.five_pct)}%
+                          {resetSuffix(overview.live.five_reset)}
+                        </span>
+                      </div>
+                    )}
                     <div className="usage-gauge-row">
                       <DotGauge pct={Math.round(overview.live.seven_pct)} />
                       <span>
@@ -727,6 +744,15 @@ function UsagePopover() {
                         {resetSuffix(overview.live.seven_reset)}
                       </span>
                     </div>
+                    {(overview.live.model_limits ?? []).map((limit, i) => (
+                      <div className="usage-gauge-row" key={`${limit.name}-${i}`}>
+                        <DotGauge pct={Math.round(limit.pct)} />
+                        <span>
+                          {limit.name} {Math.round(limit.pct)}%
+                          {resetSuffix(limit.reset)}
+                        </span>
+                      </div>
+                    ))}
                     {overview.live_note &&
                       // S-3（2026-08-22）: 注記が2行（取得時刻＋Expiredのときの復帰案内）に
                       // なることがあるため、live_error と同じ「\n で分割して1行1<p>」の

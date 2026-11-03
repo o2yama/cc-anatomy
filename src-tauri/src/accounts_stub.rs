@@ -8,6 +8,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::actions::ModelLimit;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Account {
     pub name: String,
@@ -45,6 +47,7 @@ pub struct AccountUsage {
     pub five_reset: Option<i64>,
     pub seven_reset: Option<i64>,
     pub fetched_at: Option<i64>,
+    pub model_limits: Vec<ModelLimit>,
     pub stale: bool,
     pub five_probably_reset: bool,
     pub refresh_token_expires_at: Option<i64>,

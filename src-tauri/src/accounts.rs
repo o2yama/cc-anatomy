@@ -76,7 +76,9 @@
 //! `meta.active` フィールド自体は「ライブ追随の記録専用」として存置する
 //! （Keychain の裏付けは持たない、表示・記録用のブックキーピングのみ）。
 
-use crate::actions::{usage_attempt_min_interval, NON_LIVE_MIN_REFETCH_SECS, USAGE_MIN_REFETCH_SECS};
+use crate::actions::{
+    usage_attempt_min_interval, ModelLimit, NON_LIVE_MIN_REFETCH_SECS, USAGE_MIN_REFETCH_SECS,
+};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -225,11 +227,32 @@ struct StoredAccount {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct UsageCache {
     five_pct: f64,
+    #[serde(default = "default_has_five_hour")]
+    has_five_hour: bool,
     seven_pct: f64,
     five_reset: Option<i64>,
     seven_reset: Option<i64>,
     /// 取得時刻（epoch 秒）
     fetched_at: i64,
+    #[serde(default)]
+    model_limits: Vec<ModelLimit>,
+}
+
+fn default_has_five_hour() -> bool {
+    true
+}
+
+fn usage_cache_from_summary(summary: crate::actions::UsageSummary, fetched_at: i64) -> UsageCache {
+    let has_five_hour = summary.five_pct.is_some();
+    UsageCache {
+        five_pct: summary.five_pct.unwrap_or(0.0),
+        has_five_hour,
+        seven_pct: summary.seven_pct,
+        five_reset: summary.five_reset,
+        seven_reset: summary.seven_reset,
+        fetched_at,
+        model_limits: summary.model_limits,
+    }
 }
 
 /// ~/.claude.json 全体を読む
@@ -598,6 +621,7 @@ pub struct AccountUsage {
     pub seven_reset: Option<i64>,
     /// 取得時刻（epoch 秒）。cache が無ければ None
     pub fetched_at: Option<i64>,
+    pub model_limits: Vec<ModelLimit>,
     /// true ならキャッシュ返し（今回は新規取得できなかった）
     pub stale: bool,
     /// 5h 枠のリセット時刻を過ぎている想定（実質 0% とみなせる）
@@ -627,13 +651,15 @@ fn to_account_usage(
     match cache {
         Some(c) => AccountUsage {
             name: name.to_string(),
-            five_pct: Some(c.five_pct),
+            five_pct: c.has_five_hour.then_some(c.five_pct),
             seven_pct: Some(c.seven_pct),
-            five_reset: c.five_reset,
+            five_reset: c.has_five_hour.then_some(c.five_reset).flatten(),
             seven_reset: c.seven_reset,
             fetched_at: Some(c.fetched_at),
+            model_limits: c.model_limits.clone(),
             stale,
-            five_probably_reset: c.five_reset.is_some_and(|reset| reset <= now),
+            five_probably_reset: c.has_five_hour
+                && c.five_reset.is_some_and(|reset| reset <= now),
             refresh_token_expires_at,
         },
         None => AccountUsage {
@@ -643,6 +669,7 @@ fn to_account_usage(
             five_reset: None,
             seven_reset: None,
             fetched_at: None,
+            model_limits: Vec::new(),
             stale: true,
             five_probably_reset: false,
             refresh_token_expires_at,
@@ -992,13 +1019,7 @@ pub fn get_accounts_usage(force: bool) -> Result<UsageBatch, String> {
 
         match fetched {
             Some(summary) => {
-                let new_cache = UsageCache {
-                    five_pct: summary.five_pct,
-                    seven_pct: summary.seven_pct,
-                    five_reset: summary.five_reset,
-                    seven_reset: summary.seven_reset,
-                    fetched_at: now,
-                };
+                let new_cache = usage_cache_from_summary(summary, now);
                 results.push(to_account_usage(&t.name, Some(&new_cache), false, now, refresh_token_expires_at));
                 updates.push((t.name.clone(), new_cache));
             }
@@ -3522,11 +3543,45 @@ mod tests {
     fn cache(five_pct: f64, seven_pct: f64, five_reset: Option<i64>, fetched_at: i64) -> UsageCache {
         UsageCache {
             five_pct,
+            has_five_hour: true,
             seven_pct,
             five_reset,
             seven_reset: None,
             fetched_at,
+            model_limits: Vec::new(),
         }
+    }
+
+    #[test]
+    fn usage_cache_deserializes_legacy_json_without_model_limits() {
+        let cache: UsageCache = serde_json::from_str(
+            r#"{"five_pct":42.5,"seven_pct":18.0,"five_reset":123,"seven_reset":456,"fetched_at":789}"#,
+        )
+        .expect("旧形式の usage_cache を読めること");
+
+        assert_eq!(cache.five_pct, 42.5);
+        assert!(cache.has_five_hour);
+        assert!(cache.model_limits.is_empty());
+    }
+
+    #[test]
+    fn usage_cache_serializes_missing_five_hour_as_numeric_zero() {
+        let summary = crate::actions::UsageSummary {
+            five_pct: None,
+            seven_pct: 18.0,
+            five_reset: None,
+            seven_reset: Some(456),
+            fetched_at: Some(789),
+            model_limits: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&usage_cache_from_summary(summary, 789))
+            .expect("usage_cache を JSON にできること");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("JSON として読めること");
+
+        assert_eq!(value["five_pct"], 0.0);
+        assert_eq!(value["has_five_hour"], false);
+        assert!(!json.contains(r#""five_pct":null"#));
     }
 
     #[test]
@@ -3747,11 +3802,17 @@ mod tests {
 
     #[test]
     fn to_account_usage_fresh_fetch_is_not_stale() {
-        let c = cache(9.0, 52.0, Some(2_000), 1_000);
+        let mut c = cache(9.0, 52.0, Some(2_000), 1_000);
+        c.model_limits.push(ModelLimit {
+            name: "Fable".to_string(),
+            pct: 10.0,
+            reset: Some(3_000),
+        });
         let usage = to_account_usage("acct", Some(&c), false, 1_000, None);
         assert_eq!(usage.five_pct, Some(9.0));
         assert_eq!(usage.seven_pct, Some(52.0));
         assert_eq!(usage.fetched_at, Some(1_000));
+        assert_eq!(usage.model_limits, c.model_limits);
         assert!(!usage.stale);
     }
 
@@ -3781,6 +3842,19 @@ mod tests {
     fn to_account_usage_no_reset_time_never_flags_reset() {
         let c = cache(80.0, 52.0, None, 1_000);
         let usage = to_account_usage("acct", Some(&c), true, 5_000, None);
+        assert!(!usage.five_probably_reset);
+    }
+
+    #[test]
+    fn to_account_usage_without_five_hour_never_flags_reset() {
+        let c: UsageCache = serde_json::from_str(
+            r#"{"five_pct":0.0,"has_five_hour":false,"seven_pct":52.0,"five_reset":2000,"seven_reset":null,"fetched_at":1000}"#,
+        )
+        .expect("5h 枠が無いキャッシュを読めること");
+        let usage = to_account_usage("acct", Some(&c), true, 5_000, None);
+
+        assert_eq!(usage.five_pct, None);
+        assert_eq!(usage.five_reset, None);
         assert!(!usage.five_probably_reset);
     }
 
