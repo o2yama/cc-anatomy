@@ -13,6 +13,7 @@ import {
   ownerErrorKind,
   ProjectInfo,
   SearchHit,
+  switchSuccessMessage,
   Transcript,
   UsageOverview,
 } from "./api";
@@ -499,11 +500,18 @@ function UsagePopover() {
           return;
         }
         setSessionsConfirm(null);
-        setNotice(
-          outcome.warning ??
-            "切り替えました。実行中の Claude Code セッションには反映されません。"
-        );
+        if (outcome.warning) {
+          setNotice(outcome.warning);
+          load();
+          return;
+        }
         load();
+        return api
+          .getAccounts()
+          .then((latestState) => {
+            setNotice(switchSuccessMessage(latestState.stale_credentials_file));
+          })
+          .catch(() => setNotice("切り替えました。"));
       })
       .catch((e) => {
         // issue #3: 持ち主未確認（token 期限切れ／通信不能）は続行を選べる。

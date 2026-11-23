@@ -28,6 +28,7 @@ import {
   describeAccountError,
   ownerErrorKind,
   isForceSwitchEligible,
+  switchSuccessMessage,
 } from "./api";
 
 const PLAN_LABEL: Record<string, string> = {
@@ -881,11 +882,18 @@ export function AccountsOverlay({
         }
         setPendingConfirm(null);
         setSessionsConfirm(null);
-        setNotice(
-          outcome.warning ??
-            "切り替えました。実行中の Claude Code セッションには反映されません。新しく起動したセッションから有効です。"
-        );
-        reload();
+        if (outcome.warning) {
+          setNotice(outcome.warning);
+          reload();
+          return;
+        }
+        return api
+          .getAccounts()
+          .then((latestState) => {
+            setState(latestState);
+            setNotice(switchSuccessMessage(latestState.stale_credentials_file));
+          })
+          .catch(() => setNotice("切り替えました。"));
       })
       .catch((e) => {
         // issue #3: 持ち主未確認（token 期限切れ／通信不能）は続行を選べる。
@@ -1064,6 +1072,20 @@ export function AccountsOverlay({
               <button className="acct-btn acct-btn-primary" disabled={busy} onClick={() => importLive()}>
                 このセッションを取り込む
               </button>
+            </div>
+          )}
+
+          {state?.stale_credentials_file && (
+            <div className="acct-banner">
+              <div>
+                <strong>古い資格情報ファイルが残っています</strong>
+                <p className="muted">
+                  ~/.claude/.credentials.json が残っているため、アカウントを切り替えても実行中の Claude Code セッションは旧アカウントのまま動きます（最大約8時間）。次のコマンドで退避すると、実行中のセッションにも切り替えが反映されます。
+                </p>
+                <p>
+                  <code>mv ~/.claude/.credentials.json ~/.claude/.credentials.json.retired</code>
+                </p>
+              </div>
             </div>
           )}
 

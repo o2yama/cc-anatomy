@@ -159,6 +159,13 @@ pub struct AccountsState {
     /// （2026-07-26 レビュー High-1: 従来は live_registered=false のときしか
     /// 取り込み導線を出しておらず、登録済みのまま不整合になったケースが詰んでいた）
     pub inconsistent: bool,
+    pub stale_credentials_file: bool,
+}
+
+fn is_stale_credentials_file(content: Option<&[u8]>) -> bool {
+    content
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .is_some_and(|value| value.get("claudeAiOauth").is_none())
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1367,6 +1374,8 @@ pub fn get_accounts() -> Result<AccountsState, String> {
         }
         None => (None, false),
     };
+    let stale_credentials_path = crate::db::home_dir().join(".claude/.credentials.json");
+    let stale_credentials_content = fs::read(stale_credentials_path).ok();
 
     Ok(AccountsState {
         accounts,
@@ -1374,6 +1383,7 @@ pub fn get_accounts() -> Result<AccountsState, String> {
         live_registered,
         running_sessions: running_sessions(),
         inconsistent: meta.inconsistent,
+        stale_credentials_file: is_stale_credentials_file(stale_credentials_content.as_deref()),
     })
 }
 
@@ -3114,6 +3124,31 @@ mod tests {
             usage_cache: None,
             refresh_prompted_at: None,
         }
+    }
+
+    #[test]
+    fn stale_credentials_file_is_false_when_missing() {
+        assert!(!is_stale_credentials_file(None));
+    }
+
+    #[test]
+    fn stale_credentials_file_is_false_when_claude_oauth_exists() {
+        assert!(!is_stale_credentials_file(Some(br#"{"claudeAiOauth":{}}"#)));
+    }
+
+    #[test]
+    fn stale_credentials_file_is_true_when_only_mcp_oauth_exists() {
+        assert!(is_stale_credentials_file(Some(br#"{"mcpOAuth":{}}"#)));
+    }
+
+    #[test]
+    fn stale_credentials_file_is_false_for_invalid_json() {
+        assert!(!is_stale_credentials_file(Some(b"{")));
+    }
+
+    #[test]
+    fn stale_credentials_file_is_true_for_empty_object() {
+        assert!(is_stale_credentials_file(Some(b"{}")));
     }
 
     #[test]

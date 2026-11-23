@@ -30,6 +30,7 @@ pub struct AccountsState {
     pub live_registered: bool,
     pub running_sessions: usize,
     pub inconsistent: bool,
+    pub stale_credentials_file: bool,
 }
 
 pub struct TrayAccount {

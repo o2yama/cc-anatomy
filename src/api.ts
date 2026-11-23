@@ -182,6 +182,13 @@ export interface AccountsState {
    * 再ログインがすべてエラーになり、「このセッションを取り込む」でしか解消できない。
    * live_registered の値に関わらず起こりうる */
   inconsistent: boolean;
+  stale_credentials_file: boolean;
+}
+
+export function switchSuccessMessage(staleCredentialsFile: boolean): string {
+  return staleCredentialsFile
+    ? "切り替えました。古い資格情報ファイルが残っているため、実行中の Claude Code セッションは旧アカウントのまま動きます。"
+    : "切り替えました。実行中の Claude Code セッションにも、30秒ほどで反映されます。";
 }
 
 /** "accounts-updated" イベント（tray.rs の定期更新ループから emit）のペイロード。
